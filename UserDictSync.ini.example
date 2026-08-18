@@ -1,0 +1,12 @@
+[weasel]
+; 由“指定RIME用户词库”按钮保存
+user_data_dir=
+; 留空时依次查找小程序同目录和小狼毫注册表安装目录
+deployer_path=
+
+[webdav]
+url=https://dav.example.com/rime/
+username=your_name
+password=your_password
+; 界面保存后将删除上面的 password，并使用 Base64 字段
+password_base64=
