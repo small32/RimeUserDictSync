@@ -129,7 +129,7 @@ macOS 示例：
 sync_dir: '/Users/你的用户名/Library/Application Support/RimeUserDictSync/Sync'
 ```
 
-Windows RIME 前端实际使用的当前设备同步文件夹为：
+小狼毫实际使用的当前设备同步文件夹为：
 
 ```text
 程序所在目录\Sync\<installation_id>
@@ -336,7 +336,7 @@ RimeSync.log
 
 ### 找不到 `WeaselDeployer.exe`
 
-Windows 会先查找自身所在目录，然后查找 Windows RIME 前端的注册表安装位置。如仍无法找到，可在
+Windows 会先查找自身所在目录，然后查找小狼毫的注册表安装位置。如仍无法找到，可在
 `RimeUserDictSync.ini` 的 `[rime]` 部分手动设置完整路径：
 
 ```ini
@@ -418,7 +418,7 @@ Actions 页面选择“Build and publish release”，点击“Run workflow”�
 
 本项目采用 [GNU General Public License v3.0](LICENSE)。
 
-程序调用 [Windows RIME 前端（rime/weasel）](https://github.com/rime/weasel) 的官方部署程序，
+程序调用 [小狼毫（rime/weasel）](https://github.com/rime/weasel) 的官方部署程序，
 并复用其 `weasel.ico` 图标资源。感谢 Rime 与相关项目的开发者和贡献者。
 
 ## 捐赠支持
