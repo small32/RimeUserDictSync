@@ -24,7 +24,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Select Rust stable
         run: rustup default stable
@@ -56,7 +56,7 @@ jobs:
           Copy-Item target/release/RimeUserDictSync.exe "dist/RimeUserDictSync-$env:RELEASE_TAG-Windows-x64.exe"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: windows-x64
           path: dist/*
@@ -68,7 +68,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Select Rust stable and install targets
         run: |
@@ -99,7 +99,7 @@ jobs:
           ./build-macos.sh
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*.zip
@@ -114,7 +114,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Resolve release tag
         shell: bash
@@ -126,7 +126,7 @@ jobs:
           fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
