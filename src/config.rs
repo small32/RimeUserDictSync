@@ -140,6 +140,15 @@ pub fn validate_installation_id(value: &str) -> Result<()> {
 }
 
 pub fn app_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").context("无法确定用户主目录")?;
+        let dir = PathBuf::from(home)
+            .join("Library/Application Support/RimeUserDictSync");
+        fs::create_dir_all(&dir).context("无法创建 macOS 应用数据目录")?;
+        return Ok(dir);
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(std::env::current_exe()?
         .parent()
         .context("无法确定程序目录")?

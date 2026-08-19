@@ -49,6 +49,8 @@ pub fn default_user_dir() -> PathBuf {
 }
 
 pub fn find_rime(configured: &str, app_dir: &Path) -> Result<RimeCommand> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = app_dir;
     #[cfg(target_os = "windows")]
     {
         let mut candidates = Vec::new();

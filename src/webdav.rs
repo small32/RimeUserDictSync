@@ -34,7 +34,7 @@ impl WebDav {
         Ok(Self {
             root,
             client,
-            username: username.into(),
+            username: username.trim().into(),
             password: password.into(),
         })
     }
@@ -65,6 +65,10 @@ impl WebDav {
     fn ok(response: Response, action: &str) -> Result<Response> {
         if response.status().is_success() || response.status().as_u16() == 207 {
             Ok(response)
+        } else if response.status() == StatusCode::UNAUTHORIZED {
+            bail!(
+                "{action}失败: HTTP 401 Unauthorized（请核对用户名大小写和密码，并确认该账号拥有 WebDAV 目录权限）"
+            )
         } else {
             bail!("{action}失败: HTTP {}", response.status())
         }

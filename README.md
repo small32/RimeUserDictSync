@@ -19,13 +19,37 @@
 
 - Windows 10/11 并安装小狼毫；或 macOS 并安装鼠须管。
 - WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT` 和 `DELETE`。
-- 程序所在目录必须具有读写权限。
+- Windows 版的程序所在目录必须具有读写权限。
 
 建议不要将程序放在 `Program Files` 等需要管理员权限才能写入的目录中。
 
+macOS 版的配置、日志和同步数据保存在用户资料库，不会写入 `.app` 应用包：
+
+```text
+~/Library/Application Support/RimeUserDictSync
+```
+
+### macOS 编译与安装
+
+安装 Rust stable 与 Xcode Command Line Tools 后，在仓库根目录执行：
+
+```bash
+./build-macos.sh
+```
+
+脚本一次生成三个压缩发布包：
+
+- `dist/RimeUserDictSync-macOS-arm64.zip`：Apple Silicon；
+- `dist/RimeUserDictSync-macOS-x86_64.zip`：Intel Mac；
+- `dist/RimeUserDictSync-macOS-universal.zip`：同时支持两种架构的 Universal 2 应用。
+
+解压所需版本，将应用拖入“应用程序”后即可启动。
+未经 Apple Developer ID 签名和公证的自行编译版本首次打开时，可能需要在 Finder 中
+右键应用并选择“打开”。
+
 ## 文件和目录结构
 
-首次运行后，程序会在自身所在目录生成以下内容：
+Windows 版首次运行后，会在程序自身所在目录生成以下内容：
 
 ```text
 RIME用户词库同步.exe
@@ -35,6 +59,30 @@ Sync
 ├─ WebDAV
 └─ <installation_id>
 ```
+
+macOS 版则生成在：
+
+```text
+~/Library/Application Support/RimeUserDictSync/
+├─ WeaselUserDictSync.ini
+├─ RimeSync.log
+└─ Sync/
+   ├─ WebDAV/
+   └─ <installation_id>/
+```
+
+在 Finder 中按 `Command + Shift + G`，输入
+`~/Library/Application Support/RimeUserDictSync` 即可打开。Windows 与 macOS 的主要
+路径差异如下：
+
+| 内容 | Windows | macOS |
+| --- | --- | --- |
+| RIME 用户目录 | `%APPDATA%\Rime` | `~/Library/Rime` |
+| INI 与日志 | 程序所在目录 | `~/Library/Application Support/RimeUserDictSync` |
+| `Sync` 根目录 | `程序所在目录\Sync` | `~/Library/Application Support/RimeUserDictSync/Sync` |
+| RIME 前端 | 小狼毫 Weasel | 鼠须管 Squirrel |
+| 同步命令 | `WeaselDeployer.exe /sync` | `Squirrel --sync` |
+| 部署命令 | `WeaselDeployer.exe /deploy` | `Squirrel --reload` |
 
 各部分用途：
 
@@ -68,10 +116,17 @@ macOS：
 1. 将所选文件夹地址明文保存到 `WeaselUserDictSync.ini`。
 2. 读取 `installation.yaml` 中原有的 `installation_id`。
 3. 保持 `installation_id` 不变。
-4. 将 `installation.yaml` 的 `sync_dir` 设置为程序目录下的 `Sync`：
+4. 将 `installation.yaml` 的 `sync_dir` 设置为本平台的数据目录下的 `Sync`。Windows
+   使用程序所在目录；macOS 使用 `~/Library/Application Support/RimeUserDictSync`：
 
 ```yaml
 sync_dir: '程序所在目录\Sync'
+```
+
+macOS 示例：
+
+```yaml
+sync_dir: '/Users/你的用户名/Library/Application Support/RimeUserDictSync/Sync'
 ```
 
 小狼毫实际使用的当前设备同步文件夹为：
@@ -257,7 +312,8 @@ Sync\<installation_id>
 
 ## 日志
 
-日志同时显示在主窗口中，并保存为程序目录下的：
+日志同时显示在主窗口中。Windows 保存到程序目录，macOS 保存到
+`~/Library/Application Support/RimeUserDictSync`：
 
 ```text
 RimeSync.log
@@ -332,9 +388,9 @@ Windows 输出：
 target/release/RimeUserDictSync.exe
 ```
 
-macOS 输出 `target/release/RimeUserDictSync`。如需 Finder 中的标准 `.app`、签名和公证，
-应在 macOS/Xcode 环境中进一步打包。源码中的 `Program.cs`、`MainForm.cs` 与 `build.cmd`
-暂时保留为旧版实现参考；新的主构建入口是 `Cargo.toml`。
+macOS 可运行 `./build-macos.sh`，一次生成 ARM64、x86_64 和 Universal 2 三个 `.app`
+压缩包。源码中的 `Program.cs`、`MainForm.cs` 与 `build.cmd` 暂时保留为旧版实现参考；
+新的主构建入口是 `Cargo.toml`。
 
 首次运行时程序会自动生成 INI、日志和工作目录。请勿将包含真实 WebDAV 凭据的
 `WeaselUserDictSync.ini` 提交到版本库。

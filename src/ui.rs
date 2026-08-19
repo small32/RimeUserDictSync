@@ -74,7 +74,15 @@ fn set_fonts(ctx: &egui::Context) {
             PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
         ]
     } else if cfg!(target_os = "macos") {
-        vec![PathBuf::from("/System/Library/Fonts/PingFang.ttc")]
+        vec![
+            // PingFang is not stored at a stable public path on every macOS release.
+            // Hiragino Sans GB and STHeiti are system CJK fonts available on both
+            // Intel and Apple Silicon macOS installations.
+            PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+            PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
+            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+        ]
     } else {
         vec![PathBuf::from(
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -84,8 +92,11 @@ fn set_fonts(ctx: &egui::Context) {
         .into_iter()
         .find_map(|p| fs::read(&p).ok().map(|b| (p, b)))
     {
-        f.font_data
-            .insert("cjk".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        let font = egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
+            y_offset: 1.5,
+            ..Default::default()
+        });
+        f.font_data.insert("cjk".into(), Arc::new(font));
         f.families
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
@@ -93,7 +104,7 @@ fn set_fonts(ctx: &egui::Context) {
         f.families
             .get_mut(&egui::FontFamily::Monospace)
             .unwrap()
-            .push("cjk".into());
+            .insert(0, "cjk".into());
     }
     ctx.set_fonts(f);
 }
@@ -326,25 +337,27 @@ impl eframe::App for App {
                         ui.end_row();
                     });
                     ui.checkbox(&mut self.password_visible, "显示密码");
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("测试连接"))
-                            .clicked()
-                        {
-                            self.test_webdav();
-                        }
-                        if ui.button("保存").clicked() {
-                            match self.settings.save(&self.ini) {
-                                Ok(_) => {
-                                    self.append(&sync::timestamped("已保存 WebDAV 设置。"));
-                                    self.show_webdav = false;
-                                }
-                                Err(e) => self.notice = Some(e.to_string()),
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.busy, egui::Button::new("测试连接"))
+                                .clicked()
+                            {
+                                self.test_webdav();
                             }
-                        }
-                        if ui.button("取消").clicked() {
-                            self.show_webdav = false;
-                        }
+                            if ui.button("保存").clicked() {
+                                match self.settings.save(&self.ini) {
+                                    Ok(_) => {
+                                        self.append(&sync::timestamped("已保存 WebDAV 设置。"));
+                                        self.show_webdav = false;
+                                    }
+                                    Err(e) => self.notice = Some(e.to_string()),
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.show_webdav = false;
+                            }
+                        });
                     });
                 });
             if !open {
