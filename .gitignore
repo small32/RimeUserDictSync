@@ -1,3 +1,5 @@
 WeaselUserDictSync.exe
 WeaselUserDictSync.ini
 RimeSync.log
+target/
+.DS_Store

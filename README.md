@@ -1,24 +1,23 @@
 # RIME 用户词库同步
 
-`RIME用户词库同步.exe` 是一个用于 Windows 小狼毫（Weasel）的用户词库同步工具。
-程序调用小狼毫自带的用户资料同步和重新部署功能，并通过 WebDAV 在不同设备之间同步
-RIME 用户词库。
+本项目已使用 Rust 重构为跨平台 RIME 用户词库同步工具。在 Windows 上配合小狼毫
+（Weasel）使用，在 macOS 上配合鼠须管（Squirrel）使用。程序调用对应平台 RIME
+前端自带的用户资料同步和重新部署功能，并通过 WebDAV 在不同设备之间同步用户词库。
 
 ## 主要功能
 
-- 调用小狼毫官方的 `WeaselDeployer.exe /sync` 进行用户资料同步。
+- Windows 调用 `WeaselDeployer.exe /sync`，macOS 调用 `Squirrel --sync`。
 - 通过 WebDAV 下载和覆盖上传同步资料。
 - 合并 `cn_dicts`、`en_dicts` 中的词库文件。
 - 同一词条存在不同权重时，保留权重较大的记录。
 - 按修改日期同步 `wanxiang-lts-zh-hans.gram`（如果有这个文件的话 ##这个文件是万象拼音的AI智能长句输入的模型文件）。
-- 合并完成后调用 `WeaselDeployer.exe /deploy` 重新部署。
+- 合并后在 Windows 调用 `/deploy`，在 macOS 调用 `Squirrel --reload`。
 - 提供同步进度、实时日志、停止同步和 WebDAV 读写测试。
-- 单文件 EXE，首次运行时自动生成配置文件和工作目录。
+- 同一套 Rust 源码可在 Windows、macOS 上原生编译；Windows 发布为单文件 EXE。
 
 ## 运行环境
 
-- Windows 8.1、Windows 10 或 Windows 11。
-- 已安装小狼毫输入法。
+- Windows 10/11 并安装小狼毫；或 macOS 并安装鼠须管。
 - WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT` 和 `DELETE`。
 - 程序所在目录必须具有读写权限。
 
@@ -52,10 +51,16 @@ Sync
 ### 1. 指定 RIME 用户词库
 
 点击主窗口中的“指定RIME用户词库”，选择包含 `installation.yaml` 的 RIME 用户词库
-文件夹。小狼毫的默认用户词库位置通常是：
+文件夹。默认用户词库位置通常是：
 
 ```text
 %APPDATA%\Rime
+```
+
+macOS：
+
+```text
+~/Library/Rime
 ```
 
 选择完成后，程序会：
@@ -105,8 +110,8 @@ WebDAV 密码以 Base64 形式保存在 INI 中。Base64 仅用于避免密码�
 
 完成首次配置后，点击“开始同步”。同步期间可以通过进度条和日志区域查看当前状态。
 
-需要中止时点击“停止同步”。程序会取消正在进行的网络请求；如果小狼毫部署程序仍在
-运行，程序会终止本次启动的部署进程。
+需要中止时点击“停止同步”。程序会在当前文件或网络操作结束后停止后续步骤；如果
+RIME 部署程序仍在运行，程序会终止本次启动的部署进程。
 
 为避免词库文件在同步过程中被其他程序修改，建议同步时不要手动编辑相关文件。
 
@@ -275,12 +280,18 @@ RimeSync.log
 
 ### 找不到 `WeaselDeployer.exe`
 
-程序会先查找自身所在目录，然后查找小狼毫注册表安装位置。如仍无法找到，可在
-`WeaselUserDictSync.ini` 的 `[weasel]` 部分手动设置完整路径：
+Windows 会先查找自身所在目录，然后查找小狼毫注册表安装位置。如仍无法找到，可在
+`WeaselUserDictSync.ini` 的 `[rime]` 部分手动设置完整路径：
 
 ```ini
-[weasel]
+[rime]
 deployer_path=C:\Program Files\Rime\weasel-x.x.x\WeaselDeployer.exe
+```
+
+macOS 默认使用：
+
+```text
+/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel
 ```
 
 ### WebDAV 测试失败
@@ -308,17 +319,22 @@ deployer_path=C:\Program Files\Rime\weasel-x.x.x\WeaselDeployer.exe
 
 ## 从源代码构建
 
-在 Windows 上运行：
+安装当前稳定版 Rust 工具链后，在目标平台运行：
 
-```bat
-build.cmd
+```bash
+cargo test
+cargo build --release
 ```
 
-构建脚本使用系统的 .NET Framework C# 编译器，输出文件为：
+Windows 输出：
 
 ```text
-WeaselUserDictSync.exe
+target/release/RimeUserDictSync.exe
 ```
+
+macOS 输出 `target/release/RimeUserDictSync`。如需 Finder 中的标准 `.app`、签名和公证，
+应在 macOS/Xcode 环境中进一步打包。源码中的 `Program.cs`、`MainForm.cs` 与 `build.cmd`
+暂时保留为旧版实现参考；新的主构建入口是 `Cargo.toml`。
 
 首次运行时程序会自动生成 INI、日志和工作目录。请勿将包含真实 WebDAV 凭据的
 `WeaselUserDictSync.ini` 提交到版本库。

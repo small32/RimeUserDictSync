@@ -1,7 +1,7 @@
-[weasel]
+[rime]
 ; 由“指定RIME用户词库”按钮保存
 user_data_dir=
-; 留空时依次查找小程序同目录和小狼毫注册表安装目录
+; Windows 留空时查找程序目录和小狼毫注册表；macOS 留空时使用鼠须管默认路径
 deployer_path=
 
 [webdav]
