@@ -1,7 +1,7 @@
 # RIME 用户词库同步工具
 
 本项目已使用 Rust 重构为跨平台 RIME 用户词库同步工具。在 Windows 上配合
-Windows RIME 前端（Weasel）使用，在 macOS 上配合鼠须管（Squirrel）使用。程序调用对应平台 RIME
+小狼毫（Weasel）使用，在 macOS 上配合鼠须管（Squirrel）使用。程序调用对应平台 RIME
 前端自带的用户资料同步和重新部署功能，并通过 WebDAV 在不同设备之间同步用户词库。
 
 ## 主要功能
@@ -17,7 +17,7 @@ Windows RIME 前端（Weasel）使用，在 macOS 上配合鼠须管（Squirrel�
 
 ## 运行环境
 
-- Windows 10/11 并安装 Windows RIME 前端（Weasel）；或 macOS 并安装鼠须管。
+- Windows 10/11 并安装 小狼毫；或 macOS 并安装鼠须管。
 - WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT` 和 `DELETE`。
 - Windows 版的程序所在目录必须具有读写权限。
 
