@@ -21,7 +21,13 @@ namespace WeaselUserDictSync
 
         public MainForm()
         {
-            iniPath = Path.Combine(baseDir, "WeaselUserDictSync.ini");
+            iniPath = Path.Combine(baseDir, "RimeUserDictSync.ini");
+            string legacyIniPath = Path.Combine(baseDir, "WeaselUserDictSync.ini");
+            if (!File.Exists(iniPath) && File.Exists(legacyIniPath))
+            {
+                try { File.Move(legacyIniPath, iniPath); }
+                catch (IOException) { File.Copy(legacyIniPath, iniPath, false); }
+            }
             Text = "RIME 用户词库同步工具";
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             ClientSize = new Size(760, 520);
@@ -78,7 +84,7 @@ namespace WeaselUserDictSync
 
         private async Task StartSync()
         {
-            if (!File.Exists(iniPath)) { MessageBox.Show(this, "找不到 WeaselUserDictSync.ini。", Text, MessageBoxButtons.OK, MessageBoxIcon.Error); return; }
+            if (!File.Exists(iniPath)) { MessageBox.Show(this, "找不到 RimeUserDictSync.ini。", Text, MessageBoxButtons.OK, MessageBoxIcon.Error); return; }
             SetBusy(true); progress.Value = 0; cancellation = new CancellationTokenSource();
             try
             {

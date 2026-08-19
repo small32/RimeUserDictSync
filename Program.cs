@@ -46,9 +46,12 @@ namespace WeaselUserDictSync
         {
             Action<int> report = value => { if (progress != null) progress.Report(value); };
             report(0);
-            string iniPath = Path.Combine(baseDir, "WeaselUserDictSync.ini");
+            string iniPath = Path.Combine(baseDir, "RimeUserDictSync.ini");
+            string legacyIniPath = Path.Combine(baseDir, "WeaselUserDictSync.ini");
+            if (!File.Exists(iniPath) && File.Exists(legacyIniPath))
+                File.Copy(legacyIniPath, iniPath, false);
             if (!File.Exists(iniPath))
-                throw new FileNotFoundException("找不到配置文件，请复制并填写 WeaselUserDictSync.ini。", iniPath);
+                throw new FileNotFoundException("找不到配置文件，请复制并填写 RimeUserDictSync.ini。", iniPath);
             Ini ini = Ini.Load(iniPath);
             string userDir = Expand(ini.Get("weasel", "user_data_dir", Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rime")));

@@ -53,7 +53,7 @@ Windows 版首次运行后，会在程序自身所在目录生成以下内容：
 
 ```text
 RIME用户词库同步.exe
-WeaselUserDictSync.ini
+RimeUserDictSync.ini
 RimeSync.log
 Sync
 ├─ WebDAV
@@ -64,7 +64,7 @@ macOS 版则生成在：
 
 ```text
 ~/Library/Application Support/RimeUserDictSync/
-├─ WeaselUserDictSync.ini
+├─ RimeUserDictSync.ini
 ├─ RimeSync.log
 └─ Sync/
    ├─ WebDAV/
@@ -86,7 +86,7 @@ macOS 版则生成在：
 
 各部分用途：
 
-- `WeaselUserDictSync.ini`：保存 RIME 用户词库位置和 WebDAV 设置。
+- `RimeUserDictSync.ini`：保存 RIME 用户词库位置和 WebDAV 设置。升级时程序会自动迁移旧的 `WeaselUserDictSync.ini`。
 - `RimeSync.log`：保存程序工作日志。
 - `Sync\WebDAV`：WebDAV 远端内容的临时本地镜像。
 - `Sync\<installation_id>`：当前 RIME 安装实例的同步文件夹。
@@ -113,7 +113,7 @@ macOS：
 
 选择完成后，程序会：
 
-1. 将所选文件夹地址明文保存到 `WeaselUserDictSync.ini`。
+1. 将所选文件夹地址明文保存到 `RimeUserDictSync.ini`。
 2. 读取 `installation.yaml` 中原有的 `installation_id`。
 3. 保持 `installation_id` 不变。
 4. 将 `installation.yaml` 的 `sync_dir` 设置为本平台的数据目录下的 `Sync`。Windows
@@ -337,7 +337,7 @@ RimeSync.log
 ### 找不到 `WeaselDeployer.exe`
 
 Windows 会先查找自身所在目录，然后查找 Windows RIME 前端的注册表安装位置。如仍无法找到，可在
-`WeaselUserDictSync.ini` 的 `[rime]` 部分手动设置完整路径：
+`RimeUserDictSync.ini` 的 `[rime]` 部分手动设置完整路径：
 
 ```ini
 [rime]
@@ -370,7 +370,7 @@ macOS 默认使用：
 - 首次使用前建议备份 RIME 用户词库和 WebDAV 数据。
 - 不要同时运行多个本程序实例。
 - 不要在同步过程中关闭计算机或手动移动 `Sync` 目录。
-- 不要公开包含 WebDAV 凭据的 `WeaselUserDictSync.ini`。
+- 不要公开包含 WebDAV 凭据的 `RimeUserDictSync.ini`。
 - 定期检查 `RimeSync.log`，确认所有步骤成功完成。
 
 ## 从源代码构建
@@ -393,7 +393,7 @@ macOS 可运行 `./build-macos.sh`，一次生成 ARM64、x86_64 和 Universal 2
 新的主构建入口是 `Cargo.toml`。
 
 首次运行时程序会自动生成 INI、日志和工作目录。请勿将包含真实 WebDAV 凭据的
-`WeaselUserDictSync.ini` 提交到版本库。
+`RimeUserDictSync.ini` 提交到版本库。
 
 ## 自动构建和发布
 
