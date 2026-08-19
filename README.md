@@ -395,6 +395,25 @@ macOS 可运行 `./build-macos.sh`，一次生成 ARM64、x86_64 和 Universal 2
 首次运行时程序会自动生成 INI、日志和工作目录。请勿将包含真实 WebDAV 凭据的
 `WeaselUserDictSync.ini` 提交到版本库。
 
+## 自动构建和发布
+
+仓库中的 `.github/workflows/release.yml` 会在推送 `v*` 标签时，自动使用 GitHub
+托管的 Windows 与 macOS 构建机完成测试、编译和打包。两个平台全部成功后，工作流
+将 Windows x64、macOS ARM64、Intel、Universal 2 和 `SHA256SUMS.txt` 上传到同一个
+GitHub Release。
+
+发布新版本时，先将 `Cargo.toml` 的版本号修改并提交，再推送匹配的标签。例如：
+
+```bash
+git tag v0.1.2
+git push origin main
+git push origin v0.1.2
+```
+
+标签必须是 `v` 加 `Cargo.toml` 中的版本号，否则构建会主动失败。也可以在 GitHub 的
+Actions 页面选择“Build and publish release”，点击“Run workflow”并填写标签手动触发。
+普通的 `main` 分支提交不会创建 Release。
+
 ## 开源许可与致谢
 
 本项目采用 [GNU General Public License v3.0](LICENSE)。
