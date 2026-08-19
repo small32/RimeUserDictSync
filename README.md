@@ -1,7 +1,7 @@
-# RIME 用户词库同步
+# RIME 用户词库同步工具
 
-本项目已使用 Rust 重构为跨平台 RIME 用户词库同步工具。在 Windows 上配合小狼毫
-（Weasel）使用，在 macOS 上配合鼠须管（Squirrel）使用。程序调用对应平台 RIME
+本项目已使用 Rust 重构为跨平台 RIME 用户词库同步工具。在 Windows 上配合
+Windows RIME 前端（Weasel）使用，在 macOS 上配合鼠须管（Squirrel）使用。程序调用对应平台 RIME
 前端自带的用户资料同步和重新部署功能，并通过 WebDAV 在不同设备之间同步用户词库。
 
 ## 主要功能
@@ -17,7 +17,7 @@
 
 ## 运行环境
 
-- Windows 10/11 并安装小狼毫；或 macOS 并安装鼠须管。
+- Windows 10/11 并安装 Windows RIME 前端（Weasel）；或 macOS 并安装鼠须管。
 - WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT` 和 `DELETE`。
 - Windows 版的程序所在目录必须具有读写权限。
 
@@ -80,7 +80,7 @@ macOS 版则生成在：
 | RIME 用户目录 | `%APPDATA%\Rime` | `~/Library/Rime` |
 | INI 与日志 | 程序所在目录 | `~/Library/Application Support/RimeUserDictSync` |
 | `Sync` 根目录 | `程序所在目录\Sync` | `~/Library/Application Support/RimeUserDictSync/Sync` |
-| RIME 前端 | 小狼毫 Weasel | 鼠须管 Squirrel |
+| RIME 前端 | Weasel | Squirrel |
 | 同步命令 | `WeaselDeployer.exe /sync` | `Squirrel --sync` |
 | 部署命令 | `WeaselDeployer.exe /deploy` | `Squirrel --reload` |
 
@@ -129,7 +129,7 @@ macOS 示例：
 sync_dir: '/Users/你的用户名/Library/Application Support/RimeUserDictSync/Sync'
 ```
 
-小狼毫实际使用的当前设备同步文件夹为：
+Windows RIME 前端实际使用的当前设备同步文件夹为：
 
 ```text
 程序所在目录\Sync\<installation_id>
@@ -174,7 +174,7 @@ RIME 部署程序仍在运行，程序会终止本次启动的部署进程。
 
 程序严格按照以下顺序执行：
 
-### 步骤 1：第一次运行小狼毫用户资料同步
+### 步骤 1：第一次运行 RIME 用户资料同步
 
 程序调用：
 
@@ -226,7 +226,7 @@ Sync\<installation_id>
 
 目录关系不符合要求时停止同步，防止操作错误位置。
 
-### 步骤 4：第二次运行小狼毫用户资料同步
+### 步骤 4：第二次运行 RIME 用户资料同步
 
 程序再次调用：
 
@@ -336,7 +336,7 @@ RimeSync.log
 
 ### 找不到 `WeaselDeployer.exe`
 
-Windows 会先查找自身所在目录，然后查找小狼毫注册表安装位置。如仍无法找到，可在
+Windows 会先查找自身所在目录，然后查找 Windows RIME 前端的注册表安装位置。如仍无法找到，可在
 `WeaselUserDictSync.ini` 的 `[rime]` 部分手动设置完整路径：
 
 ```ini
@@ -418,8 +418,8 @@ Actions 页面选择“Build and publish release”，点击“Run workflow”�
 
 本项目采用 [GNU General Public License v3.0](LICENSE)。
 
-程序调用 [小狼毫输入法（rime/weasel）](https://github.com/rime/weasel) 的官方部署程序，
-并复用其 `weasel.ico` 图标资源。感谢 Rime 与小狼毫项目的开发者和贡献者。
+程序调用 [Windows RIME 前端（rime/weasel）](https://github.com/rime/weasel) 的官方部署程序，
+并复用其 `weasel.ico` 图标资源。感谢 Rime 与相关项目的开发者和贡献者。
 
 ## 捐赠支持
 

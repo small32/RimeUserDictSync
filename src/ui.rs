@@ -38,14 +38,14 @@ pub fn run() -> eframe::Result {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([760., 520.])
         .with_min_inner_size([620., 420.])
-        .with_title("RIME用户词库同步");
+        .with_title("RIME 用户词库同步工具");
     let viewport = if let Some(i) = icon {
         viewport.with_icon(i)
     } else {
         viewport
     };
     eframe::run_native(
-        "RIME用户词库同步",
+        "RIME 用户词库同步工具",
         eframe::NativeOptions {
             viewport,
             ..Default::default()
@@ -366,7 +366,7 @@ impl eframe::App for App {
         }
         if let Some(text) = self.notice.clone() {
             let mut open = true;
-            egui::Window::new("RIME用户词库同步")
+            egui::Window::new("RIME 用户词库同步工具")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)

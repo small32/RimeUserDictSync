@@ -5,7 +5,7 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>RIME用户词库同步</string>
+    <string>RIME 用户词库同步工具</string>
     <key>CFBundleExecutable</key>
     <string>RimeUserDictSync</string>
     <key>CFBundleIconFile</key>

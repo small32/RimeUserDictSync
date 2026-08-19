@@ -1,7 +1,7 @@
 [rime]
 ; 由“指定RIME用户词库”按钮保存
 user_data_dir=
-; Windows 留空时查找程序目录和小狼毫注册表；macOS 留空时使用鼠须管默认路径
+; Windows 留空时查找程序目录和 Windows RIME 前端注册表；macOS 留空时使用鼠须管默认路径
 deployer_path=
 
 [webdav]

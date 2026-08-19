@@ -22,7 +22,7 @@ namespace WeaselUserDictSync
         public MainForm()
         {
             iniPath = Path.Combine(baseDir, "WeaselUserDictSync.ini");
-            Text = "RIME用户词库同步";
+            Text = "RIME 用户词库同步工具";
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             ClientSize = new Size(760, 520);
             MinimumSize = new Size(620, 420);

@@ -54,7 +54,7 @@ namespace WeaselUserDictSync
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Rime")));
             string installYaml = Path.Combine(userDir, "installation.yaml");
             if (!File.Exists(installYaml))
-                throw new FileNotFoundException("找不到小狼毫 installation.yaml，请先点击“指定RIME用户词库”。", installYaml);
+                throw new FileNotFoundException("找不到 RIME installation.yaml，请先点击“指定RIME用户词库”。", installYaml);
 
             string syncRoot = Expand(ReadYamlScalar(installYaml, "sync_dir"));
             string installationId = ReadYamlScalar(installYaml, "installation_id");
@@ -73,7 +73,7 @@ namespace WeaselUserDictSync
             string password64 = ini.Get("webdav", "password_base64", "");
             string password = password64.Length > 0 ? Encoding.UTF8.GetString(Convert.FromBase64String(password64)) : ini.Required("webdav", "password");
 
-            Log("步骤 1/7：第 1 次运行小狼毫用户资料同步。");
+            Log("步骤 1/7：第 1 次运行 RIME 用户资料同步。");
             RunDeployer(deployer, "/sync", cancellation);
             report(15);
             Directory.CreateDirectory(syncFolder);
@@ -109,7 +109,7 @@ namespace WeaselUserDictSync
                 Log("步骤 3/7：已确认本地文件夹与同步文件夹位于同一同步根目录下。");
                 report(45);
 
-                Log("步骤 4/7：第 2 次运行小狼毫用户资料同步。");
+                Log("步骤 4/7：第 2 次运行 RIME 用户资料同步。");
                 RunDeployer(deployer, "/sync", cancellation);
                 report(65);
 
@@ -119,9 +119,9 @@ namespace WeaselUserDictSync
                 if (EnsureWebDavInstallation(localFolder))
                     Log("步骤 5/7：再次将 Sync\\WebDAV\\installation.yaml 的 installation_id 修正为 WebDAV。");
                 Log("步骤 5/7：cn_dicts、en_dicts 正文并集及 gram 文件新旧比较完成，并已写回两侧。");
-                Log("步骤 5/7：合并完成，开始运行小狼毫重新部署。");
+                Log("步骤 5/7：合并完成，开始运行 RIME 重新部署。");
                 RunDeployer(deployer, "/deploy", cancellation);
-                Log("步骤 5/7：小狼毫重新部署完成。");
+                Log("步骤 5/7：RIME 重新部署完成。");
                 report(80);
 
                 Log("步骤 6/7：覆盖上传本地文件夹全部内容到 WebDAV。");
@@ -202,7 +202,7 @@ namespace WeaselUserDictSync
                     cancellation.ThrowIfCancellationRequested();
                 }
             }
-            if (p.ExitCode != 0) throw new InvalidOperationException("小狼毫用户资料同步失败，退出码 " + p.ExitCode + "。");
+            if (p.ExitCode != 0) throw new InvalidOperationException("RIME 用户资料同步失败，退出码 " + p.ExitCode + "。");
         }
 
         private static void MergeDictDirectories(string localRoot, string syncRoot, string name)
