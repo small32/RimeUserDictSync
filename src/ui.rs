@@ -129,10 +129,11 @@ impl App {
         let base = config::app_dir().unwrap_or_else(|_| PathBuf::from("."));
         let ini = base.join("RimeUserDictSync.ini");
         let legacy_ini = base.join("WeaselUserDictSync.ini");
-        if !ini.exists() && legacy_ini.is_file() {
-            if fs::rename(&legacy_ini, &ini).is_err() {
-                let _ = fs::copy(&legacy_ini, &ini);
-            }
+        if !ini.exists()
+            && legacy_ini.is_file()
+            && fs::rename(&legacy_ini, &ini).is_err()
+        {
+            let _ = fs::copy(&legacy_ini, &ini);
         }
         let log_path = base.join("RimeSync.log");
         let settings = Settings::load(&ini).unwrap_or_default();

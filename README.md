@@ -174,35 +174,57 @@ RIME 部署程序仍在运行，程序会终止本次启动的部署进程。
 
 程序严格按照以下顺序执行：
 
+以下步骤中的工作目录在两个平台上分别为：
+
+- 小狼毫（Windows）：`程序所在目录\Sync`
+- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync`
+
 ### 步骤 1：第一次运行 RIME 用户资料同步
 
-程序调用：
+Windows 上调用小狼毫：
 
 ```text
 WeaselDeployer.exe /sync
 ```
 
-完成后，将 RIME 用户词库目录中的以下内容复制到
-`Sync\<installation_id>`：
+macOS 上调用鼠须管：
 
 ```text
-cn_dicts\                    包含文件夹、子文件夹和所有文件
-en_dicts\                    包含文件夹、子文件夹和所有文件
+/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --sync
+```
+
+完成后，将 RIME 用户词库目录中的以下内容复制到当前平台的设备同步目录：
+
+- 小狼毫（Windows）：`程序所在目录\Sync\<installation_id>`
+- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync/<installation_id>`
+
+```text
+cn_dicts                     包含文件夹、子文件夹和所有文件
+en_dicts                     包含文件夹、子文件夹和所有文件
 wanxiang-lts-zh-hans.gram
 ```
 
+小狼毫（Windows）路径使用 `\` 分隔，鼠须管（macOS）路径使用 `/` 分隔。
+
 ### 步骤 2：下载 WebDAV
 
-程序递归读取 WebDAV 文件夹：
+程序递归读取 WebDAV 文件夹。其本地镜像目录分别是：
+
+- 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
+- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync/WebDAV`
+
+两个平台执行相同的 WebDAV 处理：
 
 - WebDAV 有内容时，先清空旧的 `Sync\WebDAV` 镜像，再完整下载远端文件。
 - 下载时读取 WebDAV 的 `getlastmodified`，并将其保存为本地文件修改日期。
 - WebDAV 没有内容时，用当前同步资料初始化 `Sync\WebDAV` 并直接上传。
 
-每次下载完成后，程序都会检查：
+每次下载完成后，程序都会检查当前平台 WebDAV 镜像目录中的
+`installation.yaml`：
 
 ```text
-Sync\WebDAV\installation.yaml
+小狼毫（Windows）：程序所在目录\Sync\WebDAV\installation.yaml
+鼠须管（macOS）：~/Library/Application Support/RimeUserDictSync/Sync/WebDAV/installation.yaml
 ```
 
 该文件的 `installation_id` 必须为：
@@ -217,29 +239,39 @@ WebDAV。此操作不会修改 RIME 用户词库目录中 `installation.yaml` �
 
 ### 步骤 3：检查目录关系
 
-程序确认本地文件夹和同步文件夹位于同一个 `Sync` 根目录：
+程序确认本地文件夹和同步文件夹位于当前平台的同一个 `Sync` 根目录：
 
 ```text
-Sync\WebDAV
-Sync\<installation_id>
+小狼毫（Windows）：程序所在目录\Sync\WebDAV
+                  程序所在目录\Sync\<installation_id>
+
+鼠须管（macOS）：~/Library/Application Support/RimeUserDictSync/Sync/WebDAV
+                ~/Library/Application Support/RimeUserDictSync/Sync/<installation_id>
 ```
 
 目录关系不符合要求时停止同步，防止操作错误位置。
 
 ### 步骤 4：第二次运行 RIME 用户资料同步
 
-程序再次调用：
+Windows 上再次调用小狼毫：
 
 ```text
 WeaselDeployer.exe /sync
+```
+
+macOS 上再次调用鼠须管：
+
+```text
+/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --sync
 ```
 
 ### 步骤 5：合并词库和 gram 文件
 
 #### `cn_dicts`、`en_dicts` 合并
 
-程序对比 `Sync\WebDAV` 和 `Sync\<installation_id>` 下两个词库目录中的相对路径
-相同文件。
+程序对比当前平台 `WebDAV` 与 `<installation_id>` 目录下两个词库目录中相对路径
+相同的文件。小狼毫（Windows）使用反斜杠路径，鼠须管（macOS）使用正斜杠路径；
+合并规则完全相同。
 
 词库的 YAML 文件头不参与并集。文件头是从 `---` 开始、到 `...` 结束的部分，例如：
 
@@ -278,33 +310,46 @@ sort: by_weight
 
 程序对比两侧同名 gram 文件的修改日期：
 
-- WebDAV 没有该文件时，从同步文件夹复制到 `Sync\WebDAV`。
-- 同步文件夹没有该文件时，从 `Sync\WebDAV` 复制过去。
+- WebDAV 镜像目录没有该文件时，从当前平台的设备同步目录复制过去。
+- 设备同步目录没有该文件时，从当前平台的 WebDAV 镜像目录复制过去。
 - 两侧都有时，修改日期较新的文件覆盖较旧文件。
 - 修改日期相同时不覆盖。
 
 #### 重新部署
 
-以上合并完成后，程序调用：
+以上合并完成后，Windows 上调用小狼毫：
 
 ```text
 WeaselDeployer.exe /deploy
+```
+
+macOS 上调用鼠须管：
+
+```text
+/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --reload
 ```
 
 重新部署成功后才继续后续步骤。
 
 ### 步骤 6：覆盖上传 WebDAV
 
-程序将 `Sync\WebDAV` 中的所有文件递归上传到 WebDAV。同名远端文件使用 `PUT`
-直接覆盖。
+程序将当前平台的 WebDAV 镜像目录中所有文件递归上传到 WebDAV：
+
+- 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
+- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync/WebDAV`
+
+两个平台都会对同名远端文件使用 `PUT` 直接覆盖。
 
 ### 步骤 7：清理工作目录
 
-只有步骤 6 全部上传成功后，程序才会删除以下两个目录中的所有文件和子目录：
+只有步骤 6 全部上传成功后，程序才会删除当前平台以下两个目录中的所有文件和子目录：
 
 ```text
-Sync\WebDAV
-Sync\<installation_id>
+小狼毫（Windows）：程序所在目录\Sync\WebDAV
+                  程序所在目录\Sync\<installation_id>
+
+鼠须管（macOS）：~/Library/Application Support/RimeUserDictSync/Sync/WebDAV
+                ~/Library/Application Support/RimeUserDictSync/Sync/<installation_id>
 ```
 
 两个根目录本身会保留。若上传失败或同步被停止，程序不会执行这一步，以避免本地数据
