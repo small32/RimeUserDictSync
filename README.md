@@ -8,10 +8,11 @@
 
 - Windows 调用 `WeaselDeployer.exe /sync`，macOS 调用 `Squirrel --sync`。
 - 通过 WebDAV 下载和覆盖上传同步资料。
-- 合并 `cn_dicts`、`en_dicts` 中的词库文件。
-- 同一词条存在不同权重时，保留权重较大的记录。
-- 按修改日期同步 `wanxiang-lts-zh-hans.gram`（如果有这个文件的话 ##这个文件是万象拼音的AI智能长句输入的模型文件）。
-- 合并后在 Windows 调用 `/deploy`，在 macOS 调用 `Squirrel --reload`。
+- RIME 自带的用户资料由小狼毫或鼠须管原生同步功能生成。
+- 支持多选其他同步文件，并为每个文件选择“按并集同步”或“按时间同步”。
+- `wanxiang-lts-zh-hans.gram` 默认不同步，需要时可在“同步文件选择”中启用。
+- 按设置回写自选文件后，在 Windows 调用
+  `/deploy`，在 macOS 调用 `Squirrel --reload`。
 - 提供同步进度、实时日志、停止同步和 WebDAV 读写测试。
 - 同一套 Rust 源码可在 Windows、macOS 上原生编译；Windows 发布为单文件 EXE。
 
@@ -23,7 +24,8 @@
 
 建议不要将程序放在 `Program Files` 等需要管理员权限才能写入的目录中。
 
-macOS 版的配置、日志和同步数据保存在用户资料库，不会写入 `.app` 应用包：
+macOS 版默认将配置、日志和同步数据保存在用户资料库，不会写入 `.app` 应用包；也可
+通过“配置文件”按钮改为其他目录：
 
 ```text
 ~/Library/Application Support/RimeUserDictSync
@@ -78,15 +80,15 @@ macOS 版则生成在：
 | 内容 | Windows | macOS |
 | --- | --- | --- |
 | RIME 用户目录 | `%APPDATA%\Rime` | `~/Library/Rime` |
-| INI 与日志 | 程序所在目录 | `~/Library/Application Support/RimeUserDictSync` |
-| `Sync` 根目录 | `程序所在目录\Sync` | `~/Library/Application Support/RimeUserDictSync/Sync` |
+| INI 与日志 | 程序所在目录 | 用户选择的配置目录；默认为 `~/Library/Application Support/RimeUserDictSync` |
+| `Sync` 根目录 | `程序所在目录\Sync` | `用户选择的配置目录/Sync` |
 | RIME 前端 | Weasel | Squirrel |
 | 同步命令 | `WeaselDeployer.exe /sync` | `Squirrel --sync` |
 | 部署命令 | `WeaselDeployer.exe /deploy` | `Squirrel --reload` |
 
 各部分用途：
 
-- `RimeUserDictSync.ini`：保存 RIME 用户词库位置和 WebDAV 设置。升级时程序会自动迁移旧的 `WeaselUserDictSync.ini`。
+- `RimeUserDictSync.ini`：保存 RIME 用户词库位置、WebDAV 设置和同步文件选择。升级时程序会自动迁移旧的 `WeaselUserDictSync.ini`。
 - `RimeSync.log`：保存程序工作日志。
 - `Sync\WebDAV`：WebDAV 远端内容的临时本地镜像。
 - `Sync\<installation_id>`：当前 RIME 安装实例的同步文件夹。
@@ -117,7 +119,8 @@ macOS：
 2. 读取 `installation.yaml` 中原有的 `installation_id`。
 3. 保持 `installation_id` 不变。
 4. 将 `installation.yaml` 的 `sync_dir` 设置为本平台的数据目录下的 `Sync`。Windows
-   使用程序所在目录；macOS 使用 `~/Library/Application Support/RimeUserDictSync`：
+   使用程序所在目录；macOS 使用当前配置目录（默认为
+   `~/Library/Application Support/RimeUserDictSync`）：
 
 ```yaml
 sync_dir: '程序所在目录\Sync'
@@ -137,7 +140,7 @@ sync_dir: '/Users/你的用户名/Library/Application Support/RimeUserDictSync/S
 
 ### 2. 设置 WebDAV
 
-点击“设置WebDAV”，填写：
+点击“WebDAV设置”，填写：
 
 - WebDAV 文件夹地址；
 - 用户名；
@@ -161,6 +164,47 @@ https://dav.example.com/rime-sync/
 WebDAV 密码以 Base64 形式保存在 INI 中。Base64 仅用于避免密码直接显示为明文，不等同
 于安全加密；请妥善保护程序目录和 INI 文件。
 
+### 3. 选择其他同步文件（可选）
+
+点击 WebDAV 设置右侧的“同步文件选择”，点击“添加文件”可从当前 RIME 用户词库目录
+多选文件。每个文件可单独设置同步方式和是否回写：
+
+- **按并集同步**：合并两侧 UTF-8 文本内容；词条和编码相同时保留较大权重。不能用于
+  gram 等二进制文件。
+- **按时间同步**：比较修改时间，以较新的文件覆盖较旧的文件，适合 gram 或其他无需
+  文本合并的文件。
+- **是否回写**：选择“是”时，同步完成后将最终文件覆盖回 RIME 用户目录中的源文件；
+  选择“否”时只更新同步数据，不修改源文件。新添加的文件默认选择“是”。
+
+列表左侧可勾选多个文件，并通过底部按钮批量改为按并集、按时间、回写或不回写。
+
+`wanxiang-lts-zh-hans.gram` 默认不再同步。如需同步，可手动添加并选择“按时间同步”。
+保存后，文件路径按分号分隔写入 INI：
+
+```ini
+[sync_files]
+file=default.custom.yaml/newest/N;custom/a.dict.yaml/union/Y
+```
+
+每项按 `文件名/同步方式/回写参数` 保存：同步方式为 `union`（按并集同步）或
+`newest`（按时间同步）；回写参数为 `Y`（覆盖源文件）或 `N`（不回写）。多个文件用
+`;` 分隔。
+
+### 4. 设置 macOS 配置目录（可选）
+
+此功能仅在 macOS 显示。点击主窗口“同步文件选择”旁边的“配置文件”，可选择用于保存
+以下内容的目录：
+
+- `Sync` 目录
+- `RimeUserDictSync.ini`
+- `RimeSync.log`
+
+保存时程序会将当前配置、日志和 Sync 数据移动到新目录，并同步修改
+`installation.yaml` 中的 `sync_dir`。以后启动程序时继续使用该目录。Windows 不显示
+该按钮，仍将以上内容保存在 EXE 所在目录。
+
+配置窗口中的“打开配置”会直接通过访达打开当前配置目录。
+
 ## 使用方法
 
 完成首次配置后，点击“开始同步”。同步期间可以通过进度条和日志区域查看当前状态。
@@ -177,7 +221,8 @@ RIME 部署程序仍在运行，程序会终止本次启动的部署进程。
 以下步骤中的工作目录在两个平台上分别为：
 
 - 小狼毫（Windows）：`程序所在目录\Sync`
-- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync`
+- 鼠须管（macOS）：`用户选择的配置目录/Sync`，未设置时为
+  `~/Library/Application Support/RimeUserDictSync/Sync`
 
 ### 步骤 1：第一次运行 RIME 用户资料同步
 
@@ -193,16 +238,11 @@ macOS 上调用鼠须管：
 /Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --sync
 ```
 
-完成后，将 RIME 用户词库目录中的以下内容复制到当前平台的设备同步目录：
+完成后，RIME 自带同步数据位于当前平台的设备同步目录。程序另将“同步文件选择”中
+启用的文件复制到该目录：
 
 - 小狼毫（Windows）：`程序所在目录\Sync\<installation_id>`
-- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync/<installation_id>`
-
-```text
-cn_dicts                     包含文件夹、子文件夹和所有文件
-en_dicts                     包含文件夹、子文件夹和所有文件
-wanxiang-lts-zh-hans.gram
-```
+- 鼠须管（macOS）：`<macOS 配置目录>/Sync/<installation_id>`
 
 小狼毫（Windows）路径使用 `\` 分隔，鼠须管（macOS）路径使用 `/` 分隔。
 
@@ -211,7 +251,7 @@ wanxiang-lts-zh-hans.gram
 程序递归读取 WebDAV 文件夹。其本地镜像目录分别是：
 
 - 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
-- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync/WebDAV`
+- 鼠须管（macOS）：`<macOS 配置目录>/Sync/WebDAV`
 
 两个平台执行相同的 WebDAV 处理：
 
@@ -224,7 +264,7 @@ wanxiang-lts-zh-hans.gram
 
 ```text
 小狼毫（Windows）：程序所在目录\Sync\WebDAV\installation.yaml
-鼠须管（macOS）：~/Library/Application Support/RimeUserDictSync/Sync/WebDAV/installation.yaml
+鼠须管（macOS）：<macOS 配置目录>/Sync/WebDAV/installation.yaml
 ```
 
 该文件的 `installation_id` 必须为：
@@ -245,8 +285,8 @@ WebDAV。此操作不会修改 RIME 用户词库目录中 `installation.yaml` �
 小狼毫（Windows）：程序所在目录\Sync\WebDAV
                   程序所在目录\Sync\<installation_id>
 
-鼠须管（macOS）：~/Library/Application Support/RimeUserDictSync/Sync/WebDAV
-                ~/Library/Application Support/RimeUserDictSync/Sync/<installation_id>
+鼠须管（macOS）：<macOS 配置目录>/Sync/WebDAV
+                <macOS 配置目录>/Sync/<installation_id>
 ```
 
 目录关系不符合要求时停止同步，防止操作错误位置。
@@ -265,55 +305,23 @@ macOS 上再次调用鼠须管：
 /Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --sync
 ```
 
-### 步骤 5：合并词库和 gram 文件
+### 步骤 5：同步自选文件
 
-#### `cn_dicts`、`en_dicts` 合并
+#### 自选文件同步
 
-程序对比当前平台 `WebDAV` 与 `<installation_id>` 目录下两个词库目录中相对路径
-相同的文件。小狼毫（Windows）使用反斜杠路径，鼠须管（macOS）使用正斜杠路径；
-合并规则完全相同。
+程序根据“同步文件选择”中为每个文件指定的方式处理：
 
-词库的 YAML 文件头不参与并集。文件头是从 `---` 开始、到 `...` 结束的部分，例如：
+- 按并集同步：对 UTF-8 文本执行有序并集合并；词条和编码相同时保留较大权重。
+- 按时间同步：一侧没有文件时从另一侧复制；两侧都有时，修改日期较新的覆盖较旧的；
+  修改日期相同时不覆盖。
 
-```yaml
----
-name: 8105
-version: "2026-07-11"
-sort: by_weight
-...
-```
+未在“同步文件选择”中启用的文件不会参与同步，包括
+`wanxiang-lts-zh-hans.gram`。
 
-仅对文件头之后的正文执行合并：
+#### 回写同步结果
 
-- 只在一侧存在的文件会复制到另一侧。
-- 普通正文行采用有序并集，重复行只保留一次。
-- 词条和编码相同、最后一列数字不同时，只保留数字较大的记录。
-- 词条或编码不同的记录分别保留。
-- 合并结果同时写入本地文件夹和同步文件夹。
-
-例如：
-
-```text
-𤭢	cei	800
-𤭢	cei	1000
-```
-
-合并后只保留：
-
-```text
-𤭢	cei	1000
-```
-
-词库文件必须是 UTF-8 文本。程序检测到非 UTF-8 或二进制文件时会停止，避免损坏数据。
-
-#### `wanxiang-lts-zh-hans.gram` 同步
-
-程序对比两侧同名 gram 文件的修改日期：
-
-- WebDAV 镜像目录没有该文件时，从当前平台的设备同步目录复制过去。
-- 设备同步目录没有该文件时，从当前平台的 WebDAV 镜像目录复制过去。
-- 两侧都有时，修改日期较新的文件覆盖较旧文件。
-- 修改日期相同时不覆盖。
+自选文件选择“回写：是”时，最终结果直接覆盖 RIME 用户目录中的源文件；选择
+“回写：否”时不修改源文件。以上操作完成后程序才会重新部署。
 
 #### 重新部署
 
@@ -336,7 +344,7 @@ macOS 上调用鼠须管：
 程序将当前平台的 WebDAV 镜像目录中所有文件递归上传到 WebDAV：
 
 - 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
-- 鼠须管（macOS）：`~/Library/Application Support/RimeUserDictSync/Sync/WebDAV`
+- 鼠须管（macOS）：`<macOS 配置目录>/Sync/WebDAV`
 
 两个平台都会对同名远端文件使用 `PUT` 直接覆盖。
 
@@ -348,8 +356,8 @@ macOS 上调用鼠须管：
 小狼毫（Windows）：程序所在目录\Sync\WebDAV
                   程序所在目录\Sync\<installation_id>
 
-鼠须管（macOS）：~/Library/Application Support/RimeUserDictSync/Sync/WebDAV
-                ~/Library/Application Support/RimeUserDictSync/Sync/<installation_id>
+鼠须管（macOS）：<macOS 配置目录>/Sync/WebDAV
+                <macOS 配置目录>/Sync/<installation_id>
 ```
 
 两个根目录本身会保留。若上传失败或同步被停止，程序不会执行这一步，以避免本地数据
@@ -357,8 +365,8 @@ macOS 上调用鼠须管：
 
 ## 日志
 
-日志同时显示在主窗口中。Windows 保存到程序目录，macOS 保存到
-`~/Library/Application Support/RimeUserDictSync`：
+日志同时显示在主窗口中。Windows 保存到程序目录，macOS 保存到当前配置目录（默认
+为 `~/Library/Application Support/RimeUserDictSync`）：
 
 ```text
 RimeSync.log

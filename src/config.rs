@@ -7,6 +7,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncFileMode {
+    Union,
+    Newest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncFile {
+    pub path: String,
+    pub mode: SyncFileMode,
+    pub writeback: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct Settings {
     pub user_data_dir: String,
@@ -14,6 +27,7 @@ pub struct Settings {
     pub webdav_url: String,
     pub username: String,
     pub password: String,
+    pub sync_files: Vec<SyncFile>,
 }
 
 impl Settings {
@@ -37,6 +51,10 @@ impl Settings {
                     .context("WebDAV 密码 Base64 无效")?,
             )?
         };
+        let mut sync_files = parse_sync_file_entries(&get("sync_files", "file"));
+        if sync_files.is_empty() {
+            sync_files = parse_legacy_sync_files(&get);
+        }
         Ok(Self {
             user_data_dir: get("rime", "user_data_dir")
                 .or_else_nonempty(get("weasel", "user_data_dir")),
@@ -45,20 +63,89 @@ impl Settings {
             webdav_url: get("webdav", "url"),
             username: get("webdav", "username"),
             password,
+            sync_files,
         })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        let files = join_sync_file_entries(&self.sync_files);
         let text = format!(
-            "[rime]\nuser_data_dir={}\ndeployer_path={}\n\n[webdav]\nurl={}\nusername={}\npassword_base64={}\n",
+            "[rime]\nuser_data_dir={}\ndeployer_path={}\n\n[webdav]\nurl={}\nusername={}\npassword_base64={}\n\n[sync_files]\nfile={}\n",
             self.user_data_dir,
             self.deployer_path,
             self.webdav_url,
             self.username,
-            STANDARD.encode(self.password.as_bytes())
+            STANDARD.encode(self.password.as_bytes()),
+            files,
         );
         fs::write(path, text).context("保存配置文件失败")
     }
+}
+
+fn parse_sync_file_entries(value: &str) -> Vec<SyncFile> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter_map(|entry| {
+            let (path, mode, writeback) =
+                if let Some((path, writeback)) = entry.rsplit_once("/union/") {
+                    (path, SyncFileMode::Union, writeback)
+                } else if let Some((path, writeback)) = entry.rsplit_once("/newest/") {
+                    (path, SyncFileMode::Newest, writeback)
+                } else {
+                    return None;
+                };
+            if path.is_empty() {
+                return None;
+            }
+            Some(SyncFile {
+                path: path.to_owned(),
+                mode,
+                // 兼容曾短暂使用“回写目录”的测试版：非 N 参数均视为回写。
+                writeback: !writeback.eq_ignore_ascii_case("N"),
+            })
+        })
+        .collect()
+}
+
+fn join_sync_file_entries(files: &[SyncFile]) -> String {
+    files
+        .iter()
+        .map(|file| {
+            let mode = match file.mode {
+                SyncFileMode::Union => "union",
+                SyncFileMode::Newest => "newest",
+            };
+            let writeback = if file.writeback { "Y" } else { "N" };
+            format!("{}/{mode}/{writeback}", file.path)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn parse_legacy_sync_files(get: &impl Fn(&str, &str) -> String) -> Vec<SyncFile> {
+    let mut files = parse_legacy_file_list(&get("sync_files", "union"), SyncFileMode::Union);
+    let newest = parse_legacy_file_list(&get("sync_files", "newest"), SyncFileMode::Newest);
+    files.retain(|union| {
+        !newest
+            .iter()
+            .any(|item| item.path.eq_ignore_ascii_case(&union.path))
+    });
+    files.extend(newest);
+    files
+}
+
+fn parse_legacy_file_list(value: &str, mode: SyncFileMode) -> Vec<SyncFile> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| SyncFile {
+            path: path.to_owned(),
+            mode,
+            writeback: false,
+        })
+        .collect()
 }
 
 trait NonEmpty {
@@ -142,15 +229,79 @@ pub fn validate_installation_id(value: &str) -> Result<()> {
 pub fn app_dir() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var_os("HOME").context("无法确定用户主目录")?;
-        let dir = PathBuf::from(home)
-            .join("Library/Application Support/RimeUserDictSync");
+        let default = default_app_dir()?;
+        fs::create_dir_all(&default).context("无法创建 macOS 应用数据目录")?;
+        let marker = default.join("config_dir.txt");
+        let configured = fs::read_to_string(marker).unwrap_or_default();
+        let dir = if configured.trim().is_empty() {
+            default
+        } else {
+            let path = PathBuf::from(configured.trim());
+            if path.is_absolute() { path } else { default }
+        };
         fs::create_dir_all(&dir).context("无法创建 macOS 应用数据目录")?;
-        return Ok(dir);
+        Ok(dir)
     }
     #[cfg(not(target_os = "macos"))]
     Ok(std::env::current_exe()?
         .parent()
         .context("无法确定程序目录")?
         .to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+pub fn default_app_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("无法确定用户主目录")?;
+    Ok(PathBuf::from(home).join("Library/Application Support/RimeUserDictSync"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_app_dir(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("配置目录必须是绝对路径");
+    }
+    let default = default_app_dir()?;
+    fs::create_dir_all(&default)?;
+    fs::create_dir_all(path)?;
+    fs::write(
+        default.join("config_dir.txt"),
+        path.to_string_lossy().as_bytes(),
+    )
+    .context("保存 macOS 配置目录失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_files_round_trip_as_semicolon_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("RimeUserDictSync.ini");
+        let settings = Settings {
+            sync_files: vec![
+                SyncFile {
+                    path: "custom/a.dict.yaml".into(),
+                    mode: SyncFileMode::Union,
+                    writeback: true,
+                },
+                SyncFile {
+                    path: "wanxiang-lts-zh-hans.gram".into(),
+                    mode: SyncFileMode::Newest,
+                    writeback: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        settings.save(&ini).unwrap();
+        let text = fs::read_to_string(&ini).unwrap();
+        assert!(
+            text.contains("file=custom/a.dict.yaml/union/Y;wanxiang-lts-zh-hans.gram/newest/N")
+        );
+        assert_eq!(
+            Settings::load(&ini).unwrap().sync_files,
+            settings.sync_files
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use crate::{
-    config::{Settings, validate_installation_id, yaml_scalar},
+    config::{Settings, SyncFileMode, validate_installation_id, yaml_scalar},
     dictionary, platform,
     webdav::WebDav,
 };
@@ -40,6 +40,17 @@ pub fn run(
     }
     let installation_id = yaml_scalar(&installation, "installation_id")?;
     validate_installation_id(&installation_id)?;
+    let selected_files = settings
+        .sync_files
+        .iter()
+        .map(|file| {
+            Ok((
+                validate_sync_file_path(&file.path)?,
+                file.mode,
+                file.writeback,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let configured_root = PathBuf::from(yaml_scalar(&installation, "sync_dir")?);
     let configured_root = if configured_root.is_absolute() {
         configured_root
@@ -67,15 +78,14 @@ pub fn run(
     report.log("步骤 1/7：第 1 次运行 RIME 用户资料同步。");
     platform::run(&rime, rime.sync_arg, &cancel)?;
     check(&cancel)?;
+    remove_default_gram_unless_selected(&sync_folder, &selected_files)?;
     report.progress(15);
-    copy_dir_if_present(&user_dir.join("cn_dicts"), &sync_folder.join("cn_dicts"))?;
-    copy_dir_if_present(&user_dir.join("en_dicts"), &sync_folder.join("en_dicts"))?;
-    copy_file_if_present(
-        &user_dir.join("wanxiang-lts-zh-hans.gram"),
-        &sync_folder.join("wanxiang-lts-zh-hans.gram"),
-    )?;
+    for (relative, _, _) in &selected_files {
+        copy_file_if_present(&user_dir.join(relative), &sync_folder.join(relative))?;
+    }
     report.log(&format!(
-        "步骤 1/7：已复制 cn_dicts、en_dicts 和 gram 文件到 Sync/{installation_id}。"
+        "步骤 1/7：RIME 自带同步数据已生成，并复制 {} 个自选文件到 Sync/{installation_id}。",
+        selected_files.len()
     ));
     report.progress(25);
 
@@ -98,14 +108,24 @@ pub fn run(
     check(&cancel)?;
     report.log("步骤 4/7：第 2 次运行 RIME 用户资料同步。");
     platform::run(&rime, rime.sync_arg, &cancel)?;
+    remove_default_gram_unless_selected(&sync_folder, &selected_files)?;
     report.progress(65);
-    let cn = dictionary::merge_directories(&local_folder, &sync_folder, "cn_dicts")?;
-    let en = dictionary::merge_directories(&local_folder, &sync_folder, "en_dicts")?;
-    sync_newest(&local_folder, &sync_folder, "wanxiang-lts-zh-hans.gram")?;
+    for (relative, mode, _) in &selected_files {
+        let local = local_folder.join(relative);
+        let sync = sync_folder.join(relative);
+        match mode {
+            SyncFileMode::Union => dictionary::merge_file(&local, &sync)?,
+            SyncFileMode::Newest => sync_newest_file(&local, &sync)?,
+        }
+    }
     ensure_webdav_installation(&local_folder)?;
     report.log(&format!(
-        "步骤 5/7：词库正文并集合并完成（cn {cn} 个，en {en} 个），相同词条保留较大权重。"
+        "步骤 5/7：已按设置同步 {} 个自选文件。",
+        selected_files.len()
     ));
+    check(&cancel)?;
+    let writeback_count = writeback_selected_files(&sync_folder, &user_dir, &selected_files)?;
+    report.log(&format!("步骤 5/7：已回写 {writeback_count} 个自选文件。"));
     report.log("步骤 5/7：开始重新部署 RIME。");
     platform::run(&rime, rime.deploy_arg, &cancel)?;
     report.progress(80);
@@ -155,12 +175,6 @@ fn recreate(p: &Path) -> Result<()> {
     fs::create_dir_all(p)?;
     Ok(())
 }
-fn copy_dir_if_present(a: &Path, b: &Path) -> Result<()> {
-    if a.is_dir() {
-        copy_dir(a, b)?;
-    }
-    Ok(())
-}
 fn copy_dir(a: &Path, b: &Path) -> Result<()> {
     for e in WalkDir::new(a).into_iter().collect::<Result<Vec<_>, _>>()? {
         let rel = e.path().strip_prefix(a)?;
@@ -171,7 +185,7 @@ fn copy_dir(a: &Path, b: &Path) -> Result<()> {
             if let Some(p) = dst.parent() {
                 fs::create_dir_all(p)?;
             }
-            fs::copy(e.path(), dst)?;
+            copy_file(e.path(), &dst)?;
         }
     }
     Ok(())
@@ -181,9 +195,69 @@ fn copy_file_if_present(a: &Path, b: &Path) -> Result<()> {
         if let Some(p) = b.parent() {
             fs::create_dir_all(p)?;
         }
-        fs::copy(a, b)?;
+        copy_file(a, b)?;
     }
     Ok(())
+}
+fn copy_file(a: &Path, b: &Path) -> Result<()> {
+    fs::copy(a, b)?;
+    if let Ok(modified) = fs::metadata(a)?.modified() {
+        filetime::set_file_mtime(b, filetime::FileTime::from_system_time(modified))?;
+    }
+    Ok(())
+}
+fn writeback_selected_files(
+    sync_folder: &Path,
+    user_dir: &Path,
+    selected_files: &[(PathBuf, SyncFileMode, bool)],
+) -> Result<usize> {
+    let mut count = 0;
+    for (relative, _, writeback) in selected_files {
+        if !writeback {
+            continue;
+        }
+        let source = sync_folder.join(relative);
+        if !source.is_file() {
+            continue;
+        }
+        let target = user_dir.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        copy_file(&source, &target)?;
+        count += 1;
+    }
+    Ok(count)
+}
+fn remove_default_gram_unless_selected(
+    sync_folder: &Path,
+    selected_files: &[(PathBuf, SyncFileMode, bool)],
+) -> Result<()> {
+    let gram = Path::new("wanxiang-lts-zh-hans.gram");
+    let selected = selected_files.iter().any(|(relative, _, _)| {
+        relative
+            .to_string_lossy()
+            .eq_ignore_ascii_case("wanxiang-lts-zh-hans.gram")
+    });
+    let generated = sync_folder.join(gram);
+    if !selected && generated.is_file() {
+        fs::remove_file(generated)?;
+    }
+    Ok(())
+}
+fn validate_sync_file_path(value: &str) -> Result<PathBuf> {
+    let normalized = PathBuf::from(value.replace('\\', "/"));
+    if value.trim().is_empty() || value.contains(';') || normalized.is_absolute() {
+        bail!("同步文件路径无效: {value}");
+    }
+    let mut components = normalized.components();
+    let first = components.next().context("同步文件路径为空")?;
+    if !matches!(first, std::path::Component::Normal(_))
+        || components.any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("同步文件路径不能包含 . 或 ..: {value}");
+    }
+    Ok(normalized)
 }
 fn ensure_webdav_installation(folder: &Path) -> Result<()> {
     fs::create_dir_all(folder)?;
@@ -200,28 +274,32 @@ fn ensure_webdav_installation(folder: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn sync_newest(a_root: &Path, b_root: &Path, name: &str) -> Result<()> {
-    let a = a_root.join(name);
-    let b = b_root.join(name);
+fn sync_newest_file(a: &Path, b: &Path) -> Result<()> {
+    if let Some(parent) = a.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = b.parent() {
+        fs::create_dir_all(parent)?;
+    }
     match (a.exists(), b.exists()) {
         (false, false) => {}
         (false, true) => {
-            fs::copy(b, a)?;
+            copy_file(b, a)?;
         }
         (true, false) => {
-            fs::copy(a, b)?;
+            copy_file(a, b)?;
         }
         (true, true) => {
-            let at = fs::metadata(&a)?
+            let at = fs::metadata(a)?
                 .modified()
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            let bt = fs::metadata(&b)?
+            let bt = fs::metadata(b)?
                 .modified()
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             if at > bt {
-                fs::copy(a, b)?;
+                copy_file(a, b)?;
             } else if bt > at {
-                fs::copy(b, a)?;
+                copy_file(b, a)?;
             }
         }
     }
@@ -238,4 +316,76 @@ fn clear(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gram_is_removed_from_generated_sync_data_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_folder = dir.path().join("Sync/device");
+        fs::create_dir_all(&sync_folder).unwrap();
+        let gram = sync_folder.join("wanxiang-lts-zh-hans.gram");
+        fs::write(&gram, b"generated by RIME sync").unwrap();
+
+        remove_default_gram_unless_selected(&sync_folder, &[]).unwrap();
+
+        assert!(!gram.exists());
+    }
+
+    #[test]
+    fn selected_file_is_written_back_to_its_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_folder = dir.path().join("Sync/device");
+        let user_dir = dir.path().join("Rime");
+        fs::create_dir_all(&sync_folder).unwrap();
+        fs::write(sync_folder.join("default.custom.yaml"), "final content").unwrap();
+        let selected_files = vec![
+            (
+                PathBuf::from("default.custom.yaml"),
+                SyncFileMode::Newest,
+                true,
+            ),
+            (
+                PathBuf::from("no-writeback.yaml"),
+                SyncFileMode::Newest,
+                false,
+            ),
+        ];
+
+        assert_eq!(
+            writeback_selected_files(&sync_folder, &user_dir, &selected_files).unwrap(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(user_dir.join("default.custom.yaml")).unwrap(),
+            "final content"
+        );
+        assert!(!user_dir.join("no-writeback.yaml").exists());
+    }
+
+    #[test]
+    fn newest_file_wins_and_keeps_its_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("WebDAV/custom.bin");
+        let newer = dir.path().join("device/custom.bin");
+        fs::create_dir_all(older.parent().unwrap()).unwrap();
+        fs::create_dir_all(newer.parent().unwrap()).unwrap();
+        fs::write(&older, b"old").unwrap();
+        fs::write(&newer, b"new").unwrap();
+        let old_time = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let new_time = filetime::FileTime::from_unix_time(1_800_000_000, 0);
+        filetime::set_file_mtime(&older, old_time).unwrap();
+        filetime::set_file_mtime(&newer, new_time).unwrap();
+
+        sync_newest_file(&older, &newer).unwrap();
+
+        assert_eq!(fs::read(&older).unwrap(), b"new");
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&older).unwrap()),
+            new_time
+        );
+    }
 }

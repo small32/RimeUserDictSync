@@ -4,50 +4,29 @@ use std::{
     fs,
     path::Path,
 };
-use walkdir::WalkDir;
 
-pub fn merge_directories(local_root: &Path, sync_root: &Path, name: &str) -> Result<usize> {
-    let local = local_root.join(name);
-    let sync = sync_root.join(name);
-    fs::create_dir_all(&local)?;
-    fs::create_dir_all(&sync)?;
-    let mut relative = HashSet::new();
-    for root in [&local, &sync] {
-        for entry in WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-        {
-            relative.insert(entry.path().strip_prefix(root)?.to_path_buf());
+pub fn merge_file(a: &Path, b: &Path) -> Result<()> {
+    if let Some(parent) = a.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = b.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match (a.is_file(), b.is_file()) {
+        (false, false) => {}
+        (false, true) => {
+            fs::copy(b, a)?;
+        }
+        (true, false) => {
+            fs::copy(a, b)?;
+        }
+        (true, true) => {
+            let merged = dictionary_union(a, b)?;
+            fs::write(a, &merged)?;
+            fs::write(b, merged)?;
         }
     }
-    let mut files: Vec<_> = relative.into_iter().collect();
-    files.sort();
-    for rel in &files {
-        let a = local.join(rel);
-        let b = sync.join(rel);
-        if let Some(p) = a.parent() {
-            fs::create_dir_all(p)?;
-        }
-        if let Some(p) = b.parent() {
-            fs::create_dir_all(p)?;
-        }
-        match (a.exists(), b.exists()) {
-            (false, true) => {
-                fs::copy(&b, &a)?;
-            }
-            (true, false) => {
-                fs::copy(&a, &b)?;
-            }
-            (true, true) => {
-                let merged = dictionary_union(&a, &b)?;
-                fs::write(&a, &merged)?;
-                fs::write(&b, &merged)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(files.len())
+    Ok(())
 }
 
 fn dictionary_union(a: &Path, b: &Path) -> Result<String> {

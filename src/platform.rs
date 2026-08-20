@@ -99,11 +99,11 @@ pub fn find_rime(configured: &str, app_dir: &Path) -> Result<RimeCommand> {
         if !executable.is_file() {
             bail!("找不到鼠须管 Squirrel: {}", executable.display());
         }
-        return Ok(RimeCommand {
+        Ok(RimeCommand {
             executable,
             sync_arg: "--sync",
             deploy_arg: "--reload",
-        });
+        })
     }
     #[cfg(target_os = "linux")]
     {
