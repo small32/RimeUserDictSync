@@ -15,6 +15,10 @@ use std::{
     },
 };
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_TITLE: &str = concat!("RIME 用户词库同步工具 v", env!("CARGO_PKG_VERSION"));
+const GITHUB_URL: &str = "https://github.com/small32/RimeUserDictSync";
+
 enum Event {
     Log(String),
     Progress(u8),
@@ -43,14 +47,14 @@ pub fn run() -> eframe::Result {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([760., 520.])
         .with_min_inner_size([min_width, 420.])
-        .with_title("RIME 用户词库同步工具");
+        .with_title(APP_TITLE);
     let viewport = if let Some(i) = icon {
         viewport.with_icon(i)
     } else {
         viewport
     };
     eframe::run_native(
-        "RIME 用户词库同步工具",
+        APP_TITLE,
         eframe::NativeOptions {
             viewport,
             ..Default::default()
@@ -123,6 +127,7 @@ struct App {
     progress: u8,
     busy: bool,
     show_webdav: bool,
+    show_about: bool,
     show_sync_files: bool,
     sync_files_draft: Vec<SyncFile>,
     sync_files_selected: Vec<bool>,
@@ -158,6 +163,7 @@ impl App {
             progress: 0,
             busy: false,
             show_webdav: false,
+            show_about: false,
             show_sync_files: false,
             sync_files_draft: Vec::new(),
             sync_files_selected: Vec::new(),
@@ -423,6 +429,9 @@ impl eframe::App for App {
                         self.show_config_files = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("关于").clicked() {
+                            self.show_about = true;
+                        }
                         if ui
                             .add_enabled(self.busy, egui::Button::new("停止同步"))
                             .clicked()
@@ -722,6 +731,38 @@ impl eframe::App for App {
                 });
             if !open {
                 self.show_config_files = false;
+            }
+        }
+        if self.show_about {
+            let mut open = true;
+            egui::Window::new("关于 RIME 用户词库同步工具")
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size([620., 260.])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.heading("关于 RIME 用户词库同步工具");
+                    ui.add_space(6.);
+                    ui.label(format!("版本：v{APP_VERSION}"));
+                    ui.add_space(8.);
+                    ui.label(
+                        "RIME 用户词库同步工具是一款支持 Windows 和 macOS 的 RIME 用户数据 WebDAV 同步工具，适用于小狼毫和鼠须管。",
+                    );
+                    ui.add_space(8.);
+                    ui.label(
+                        "本项目为开源软件。源代码、使用说明、版本更新和问题反馈请访问 GitHub：",
+                    );
+                    ui.hyperlink_to(GITHUB_URL, GITHUB_URL);
+                    ui.add_space(8.);
+                    ui.label("许可证：GNU General Public License v3.0");
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        if ui.button("确定").clicked() {
+                            self.show_about = false;
+                        }
+                    });
+                });
+            if !open {
+                self.show_about = false;
             }
         }
         if let Some(text) = self.notice.clone() {
