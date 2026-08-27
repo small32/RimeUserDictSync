@@ -187,10 +187,10 @@ impl WebDav {
         Ok(())
     }
     pub fn upload_file(&self, relative: &str, source: &Path) -> Result<()> {
-        if let Some((dir, _)) = relative.rsplit_once('/') {
-            if !dir.is_empty() {
-                self.ensure_collection(dir)?;
-            }
+        if let Some((dir, _)) = relative.rsplit_once('/')
+            && !dir.is_empty()
+        {
+            self.ensure_collection(dir)?;
         }
         let bytes = fs::read(source)?;
         Self::ok(

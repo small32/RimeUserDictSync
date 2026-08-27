@@ -66,11 +66,11 @@ pub fn unpack(archive: &Path, root: &Path) -> Result<()> {
         }
         let mut out = fs::File::create(&target)?;
         std::io::copy(&mut entry, &mut out)?;
-        if let Some(dt) = entry.last_modified() {
-            if let Ok(t) = OffsetDateTime::try_from(dt) {
-                let st: SystemTime = t.into();
-                filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(st))?;
-            }
+        if let Some(dt) = entry.last_modified()
+            && let Ok(t) = OffsetDateTime::try_from(dt)
+        {
+            let st: SystemTime = t.into();
+            filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(st))?;
         }
     }
     Ok(())
