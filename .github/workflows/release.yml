@@ -149,8 +149,8 @@ jobs:
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "RimeUserDictSync $RELEASE_TAG" \
-              --generate-notes
+              --title "$RELEASE_TAG 更新说明" \
+              --notes-file RELEASE_NOTES.md
           fi
           gh release upload "$RELEASE_TAG" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \

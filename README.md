@@ -7,7 +7,9 @@
 ## 主要功能
 
 - Windows 调用 `WeaselDeployer.exe /sync`，macOS 调用 `Squirrel --sync`。
-- 通过 WebDAV 下载和覆盖上传同步资料。
+- 通过 WebDAV 下载和覆盖上传同步资料；同步数据在上传前打包为单个
+  `webdav-sync.zip`，下载时只需获取并解压这一个压缩包。
+- 上传新压缩包成功后，自动清理远端遗留的旧版散文件与目录（仅保留压缩包）。
 - RIME 自带的用户资料由小狼毫或鼠须管原生同步功能生成。
 - 支持多选其他同步文件，并为每个文件选择“按并集同步”或“按时间同步”。
 - 按设置回写自选文件后，在 Windows 调用
@@ -58,6 +60,7 @@ RimeUserDictSync.ini
 RimeSync.log
 Sync
 ├─ WebDAV
+├─ webdav-sync.zip
 └─ <installation_id>
 ```
 
@@ -69,6 +72,7 @@ macOS 版则生成在：
 ├─ RimeSync.log
 └─ Sync/
    ├─ WebDAV/
+   ├─ webdav-sync.zip
    └─ <installation_id>/
 ```
 
@@ -90,6 +94,7 @@ macOS 版则生成在：
 - `RimeUserDictSync.ini`：保存 RIME 用户词库位置、WebDAV 设置和同步文件选择。升级时程序会自动迁移旧的 `WeaselUserDictSync.ini`。
 - `RimeSync.log`：保存程序工作日志。
 - `Sync\WebDAV`：WebDAV 远端内容的临时本地镜像。
+- `Sync\webdav-sync.zip`：打包上传用的临时压缩包，上传/清理完成后即删除。
 - `Sync\<installation_id>`：当前 RIME 安装实例的同步文件夹。
 
 `<installation_id>` 来自所选 RIME 用户词库目录中的 `installation.yaml`，程序不会修改
@@ -254,9 +259,12 @@ macOS 上调用鼠须管：
 
 两个平台执行相同的 WebDAV 处理：
 
-- WebDAV 有内容时，先清空旧的 `Sync\WebDAV` 镜像，再完整下载远端文件。
-- 下载时读取 WebDAV 的 `getlastmodified`，并将其保存为本地文件修改日期。
-- WebDAV 没有内容时，用当前同步资料初始化 `Sync\WebDAV` 并直接上传。
+- WebDAV 远端已有压缩包 `webdav-sync.zip`：只下载这一个文件，解压到 `Sync\WebDAV`
+  镜像目录。压缩包内条目保留原始修改时间，供“按时间同步”使用。
+- WebDAV 远端只有旧版散文件（无压缩包）：进入兼容迁移模式，按旧逻辑完整下载全部
+  文件；本次上传后即自动完成向压缩包格式的迁移。
+- WebDAV 没有内容时，用当前同步资料初始化 `Sync\WebDAV`，打包 `webdav-sync.zip`
+  并上传。
 
 每次下载完成后，程序都会检查当前平台 WebDAV 镜像目录中的
 `installation.yaml`：
@@ -272,7 +280,7 @@ macOS 上调用鼠须管：
 installation_id: WebDAV
 ```
 
-如果字段不存在或值不是 `WebDAV`，程序会立即修正；最终会将修正后的文件覆盖上传回
+如果字段不存在或值不是 `WebDAV`，程序会立即修正；修正后的内容会随压缩包一并上传回
 WebDAV。此操作不会修改 RIME 用户词库目录中 `installation.yaml` 的
 `installation_id`。
 
@@ -338,14 +346,20 @@ macOS 上调用鼠须管：
 
 重新部署成功后才继续后续步骤。
 
-### 步骤 6：覆盖上传 WebDAV
+### 步骤 6：打包上传 WebDAV
 
-程序将当前平台的 WebDAV 镜像目录中所有文件递归上传到 WebDAV：
+程序将当前平台的 WebDAV 镜像目录打包为单个 `webdav-sync.zip`，然后使用 `PUT`
+上传覆盖远端同名文件：
 
 - 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
 - 鼠须管（macOS）：`<macOS 配置目录>/Sync/WebDAV`
 
-两个平台都会对同名远端文件使用 `PUT` 直接覆盖。
+上传成功后，程序会列出远端顶层目录并清理其中除 `webdav-sync.zip` 以外的全部旧
+文件与目录（即旧版散文件或已废弃的目录）。清理失败的项会记录在日志中，不影响本次
+同步结果，可稍后手动删除。
+
+> 注意：请为本程序使用专用的 WebDAV 远端文件夹。上传成功后该文件夹内除压缩包外的
+> 其他内容会被自动清理。
 
 ### 步骤 7：清理工作目录
 
@@ -374,7 +388,8 @@ RimeSync.log
 每条记录前都有 `YYYYMMDDHHmmss` 格式的时间戳，例如：
 
 ```text
-20260818224759 步骤 2/7：下载 WebDAV 文件: 15 个。
+20260827114512 步骤 2/7：远端为旧版散文件 15 个，进入兼容迁移模式。
+20260827114512 步骤 6/7：已清理远端遗留的旧文件/目录 16 项。
 ```
 
 日志不会记录 WebDAV 密码。
@@ -417,9 +432,23 @@ macOS 默认使用：
 这是正常的安全保护。程序只在 WebDAV 完整上传成功后清空工作目录。解决连接问题后
 重新运行同步即可。
 
+### 从旧版升级后，WebDAV 里的散文件会怎样？
+
+新版使用单个 `webdav-sync.zip` 存储全部同步数据。首次使用新版同步时，程序会
+自动检测到远端只有旧版散文件，进入兼容迁移模式：先完整下载并合并散文件，再打包
+上传新压缩包，上传成功后自动清理远端遗留的散文件与目录。整个过程无需手动操作。
+
+### 远端为什么只剩一个 `webdav-sync.zip`
+
+这是新版设计。所有同步数据（含安装标识与备份）都打包进这一个文件，下载时只需
+获取并解压它。请为该程序使用专用的 WebDAV 文件夹，不要在目录中混放其他内容，
+否则会被自动清理。
+
 ## 数据安全建议
 
 - 首次使用前建议备份 RIME 用户词库和 WebDAV 数据。
+- 为程序使用专用的 WebDAV 文件夹，避免与其他文件混用（上传成功后远端会清理除压缩包
+  外的其他内容）。
 - 不要同时运行多个本程序实例。
 - 不要在同步过程中关闭计算机或手动移动 `Sync` 目录。
 - 不要公开包含 WebDAV 凭据的 `RimeUserDictSync.ini`。

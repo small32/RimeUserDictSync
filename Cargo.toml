@@ -1,6 +1,6 @@
 [package]
 name = "rime-user-dict-sync"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Cross-platform RIME user dictionary WebDAV synchronizer"
 license = "GPL-3.0-only"
@@ -22,8 +22,10 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rfd = "0.15"
 roxmltree = "0.20"
+time = "0.3"
 url = "2"
 walkdir = "2"
+zip = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

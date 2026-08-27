@@ -1,5 +1,5 @@
 use crate::{
-    config::{Settings, SyncFileMode, validate_installation_id, yaml_scalar},
+    archive, config::{Settings, SyncFileMode, validate_installation_id, yaml_scalar},
     dictionary, platform,
     webdav::WebDav,
 };
@@ -92,13 +92,31 @@ pub fn run(
     check(&cancel)?;
     let remote = dav.list_recursive()?;
     recreate(&local_folder)?;
+    let archive_path = fixed_root.join(archive::ARCHIVE_NAME);
+    let remote_archive = remote.iter().find(|f| f.relative == archive::ARCHIVE_NAME);
     if remote.is_empty() {
         report.log("步骤 2/7：WebDAV 远端为空，使用当前同步数据初始化。");
         copy_dir(&sync_folder, &local_folder)?;
         ensure_webdav_installation(&local_folder)?;
-        dav.upload_directory(&local_folder)?;
+        report.log(&format!(
+            "步骤 2/7：打包并上传初始化压缩包 {}。",
+            archive::ARCHIVE_NAME
+        ));
+        archive::pack(&local_folder, &archive_path)?;
+        dav.upload_file(archive::ARCHIVE_NAME, &archive_path)?;
+    } else if let Some(archive_file) = remote_archive {
+        report.log(&format!(
+            "步骤 2/7：下载远端压缩包 {} 并解压。",
+            archive::ARCHIVE_NAME
+        ));
+        dav.download_file(&archive_file.relative, &archive_path, archive_file.modified)?;
+        archive::unpack(&archive_path, &local_folder)?;
+        ensure_webdav_installation(&local_folder)?;
     } else {
-        report.log(&format!("步骤 2/7：下载 WebDAV 文件 {} 个。", remote.len()));
+        report.log(&format!(
+            "步骤 2/7：远端为旧版散文件 {} 个，进入兼容迁移模式。",
+            remote.len()
+        ));
         dav.download(&remote, &local_folder)?;
         ensure_webdav_installation(&local_folder)?;
     }
@@ -131,12 +149,31 @@ pub fn run(
     report.progress(80);
 
     check(&cancel)?;
-    report.log("步骤 6/7：覆盖上传本地文件夹全部内容到 WebDAV。");
-    dav.upload_directory(&local_folder)?;
+    report.log(&format!(
+        "步骤 6/7：打包本地文件夹为 {} 并覆盖上传到 WebDAV。",
+        archive::ARCHIVE_NAME
+    ));
+    archive::pack(&local_folder, &archive_path)?;
+    dav.upload_file(archive::ARCHIVE_NAME, &archive_path)?;
+    let outcome = dav.cleanup_except(&[archive::ARCHIVE_NAME])?;
+    if !outcome.removed.is_empty() {
+        report.log(&format!(
+            "步骤 6/7：已清理远端遗留的旧文件/目录 {} 项。",
+            outcome.removed.len()
+        ));
+    }
+    if !outcome.failed.is_empty() {
+        report.log(&format!(
+            "步骤 6/7：有 {} 项旧文件清理失败，请稍后手动检查：{:?}",
+            outcome.failed.len(),
+            outcome.failed
+        ));
+    }
     report.progress(95);
     report.log("步骤 7/7：上传完成，清空本地文件夹和同步文件夹（保留目录）。");
     clear(&local_folder)?;
     clear(&sync_folder)?;
+    let _ = fs::remove_file(&archive_path);
     report.progress(100);
     report.log("全部同步步骤已完成。");
     Ok(())

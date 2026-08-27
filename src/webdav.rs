@@ -12,12 +12,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 use url::Url;
-use walkdir::WalkDir;
 
 #[derive(Clone)]
 pub struct RemoteFile {
     pub relative: String,
     pub modified: Option<SystemTime>,
+}
+pub struct CleanupOutcome {
+    pub removed: Vec<String>,
+    pub failed: Vec<(String, String)>,
 }
 pub struct WebDav {
     root: Url,
@@ -159,56 +162,111 @@ impl WebDav {
     }
     pub fn download(&self, files: &[RemoteFile], root: &Path) -> Result<()> {
         for remote in files {
-            let target = safe_local(root, &remote.relative)?;
-            if let Some(p) = target.parent() {
-                fs::create_dir_all(p)?;
-            }
-            let mut response = Self::ok(
-                self.request("GET", self.uri(&remote.relative, false)?)
-                    .send()?,
-                "下载 WebDAV 文件",
-            )?;
-            let header_time = response
-                .headers()
-                .get(header::LAST_MODIFIED)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| httpdate::parse_http_date(s).ok());
-            let mut file = fs::File::create(&target)?;
-            std::io::copy(&mut response, &mut file)?;
-            if let Some(time) = remote.modified.or(header_time) {
-                filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(time))?;
-            }
+            self.download_file(&remote.relative, &safe_local(root, &remote.relative)?, remote.modified)?;
         }
         Ok(())
     }
-    pub fn upload_directory(&self, root: &Path) -> Result<()> {
-        self.ensure_collection("")?;
-        let mut dirs: Vec<_> = WalkDir::new(root)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_dir())
-            .map(|e| e.into_path())
-            .collect();
-        dirs.sort_by_key(|p| p.components().count());
-        for dir in dirs {
-            self.ensure_collection(&relative(root, &dir)?)?;
+    pub fn download_file(&self, relative: &str, target: &Path, modified: Option<SystemTime>) -> Result<()> {
+        if let Some(p) = target.parent() {
+            fs::create_dir_all(p)?;
         }
-        for entry in WalkDir::new(root)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-        {
-            let bytes = fs::read(entry.path())?;
-            Self::ok(
-                self.request("PUT", self.uri(&relative(root, entry.path())?, false)?)
-                    .body(bytes)
-                    .send()?,
-                "上传 WebDAV 文件",
-            )?;
+        let mut response = Self::ok(
+            self.request("GET", self.uri(relative, false)?).send()?,
+            "下载 WebDAV 文件",
+        )?;
+        let header_time = response
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| httpdate::parse_http_date(s).ok());
+        let mut file = fs::File::create(target)?;
+        std::io::copy(&mut response, &mut file)?;
+        if let Some(time) = modified.or(header_time) {
+            filetime::set_file_mtime(target, filetime::FileTime::from_system_time(time))?;
         }
         Ok(())
+    }
+    pub fn upload_file(&self, relative: &str, source: &Path) -> Result<()> {
+        if let Some((dir, _)) = relative.rsplit_once('/') {
+            if !dir.is_empty() {
+                self.ensure_collection(dir)?;
+            }
+        }
+        let bytes = fs::read(source)?;
+        Self::ok(
+            self.request("PUT", self.uri(relative, false)?)
+                .body(bytes)
+                .send()?,
+            "上传 WebDAV 文件",
+        )?;
+        Ok(())
+    }
+    fn list_top_level(&self) -> Result<Vec<(String, bool)>> {
+        let body = r#"<?xml version="1.0"?><propfind xmlns="DAV:"><prop><resourcetype/><getlastmodified/></prop></propfind>"#;
+        let response = self
+            .request("PROPFIND", self.uri("", true)?)
+            .header("Depth", "1")
+            .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(body)
+            .send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        let bytes = Self::ok(response, "列出 WebDAV")?.bytes()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let doc = Document::parse(&text).context("解析 WebDAV XML 失败")?;
+        let mut out = Vec::new();
+        for node in doc
+            .descendants()
+            .filter(|n| n.has_tag_name(("DAV:", "response")))
+        {
+            let href = node
+                .descendants()
+                .find(|n| n.has_tag_name(("DAV:", "href")))
+                .and_then(|n| n.text())
+                .unwrap_or("");
+            let item = self.relative_from_href(href)?;
+            if item.is_empty() {
+                continue;
+            }
+            let collection = node
+                .descendants()
+                .any(|n| n.has_tag_name(("DAV:", "collection")));
+            out.push((item, collection));
+        }
+        Ok(out)
+    }
+    pub fn cleanup_except(&self, keep: &[&str]) -> Result<CleanupOutcome> {
+        let mut outcome = CleanupOutcome {
+            removed: Vec::new(),
+            failed: Vec::new(),
+        };
+        for (relative, is_dir) in self.list_top_level()? {
+            if keep.contains(&relative.as_str()) {
+                continue;
+            }
+            let response = self
+                .request("DELETE", self.uri(&relative, is_dir)?)
+                .send();
+            match response {
+                Ok(response)
+                    if response.status() == StatusCode::NOT_FOUND
+                        || response.status().is_success()
+                        || response.status().as_u16() == 207 =>
+                {
+                    outcome.removed.push(relative);
+                }
+                Ok(response) => {
+                    outcome
+                        .failed
+                        .push((relative.clone(), format!("HTTP {}", response.status())));
+                }
+                Err(error) => {
+                    outcome.failed.push((relative, format!("{error}")));
+                }
+            }
+        }
+        Ok(outcome)
     }
     fn ensure_collection(&self, relative: &str) -> Result<()> {
         let uri = self.uri(relative, true)?;
@@ -225,12 +283,6 @@ impl WebDav {
         Self::ok(self.request("MKCOL", uri).send()?, "创建 WebDAV 目录")?;
         Ok(())
     }
-}
-fn relative(root: &Path, path: &Path) -> Result<String> {
-    Ok(path
-        .strip_prefix(root)?
-        .to_string_lossy()
-        .replace('\\', "/"))
 }
 fn safe_local(root: &Path, relative: &str) -> Result<PathBuf> {
     let mut out = root.to_path_buf();
