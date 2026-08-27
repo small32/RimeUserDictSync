@@ -162,11 +162,20 @@ impl WebDav {
     }
     pub fn download(&self, files: &[RemoteFile], root: &Path) -> Result<()> {
         for remote in files {
-            self.download_file(&remote.relative, &safe_local(root, &remote.relative)?, remote.modified)?;
+            self.download_file(
+                &remote.relative,
+                &safe_local(root, &remote.relative)?,
+                remote.modified,
+            )?;
         }
         Ok(())
     }
-    pub fn download_file(&self, relative: &str, target: &Path, modified: Option<SystemTime>) -> Result<()> {
+    pub fn download_file(
+        &self,
+        relative: &str,
+        target: &Path,
+        modified: Option<SystemTime>,
+    ) -> Result<()> {
         if let Some(p) = target.parent() {
             fs::create_dir_all(p)?;
         }
@@ -192,10 +201,12 @@ impl WebDav {
         {
             self.ensure_collection(dir)?;
         }
-        let bytes = fs::read(source)?;
+        let file = fs::File::open(source)?;
+        let size = file.metadata()?.len();
         Self::ok(
             self.request("PUT", self.uri(relative, false)?)
-                .body(bytes)
+                .header(header::CONTENT_LENGTH, size)
+                .body(reqwest::blocking::Body::new(file))
                 .send()?,
             "上传 WebDAV 文件",
         )?;
@@ -245,9 +256,7 @@ impl WebDav {
             if keep.contains(&relative.as_str()) {
                 continue;
             }
-            let response = self
-                .request("DELETE", self.uri(&relative, is_dir)?)
-                .send();
+            let response = self.request("DELETE", self.uri(&relative, is_dir)?).send();
             match response {
                 Ok(response)
                     if response.status() == StatusCode::NOT_FOUND

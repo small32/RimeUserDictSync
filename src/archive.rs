@@ -21,11 +21,11 @@ pub fn pack(root: &Path, archive: &Path) -> Result<()> {
     let base = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o644);
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in WalkDir::new(root) {
+        let entry = entry.with_context(|| format!("遍历待打包目录 {}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let rel = entry
             .path()
             .strip_prefix(root)?
@@ -40,9 +40,9 @@ pub fn pack(root: &Path, archive: &Path) -> Result<()> {
         if let Some(t) = mtime {
             options = options.last_modified_time(t);
         }
-        writer.start_file(rel.clone(), options).with_context(|| {
-            format!("写入压缩包条目 {rel}")
-        })?;
+        writer
+            .start_file(rel.clone(), options)
+            .with_context(|| format!("写入压缩包条目 {rel}"))?;
         let mut file = fs::File::open(entry.path())?;
         std::io::copy(&mut file, &mut writer)?;
     }
@@ -126,5 +126,13 @@ mod tests {
         assert!(safe_local(&root, "../evil").is_err());
         assert!(safe_local(&root, "/abs").is_err());
         assert!(safe_local(&root, "ok/file").is_ok());
+    }
+
+    #[test]
+    fn pack_fails_when_source_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let archive = dir.path().join("pack.zip");
+        assert!(pack(&missing, &archive).is_err());
     }
 }
