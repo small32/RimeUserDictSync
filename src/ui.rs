@@ -18,12 +18,21 @@ use std::{
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_TITLE: &str = concat!("RIME 用户词库同步工具 v", env!("CARGO_PKG_VERSION"));
 const GITHUB_URL: &str = "https://github.com/small32/RimeUserDictSync";
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/small32/RimeUserDictSync/releases/latest";
+
+#[derive(Clone)]
+struct UpdateInfo {
+    version: String,
+    url: String,
+}
 
 enum Event {
     Log(String),
     Progress(u8),
     Finished(Result<(), String>),
     Tested(Result<(), String>),
+    UpdateChecked(Option<UpdateInfo>),
 }
 struct ChannelReporter {
     tx: Sender<Event>,
@@ -140,6 +149,7 @@ struct App {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     notice: Option<String>,
+    available_update: Option<UpdateInfo>,
 }
 impl App {
     fn new() -> Self {
@@ -153,6 +163,7 @@ impl App {
         let settings = Settings::load(&ini).unwrap_or_default();
         let logs = fs::read_to_string(&log_path).unwrap_or_default();
         let (tx, rx) = mpsc::channel();
+        check_for_update(tx.clone());
         fs::create_dir_all(base.join("Sync/WebDAV")).ok();
         Self {
             base,
@@ -176,6 +187,7 @@ impl App {
             tx,
             rx,
             notice: None,
+            available_update: None,
         }
     }
     fn append(&mut self, line: &str) {
@@ -212,6 +224,7 @@ impl App {
                         Err(e) => format!("测试失败：{e}"),
                     });
                 }
+                Event::UpdateChecked(update) => self.available_update = update,
             }
         }
     }
@@ -765,6 +778,29 @@ impl eframe::App for App {
                 self.show_about = false;
             }
         }
+        if let Some(update) = self.available_update.clone() {
+            let mut open = true;
+            egui::Window::new("发现新版本")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(format!("当前版本：v{APP_VERSION}"));
+                    ui.label(format!("最新版本：v{}", update.version));
+                    ui.add_space(8.);
+                    ui.label("发现新版本，是否前往 GitHub Release 页面下载？");
+                    ui.add_space(8.);
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to("前往下载", &update.url);
+                        if ui.button("稍后").clicked() {
+                            self.available_update = None;
+                        }
+                    });
+                });
+            if !open {
+                self.available_update = None;
+            }
+        }
         if let Some(text) = self.notice.clone() {
             let mut open = true;
             egui::Window::new("RIME 用户词库同步工具")
@@ -781,5 +817,64 @@ impl eframe::App for App {
                 self.notice = None;
             }
         }
+    }
+}
+
+fn check_for_update(tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        let update = fetch_latest_release().ok().flatten();
+        let _ = tx.send(Event::UpdateChecked(update));
+    });
+}
+
+fn fetch_latest_release() -> anyhow::Result<Option<UpdateInfo>> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("RimeUserDictSync/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get(LATEST_RELEASE_API)
+        .send()?
+        .error_for_status()?;
+    let json: serde_json::Value = serde_json::from_str(&response.text()?)?;
+    let tag = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("GitHub Release 缺少 tag_name"))?;
+    let url = json["html_url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("GitHub Release 缺少 html_url"))?;
+    available_release(tag, url, APP_VERSION)
+}
+
+fn available_release(tag: &str, url: &str, current: &str) -> anyhow::Result<Option<UpdateInfo>> {
+    let version_text = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
+    let latest = semver::Version::parse(version_text)?;
+    let current = semver::Version::parse(current)?;
+    Ok((latest > current).then(|| UpdateInfo {
+        version: latest.to_string(),
+        url: url.to_owned(),
+    }))
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn only_newer_stable_release_is_available() {
+        assert!(
+            available_release("v0.2.3", "https://example.test", "0.2.2")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            available_release("v0.2.2", "https://example.test", "0.2.2")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            available_release("v0.2.1", "https://example.test", "0.2.2")
+                .unwrap()
+                .is_none()
+        );
     }
 }

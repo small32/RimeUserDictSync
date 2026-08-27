@@ -15,6 +15,7 @@
 - 按设置回写自选文件后，在 Windows 调用
   `/deploy`，在 macOS 调用 `Squirrel --reload`。
 - 提供同步进度、实时日志、停止同步和 WebDAV 读写测试。
+- 启动后自动检查 GitHub 最新 Release；发现新版本时提示并可前往下载页面。
 - 同一套 Rust 源码可在 Windows、macOS 上原生编译；Windows 发布为单文件 EXE。
 
 ## 运行环境

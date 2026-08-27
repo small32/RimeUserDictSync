@@ -3020,6 +3020,8 @@ dependencies = [
  "reqwest",
  "rfd",
  "roxmltree",
+ "semver",
+ "serde_json",
  "tempfile",
  "time",
  "url",
