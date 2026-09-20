@@ -16,12 +16,14 @@ make_app() {
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     cp "$binary" "$app/Contents/MacOS/$APP_NAME"
     cp "$ROOT/macos/Info.plist" "$app/Contents/Info.plist"
-    sips -s format icns "$ROOT/weasel.ico" \
-        --out "$app/Contents/Resources/AppIcon.icns" >/dev/null
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$app/Contents/Info.plist"
+    cp "$ROOT/macos/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
     codesign --force --deep --sign - "$app"
 }
 
 cd "$ROOT"
+VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 cargo build --release --locked --target aarch64-apple-darwin
 cargo build --release --locked --target x86_64-apple-darwin
 

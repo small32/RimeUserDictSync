@@ -75,6 +75,9 @@ pub fn run() -> eframe::Result {
     )
 }
 fn load_icon() -> Option<Arc<egui::IconData>> {
+    #[cfg(target_os = "macos")]
+    let bytes = include_bytes!("../macos/AppIcon.png");
+    #[cfg(not(target_os = "macos"))]
     let bytes = include_bytes!("../weasel.ico");
     let image = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (w, h) = image.dimensions();
