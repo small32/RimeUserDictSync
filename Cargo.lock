@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "rime-user-dict-sync"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64",
