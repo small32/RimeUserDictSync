@@ -20,6 +20,8 @@ const APP_TITLE: &str = concat!("RIME 用户词库同步工具 v", env!("CARGO_P
 const GITHUB_URL: &str = "https://github.com/small32/RimeUserDictSync";
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/small32/RimeUserDictSync/releases/latest";
+const CONFIG_BROKEN_NOTICE: &str =
+    "配置文件读取失败，为避免覆盖原有配置已禁用保存；请手动修复或删除配置文件后重启程序。";
 
 #[derive(Clone)]
 struct UpdateInfo {
@@ -148,6 +150,7 @@ struct App {
     #[cfg(target_os = "macos")]
     config_dir_draft: String,
     password_visible: bool,
+    config_broken: bool,
     cancel: Arc<AtomicBool>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
@@ -163,8 +166,27 @@ impl App {
             let _ = fs::copy(&legacy_ini, &ini);
         }
         let log_path = base.join("RimeSync.log");
-        let settings = Settings::load(&ini).unwrap_or_default();
-        let logs = fs::read_to_string(&log_path).unwrap_or_default();
+        let mut logs = fs::read_to_string(&log_path).unwrap_or_default();
+        // 加载失败时不能静默换成空配置，否则用户再次保存会用空配置覆盖原文件。
+        let (settings, config_broken) = match Settings::load(&ini) {
+            Ok(settings) => (settings, false),
+            Err(error) => {
+                let line = sync::timestamped(&format!(
+                    "警告: 读取配置文件失败，已显示默认空配置且禁用保存，请修复或删除 {}: {error}",
+                    ini.display()
+                ));
+                logs.push_str(&line);
+                logs.push('\n');
+                if let Ok(mut f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(f, "{line}");
+                }
+                (Settings::default(), true)
+            }
+        };
         let (tx, rx) = mpsc::channel();
         check_for_update(tx.clone());
         fs::create_dir_all(base.join("Sync/WebDAV")).ok();
@@ -186,6 +208,7 @@ impl App {
             #[cfg(target_os = "macos")]
             config_dir_draft: String::new(),
             password_visible: false,
+            config_broken,
             cancel: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
@@ -249,6 +272,10 @@ impl App {
         });
     }
     fn choose_rime(&mut self) {
+        if self.config_broken {
+            self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+            return;
+        }
         if let Some(dir) = rfd::FileDialog::new()
             .set_directory(if self.settings.user_data_dir.is_empty() {
                 crate::platform::default_user_dir()
@@ -294,8 +321,11 @@ impl App {
         let Some(files) = rfd::FileDialog::new().set_directory(&user_dir).pick_files() else {
             return;
         };
+        // 规范化两侧路径，避免符号链接（如 /var 与 /private/var）导致前缀比较失败。
+        let canonical_root = user_dir.canonicalize().unwrap_or(user_dir);
         for file in files {
-            let Ok(relative) = file.strip_prefix(&user_dir) else {
+            let canonical_file = file.canonicalize().unwrap_or(file);
+            let Ok(relative) = canonical_file.strip_prefix(&canonical_root) else {
                 self.notice = Some("同步文件必须位于当前 RIME 用户词库目录内。".into());
                 continue;
             };
@@ -316,6 +346,9 @@ impl App {
     }
     #[cfg(target_os = "macos")]
     fn save_config_dir(&mut self) -> anyhow::Result<()> {
+        if self.config_broken {
+            anyhow::bail!("{}", CONFIG_BROKEN_NOTICE);
+        }
         let target = PathBuf::from(self.config_dir_draft.trim());
         if !target.is_absolute() {
             anyhow::bail!("配置目录必须是绝对路径");
@@ -520,12 +553,16 @@ impl eframe::App for App {
                                 self.test_webdav();
                             }
                             if ui.button("保存").clicked() {
-                                match self.settings.save(&self.ini) {
-                                    Ok(_) => {
-                                        self.append(&sync::timestamped("已保存 WebDAV 设置。"));
-                                        self.show_webdav = false;
+                                if self.config_broken {
+                                    self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+                                } else {
+                                    match self.settings.save(&self.ini) {
+                                        Ok(_) => {
+                                            self.append(&sync::timestamped("已保存 WebDAV 设置。"));
+                                            self.show_webdav = false;
+                                        }
+                                        Err(e) => self.notice = Some(e.to_string()),
                                     }
-                                    Err(e) => self.notice = Some(e.to_string()),
                                 }
                             }
                             if ui.button("取消").clicked() {
@@ -601,13 +638,17 @@ impl eframe::App for App {
                                 self.sync_files_selected.clear();
                             }
                             if ui.button("保存").clicked() {
-                                self.settings.sync_files = self.sync_files_draft.clone();
-                                match self.settings.save(&self.ini) {
-                                    Ok(_) => {
-                                        self.append(&sync::timestamped("已保存同步文件选择。"));
-                                        self.show_sync_files = false;
+                                if self.config_broken {
+                                    self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+                                } else {
+                                    self.settings.sync_files = self.sync_files_draft.clone();
+                                    match self.settings.save(&self.ini) {
+                                        Ok(_) => {
+                                            self.append(&sync::timestamped("已保存同步文件选择。"));
+                                            self.show_sync_files = false;
+                                        }
+                                        Err(e) => self.notice = Some(e.to_string()),
                                     }
-                                    Err(e) => self.notice = Some(e.to_string()),
                                 }
                             }
                             if ui.button("取消").clicked() {

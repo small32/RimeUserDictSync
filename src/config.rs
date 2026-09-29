@@ -42,14 +42,15 @@ impl Settings {
                 .unwrap_or_default()
         };
         let encoded = get("webdav", "password_base64");
+        // 单个字段损坏时降级为空密码，避免整个配置加载失败后被默认空配置覆盖。
         let password = if encoded.is_empty() {
             get("webdav", "password")
         } else {
-            String::from_utf8(
-                STANDARD
-                    .decode(encoded)
-                    .context("WebDAV 密码 Base64 无效")?,
-            )?
+            STANDARD
+                .decode(encoded)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_default()
         };
         let mut sync_files = parse_sync_file_entries(&get("sync_files", "file"));
         if sync_files.is_empty() {
@@ -206,8 +207,18 @@ pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
     let text = fs::read_to_string(path)?;
     let escaped = value.replace('\'', "''");
     let rx = Regex::new(&format!(r"(?m)^(\s*{}\s*:\s*).*$", regex::escape(key)))?;
-    let updated = if rx.is_match(&text) {
-        rx.replace(&text, format!("${{1}}'{escaped}'")).into_owned()
+    let updated = if let Some(captures) = rx.captures(&text) {
+        // 手动拼接：只替换第一处匹配，且避免值中的 $ 被当作捕获组引用。
+        let whole = captures.get(0).context("正则匹配结果缺少整体")?;
+        let prefix = captures.get(1).context("正则匹配结果缺少键前缀")?;
+        let mut updated = String::with_capacity(text.len() + escaped.len() + 2);
+        updated.push_str(&text[..whole.start()]);
+        updated.push_str(prefix.as_str());
+        updated.push('\'');
+        updated.push_str(&escaped);
+        updated.push('\'');
+        updated.push_str(&text[whole.end()..]);
+        updated
     } else {
         format!("{}\n{}: '{}'\n", text.trim_end(), key, escaped)
     };
@@ -216,14 +227,31 @@ pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
 }
 
 pub fn validate_installation_id(value: &str) -> Result<()> {
-    if value.trim().is_empty()
-        || matches!(value, "." | "..")
-        || value.eq_ignore_ascii_case("WebDAV")
-        || value.contains(['/', '\\'])
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || matches!(trimmed, "." | "..")
+        || trimmed.eq_ignore_ascii_case("WebDAV")
+        || trimmed.contains(['/', '\\'])
+        || trimmed.ends_with(['.', ' '])
+        || trimmed.contains(|c: char| {
+            matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control()
+        })
+        || is_windows_reserved_name(trimmed)
     {
         bail!("installation_id 不能安全地用作同步文件夹名称: {value}");
     }
     Ok(())
+}
+
+/// Windows 保留设备名不能用作文件夹名（按首个扩展名前的主干比较）。
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
 }
 
 pub fn app_dir() -> Result<PathBuf> {
@@ -303,5 +331,26 @@ mod tests {
             Settings::load(&ini).unwrap().sync_files,
             settings.sync_files
         );
+    }
+
+    #[test]
+    fn set_yaml_scalar_keeps_dollar_literal_and_first_match_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("installation.yaml");
+        fs::write(&yaml, "sync_dir: first\nsync_dir: second\n").unwrap();
+        set_yaml_scalar(&yaml, "sync_dir", r"C:\data$1\Sync").unwrap();
+        assert_eq!(
+            fs::read_to_string(&yaml).unwrap(),
+            "sync_dir: 'C:\\data$1\\Sync'\nsync_dir: second\n"
+        );
+    }
+
+    #[test]
+    fn installation_id_rejects_windows_reserved_and_invalid_chars() {
+        assert!(validate_installation_id("con").is_err());
+        assert!(validate_installation_id("COM1.txt").is_err());
+        assert!(validate_installation_id("a<b").is_err());
+        assert!(validate_installation_id("name.").is_err());
+        assert!(validate_installation_id("my-laptop").is_ok());
     }
 }

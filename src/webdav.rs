@@ -33,7 +33,10 @@ impl WebDav {
     pub fn new(url: &str, username: &str, password: &str) -> Result<Self> {
         let root =
             Url::parse(&format!("{}/", url.trim_end_matches('/'))).context("WebDAV 地址无效")?;
-        let client = Client::builder().timeout(Duration::from_secs(90)).build()?;
+        // 大压缩包在慢速网络上传/下载可能远超 90 秒，超时设为 10 分钟。
+        let client = Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()?;
         Ok(Self {
             root,
             client,
@@ -155,7 +158,10 @@ impl WebDav {
     fn relative_from_href(&self, href: &str) -> Result<String> {
         let url = self.root.join(href)?;
         let base = self.root.path();
-        let path = url.path().strip_prefix(base).unwrap_or(url.path());
+        let path = url
+            .path()
+            .strip_prefix(base)
+            .with_context(|| format!("WebDAV 返回的条目不在同步根目录下: {href}"))?;
         Ok(percent_decode_str(path.trim_start_matches('/'))
             .decode_utf8_lossy()
             .replace('/', std::path::MAIN_SEPARATOR_STR))
@@ -278,6 +284,26 @@ impl WebDav {
         Ok(outcome)
     }
     fn ensure_collection(&self, relative: &str) -> Result<()> {
+        // 逐级创建祖先目录：部分服务器在父目录不存在时会拒绝 MKCOL。
+        let mut current = String::new();
+        for segment in relative
+            .replace('\\', "/")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        {
+            if current.is_empty() {
+                current = segment;
+            } else {
+                current.push('/');
+                current.push_str(&segment);
+            }
+            self.ensure_single_collection(&current)?;
+        }
+        Ok(())
+    }
+    fn ensure_single_collection(&self, relative: &str) -> Result<()> {
         let uri = self.uri(relative, true)?;
         let probe = self
             .request("PROPFIND", uri.clone())

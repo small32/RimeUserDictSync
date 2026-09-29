@@ -22,7 +22,7 @@ pub fn default_user_dir() -> PathBuf {
                 && let Ok::<String, _>(dir) = key.get_value("RimeUserDir")
                 && !dir.trim().is_empty()
             {
-                return PathBuf::from(dir);
+                return PathBuf::from(expand_env(&dir));
             }
         }
         return std::env::var_os("APPDATA")
@@ -55,7 +55,7 @@ pub fn find_rime(configured: &str, app_dir: &Path) -> Result<RimeCommand> {
     {
         let mut candidates = Vec::new();
         if !configured.trim().is_empty() {
-            candidates.push(PathBuf::from(configured));
+            candidates.push(PathBuf::from(expand_env(configured)));
         }
         candidates.push(app_dir.join("WeaselDeployer.exe"));
         use winreg::{RegKey, enums::*};
@@ -66,10 +66,10 @@ pub fn find_rime(configured: &str, app_dir: &Path) -> Result<RimeCommand> {
             for flags in [KEY_READ | KEY_WOW64_64KEY, KEY_READ | KEY_WOW64_32KEY] {
                 if let Ok(key) = hive.open_subkey_with_flags("SOFTWARE\\Rime\\Weasel", flags) {
                     if let Ok::<String, _>(dir) = key.get_value("WeaselRoot") {
-                        candidates.push(PathBuf::from(dir).join("WeaselDeployer.exe"));
+                        candidates.push(PathBuf::from(expand_env(&dir)).join("WeaselDeployer.exe"));
                     }
                     if let Ok::<String, _>(dir) = key.get_value("InstallDir") {
-                        add_install_dir_candidates(&mut candidates, Path::new(&dir));
+                        add_install_dir_candidates(&mut candidates, Path::new(&expand_env(&dir)));
                     }
                 }
             }
@@ -94,7 +94,7 @@ pub fn find_rime(configured: &str, app_dir: &Path) -> Result<RimeCommand> {
         let executable = if configured.trim().is_empty() {
             PathBuf::from("/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel")
         } else {
-            PathBuf::from(configured)
+            PathBuf::from(expand_env(configured))
         };
         if !executable.is_file() {
             bail!("找不到鼠须管 Squirrel: {}", executable.display());
@@ -107,7 +107,7 @@ pub fn find_rime(configured: &str, app_dir: &Path) -> Result<RimeCommand> {
     }
     #[cfg(target_os = "linux")]
     {
-        let executable = PathBuf::from(configured);
+        let executable = PathBuf::from(expand_env(configured));
         if executable.as_os_str().is_empty() || !executable.is_file() {
             bail!("Linux 需要在配置中指定可执行的 RIME 部署工具；不同前端的命令并不统一");
         }
@@ -153,5 +153,50 @@ pub fn run(command: &RimeCommand, arg: &str, cancel: &AtomicBool) -> Result<()> 
             bail!("RIME 命令执行失败，退出码 {:?}", status.code());
         }
         std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// 展开 %VAR% 形式的环境变量（注册表 REG_EXPAND_SZ 与旧版 INI 值可能包含）。
+pub fn expand_env(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        let expanded = after.find('%').and_then(|end| {
+            let name = &after[..end];
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                std::env::var(name).ok().map(|var| (end, var))
+            } else {
+                None
+            }
+        });
+        out.push_str(&rest[..start]);
+        if let Some((end, var)) = expanded {
+            out.push_str(&var);
+            rest = &after[end + 1..];
+        } else {
+            out.push('%');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_env_expands_known_variables_and_keeps_unknown() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        assert!(!path.is_empty());
+        assert_eq!(expand_env("x%PATH%y"), format!("x{path}y"));
+        assert_eq!(
+            expand_env("%NO_SUCH_VARIABLE_XYZ%"),
+            "%NO_SUCH_VARIABLE_XYZ%"
+        );
+        assert_eq!(expand_env("100%"), "100%");
+        assert_eq!(expand_env("%%"), "%%");
     }
 }

@@ -32,7 +32,7 @@ pub fn run(
     let user_dir = if settings.user_data_dir.trim().is_empty() {
         platform::default_user_dir()
     } else {
-        PathBuf::from(&settings.user_data_dir)
+        PathBuf::from(platform::expand_env(&settings.user_data_dir))
     };
     let installation = user_dir.join("installation.yaml");
     if !installation.is_file() {
@@ -145,7 +145,13 @@ pub fn run(
     let writeback_count = writeback_selected_files(&sync_folder, &user_dir, &selected_files)?;
     report.log(&format!("步骤 5/7：已回写 {writeback_count} 个自选文件。"));
     report.log("步骤 5/7：开始重新部署 RIME。");
-    platform::run(&rime, rime.deploy_arg, &cancel)?;
+    if let Err(error) = platform::run(&rime, rime.deploy_arg, &cancel) {
+        // 部署失败只影响本机生效，词库数据不受影响；用户主动停止时仍需中断。
+        check(&cancel)?;
+        report.log(&format!(
+            "步骤 5/7：RIME 重新部署失败，同步数据不受影响，可稍后手动部署: {error}"
+        ));
+    }
     report.progress(80);
 
     check(&cancel)?;
