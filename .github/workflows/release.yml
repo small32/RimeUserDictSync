@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.2 (must match Cargo.toml)"
+        description: "Release tag, for example v0.3.0 (must match Cargo.toml)"
         required: true
         type: string
 
@@ -18,42 +18,78 @@ concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-windows:
+  # 先把 tag 与 Cargo.toml 的版本对齐，后面两个平台就不用各查一遍，
+  # 也就不会出现「Windows 构建成功、macOS 才发现版本号不对」这种半截状态。
+  resolve:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Tag must match Cargo.toml version
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$VERSION" ]]; then
+            echo "无法从 Cargo.toml 读到版本号" >&2
+            exit 1
+          fi
+          if [[ "$TAG" != "v$VERSION" ]]; then
+            echo "Release tag $TAG 与 Cargo.toml 的版本 $VERSION 不一致" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "标签 $TAG 与 Cargo.toml 版本 $VERSION 一致"
+
+  windows:
     name: Windows x64
+    needs: resolve
     runs-on: windows-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Select Rust stable
-        run: rustup default stable
-
-      - name: Validate tag and package version
+      - name: Select Rust stable with fmt and clippy
         shell: pwsh
         run: |
-          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = $metadata.packages[0].version
-          if ($tag -ne "v$version") {
-            throw "Release tag $tag does not match Cargo.toml version $version"
-          }
-          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          rustup default stable
+          rustup component add rustfmt clippy
 
-      - name: Test
-        run: cargo test --locked
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Test
+        run: cargo test --locked
+
       - name: Build release executable
         run: cargo build --release --locked
 
+      # 单文件便携版：齿轮图标已经内嵌在 EXE 里（资源 ID 101），不需要额外带 .ico。
       - name: Stage Windows asset
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item target/release/RimeUserDictSync.exe "dist/RimeUserDictSync-$env:RELEASE_TAG-Windows-x64.exe"
+          Copy-Item target/release/RimeUserDictSync.exe `
+            "dist/RimeUserDictSync-${{ needs.resolve.outputs.tag }}-Windows-x64.exe"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
@@ -63,8 +99,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build-macos:
+  macos:
     name: macOS ARM64, Intel and Universal 2
+    needs: resolve
     runs-on: macos-latest
     steps:
       - name: Check out source
@@ -73,22 +110,16 @@ jobs:
       - name: Select Rust stable and install targets
         run: |
           rustup default stable
+          rustup component add rustfmt clippy
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Validate tag and package version
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${{ github.ref_name }}"
-          fi
-          VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          if [[ "$TAG" != "v$VERSION" ]]; then
-            echo "Release tag $TAG does not match Cargo.toml version $VERSION" >&2
-            exit 1
-          fi
-          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+      # 这里同时也是「非 Windows 代码编不编得过」的守门人：
+      # service / shortcut 两个模块只在 Windows 上编译，别处引用到就会在这一步炸掉。
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --locked
@@ -106,24 +137,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish-release:
+  publish:
     name: Publish one GitHub Release
     needs:
-      - build-windows
-      - build-macos
+      - resolve
+      - windows
+      - macos
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v7
-
-      - name: Resolve release tag
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "RELEASE_TAG=${{ inputs.tag }}" >> "$GITHUB_ENV"
-          else
-            echo "RELEASE_TAG=${{ github.ref_name }}" >> "$GITHUB_ENV"
-          fi
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
@@ -134,17 +157,20 @@ jobs:
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
+          set -euo pipefail
           cd release-assets
           find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\0' \
             | sort -z \
             | xargs -0 sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Create or update release and upload every platform
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
+          set -euo pipefail
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \

@@ -1,500 +1,489 @@
 # RIME 用户词库同步工具
 
-本项目已使用 Rust 重构为跨平台 RIME 用户词库同步工具。在 Windows 上配合
-小狼毫（Weasel）使用，在 macOS 上配合鼠须管（Squirrel）使用。程序调用对应平台 RIME
-前端自带的用户资料同步和重新部署功能，并通过 WebDAV 在不同设备之间同步用户词库。
+跨平台 RIME（Windows 小狼毫 / macOS 鼠须管）多设备词库同步工具，Rust 实现。
+设计目标：**多端最终一致、同步过程不打断输入、删除基本可用**。
+
+核心思路是把**传输**与**生效**解耦：
+
+- **后台纯搬运**（默认每 10 分钟）只做文件比对与搬运，不读写 `RIME/` 根目录下的源文件，
+  也不调用 RIME 的 `/sync`、`/deploy`，所以对正在打字的输入法零干扰；
+- **手动「同步词库」** 才执行合并、`/sync`、`/deploy`，让远端词条真正生效。
 
 ## 主要功能
 
-- Windows 调用 `WeaselDeployer.exe /sync`，macOS 调用 `Squirrel --sync`。
-- 通过 WebDAV 下载和覆盖上传同步资料；同步数据在上传前打包为单个
-  `webdav-sync.zip`，下载时只需获取并解压这一个压缩包。
-- 上传新压缩包成功后，自动清理远端遗留的旧版散文件与目录（仅保留压缩包）。
-- RIME 自带的用户资料由小狼毫或鼠须管原生同步功能生成。
-- 支持多选其他同步文件，并为每个文件选择“按并集同步”或“按时间同步”。
-- 按设置回写自选文件后，在 Windows 调用
-  `/deploy`，在 macOS 调用 `Squirrel --reload`。
-- 提供同步进度、实时日志、停止同步和 WebDAV 读写测试。
-- 启动后自动检查 GitHub 最新 Release；发现新版本时提示并可前往下载页面。
-- 同一套 Rust 源码可在 Windows、macOS 上原生编译；Windows 发布为单文件 EXE。
+- **数据分层**：`Sync/<ID>/` 放各设备的 userdb 快照（整文件增量），
+  `Sync/Others/` 放文本词典的公共合并结果（词条级并集）。
+- **后台搬运**：比对远端 `Others/` 与各设备 `<ID>/.index.json`，按需增量下载/上传。
+  可由 **Windows 服务**常驻执行（开机即跑、不必打开本程序），未安装服务时由程序内建线程兜底。
+- **手动同步**：严格按 拉取 → 并集 → 写回 → 上传 → `/sync` → `/deploy` 执行。
+- **按类型合并**：`*.dict.yaml` 词条并集取大权重；`*.txt` 按首列 key 并集；
+  `*.yaml`（非 dict）/`*.json`/`*.lua` 走 newest。
+- **三向判断**：newest 型文件双端同时修改时保留冲突副本并提示，绝不静默覆盖。
+- **设备 ID / 密码**：PBKDF2 派生串、原子抢占、密码验证接管、强制接管、注销、导出/导入。
+- **`session_token` 每轮校验**：同一 ID 被两台设备使用时，旧设备下一轮自动停止同步。
+- **WebDAV 能力探测**：自动选择 `If-Match` / ETag / size+mtime 三档上传校验。
+- 提供后台开关与间隔、进度条、实时日志、停止同步、连接与写入测试。
+- 启动后自动检查 GitHub 最新 Release；同一套源码可在 Windows、macOS 原生编译。
 
 ## 运行环境
 
-- Windows 10/11 并安装 小狼毫；或 macOS 并安装鼠须管。
-- WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT` 和 `DELETE`。
-- Windows 版的程序所在目录必须具有读写权限。
+- Windows 10/11 并安装小狼毫；或 macOS 并安装鼠须管。
+- WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT`、`DELETE`；
+  `If-Match`、`MOVE` 为可选（不支持会自动降级，方案仍可用）。
+- 程序所在目录（或 macOS 配置目录）必须可读写。建议不要放在 `Program Files` 下。
 
-建议不要将程序放在 `Program Files` 等需要管理员权限才能写入的目录中。
-
-macOS 版默认将配置、日志和同步数据保存在用户资料库，不会写入 `.app` 应用包；也可
-通过“配置文件”按钮改为其他目录：
+## 目录布局
 
 ```text
-~/Library/Application Support/RimeUserDictSync
+<RIME 用户目录>/                     Windows: %APPDATA%\Rime   macOS: ~/Library/Rime
+├─ installation.yaml                 installation_id / sync_dir / Password(派生串)
+├─ *.userdb/                         leveldb，设备私有，绝不上传
+├─ my_words.dict.yaml                本地源（权威副本）
+├─ .rime-sync/                       工具私有，严禁进 Sync/
+│  ├─ device.json                    ★ 设备配置的权威副本
+│  ├─ sync-index.json                三向判断基线与远端观测结果
+│  ├─ sync-list.json                 本设备同步列表 + 排除集
+│  ├─ sync.lock                      本地互斥锁
+│  └─ wake                           「立刻搬运一轮」的标记，服务跑完即删
+└─ Sync/                             ★ 唯一与 WebDAV 同步的目录
+   ├─ <ID_A>/                        A 的 userdb 快照 + .index.json + owner.json
+   ├─ <ID_B>/                        B 的快照（本机下载，供 /sync 合并）
+   └─ Others/                        ★ 单一共享目录
+      ├─ custom_phrase.txt
+      └─ cn_dicts/base.dict.yaml
 ```
 
-### macOS 编译与安装
+三处不能动的红线：
 
-安装 Rust stable 与 Xcode Command Line Tools 后，在仓库根目录执行：
+| 规则 | 原因 |
+| --- | --- |
+| 只把 `<RIME 用户目录>/Sync/` 纳入外部同步工具 | 整个 `Rime/` 会带上 `*.userdb/` leveldb 目录，必损坏 |
+| `device.json` / `sync-index.json` / `sync-list.json` 放 `Sync/` 外 | 每台设备基线不同，被同步会互相污染 |
+| `Others/` 内禁止 `*.userdb.txt` | librime 会把 `Others/` 当成一台"设备"参与合并 |
+| 同步文件名一律 ASCII | macOS 中文名是 NFD 分解、Windows 是 NFC，跨端不一致 |
 
-```bash
-./build-macos.sh
-```
-
-脚本一次生成三个压缩发布包：
-
-- `dist/RimeUserDictSync-macOS-arm64.zip`：Apple Silicon；
-- `dist/RimeUserDictSync-macOS-x86_64.zip`：Intel Mac；
-- `dist/RimeUserDictSync-macOS-universal.zip`：同时支持两种架构的 Universal 2 应用。
-
-解压所需版本，将应用拖入“应用程序”后即可启动。
-未经 Apple Developer ID 签名和公证的自行编译版本首次打开时，可能需要在 Finder 中
-右键应用并选择“打开”。
-
-## 文件和目录结构
-
-Windows 版首次运行后，会在程序自身所在目录生成以下内容：
+程序目录（Windows 为 EXE 所在目录，macOS 默认为
+`~/Library/Application Support/RimeUserDictSync`）只放程序自己的东西：
 
 ```text
-RIME用户词库同步.exe
-RimeUserDictSync.ini
-RimeSync.log
-Sync
-├─ WebDAV
-├─ webdav-sync.zip
-└─ <installation_id>
+RimeUserDictSync.ini    连接信息与后台间隔
+RimeSync.log            运行日志
 ```
-
-macOS 版则生成在：
-
-```text
-~/Library/Application Support/RimeUserDictSync/
-├─ RimeUserDictSync.ini
-├─ RimeSync.log
-└─ Sync/
-   ├─ WebDAV/
-   ├─ webdav-sync.zip
-   └─ <installation_id>/
-```
-
-在 Finder 中按 `Command + Shift + G`，输入
-`~/Library/Application Support/RimeUserDictSync` 即可打开。Windows 与 macOS 的主要
-路径差异如下：
-
-| 内容 | Windows | macOS |
-| --- | --- | --- |
-| RIME 用户目录 | `%APPDATA%\Rime` | `~/Library/Rime` |
-| INI 与日志 | 程序所在目录 | 用户选择的配置目录；默认为 `~/Library/Application Support/RimeUserDictSync` |
-| `Sync` 根目录 | `程序所在目录\Sync` | `用户选择的配置目录/Sync` |
-| RIME 前端 | Weasel | Squirrel |
-| 同步命令 | `WeaselDeployer.exe /sync` | `Squirrel --sync` |
-| 部署命令 | `WeaselDeployer.exe /deploy` | `Squirrel --reload` |
-
-各部分用途：
-
-- `RimeUserDictSync.ini`：保存 RIME 用户词库位置、WebDAV 设置和同步文件选择。升级时程序会自动迁移旧的 `WeaselUserDictSync.ini`。
-- `RimeSync.log`：保存程序工作日志。
-- `Sync\WebDAV`：WebDAV 远端内容的临时本地镜像。
-- `Sync\webdav-sync.zip`：打包上传用的临时压缩包，上传/清理完成后即删除。
-- `Sync\<installation_id>`：当前 RIME 安装实例的同步文件夹。
-
-`<installation_id>` 来自所选 RIME 用户词库目录中的 `installation.yaml`，程序不会修改
-该值。
 
 ## 首次配置
 
 ### 1. 指定 RIME 用户词库
 
-点击主窗口中的“指定RIME用户词库”，选择包含 `installation.yaml` 的 RIME 用户词库
-文件夹。默认用户词库位置通常是：
+点击「指定 RIME 用户词库」，选择包含 `installation.yaml` 的目录：
 
 ```text
-%APPDATA%\Rime
+Windows: %APPDATA%\Rime
+macOS:   ~/Library/Rime
 ```
 
-macOS：
+程序会读取其中的 `installation_id`，并把 `sync_dir` 写成该目录下的 `Sync`。
 
-```text
-~/Library/Rime
-```
+### 2. WebDAV 设置
 
-选择完成后，程序会：
+填写地址、用户名、密码，点击「测试连接」。测试会执行
+`MKCOL` + `PUT` + `GET` + `DELETE`，**只测 PROPFIND 会被只读共享骗过去**，
+所以必须测写；同时会探测服务端能力并显示上传校验档位。
 
-1. 将所选文件夹地址明文保存到 `RimeUserDictSync.ini`。
-2. 读取 `installation.yaml` 中原有的 `installation_id`。
-3. 保持 `installation_id` 不变。
-4. 将 `installation.yaml` 的 `sync_dir` 设置为本平台的数据目录下的 `Sync`。Windows
-   使用程序所在目录；macOS 使用当前配置目录（默认为
-   `~/Library/Application Support/RimeUserDictSync`）：
+请为本程序使用专用的远端文件夹，例如 `https://dav.example.com/rime-sync/`。
 
-```yaml
-sync_dir: '程序所在目录\Sync'
-```
+### 3. 设备设置（必做）
 
-macOS 示例：
+首次使用必须在这里确定设备身份：
 
-```yaml
-sync_dir: '/Users/你的用户名/Library/Application Support/RimeUserDictSync/Sync'
-```
+- **注册 / 验证并接管**：填设备 ID 与密码，点按钮。
+  - 远端没有这个 ID → 用 `MKCOL` **原子抢占**，写入 `<ID>/owner.json`；
+  - 远端已有这个 ID → **不会自动占用**，程序展示该 ID 的
+    主机名 / 首次注册时间 / 最后同步时间 / 快照文件数；
+    密码正确则接管（保留远端 userdb 快照、备份本地 `Others/`、签发新 token）；
+    密码错误直接拒绝，只能换 ID。
+  - 若该 ID 在 24 小时内还同步过，会额外提示"该设备似乎仍在使用"。
+- **强制接管**：忘记密码时的兜底，要求重设新密码。
+- **修改密码**：验证旧密码后重新派生；**不轮换 token**（本机身份没变）。
+- **注销此设备**：删除远端 `<ID>/` 与本地 `Sync/<ID>/`，避免孤儿目录被永久合并。
+- **导出 / 导入配置**：导出内容不含密码，重装后导入即可零冲突继续用。
 
-小狼毫实际使用的当前设备同步文件夹为：
+设备 ID 规则：`^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$`，并额外禁止 Windows 保留设备名与
+`Others`/`WebDAV` 等保留目录名；查重大小写不敏感。
 
-```text
-程序所在目录\Sync\<installation_id>
-```
+> **密码不是安全边界，是防误操作。** WebDAV 是纯存储、没有服务端鉴权，
+> 任何持有 WebDAV 凭据的人都能拿到 `owner.json`。密码真正挡住的是你自己在另一台
+> 机器上误填同一个 ID。
+>
+> `installation.yaml` 的 `Password` 保存的是 **KDF 派生串而不是明文**，
+> 因为它可能在其它同步工具的范围内、且用户经常直接查看或贴出来求助。
+> WebDAV 自身密码建议放进系统钥匙串，并**不要与 ID 密码相同**。
 
-### 2. 设置 WebDAV
+### 4. 同步文件选择（可选）
 
-点击“WebDAV设置”，填写：
+点击「同步文件选择」，添加你**真正改过的**文件。合并方式按类型自动判定，不需要手选：
 
-- WebDAV 文件夹地址；
-- 用户名；
-- 密码。
+| 类型 | 例子 | 规则 |
+| --- | --- | --- |
+| `*.dict.yaml` | `my_words.dict.yaml`、`cn_dicts/base.dict.yaml` | 词条级并集，同 key 取大权重 |
+| `*.txt` | `custom_phrase.txt`、`opencc/emoji.txt` | 按首列 key 并集 |
+| `*.yaml`（非 dict）、`*.json`、`*.lua` | `default.custom.yaml`、`opencc/t2s.json` | newest（带三向判断） |
+| `*.userdb.txt` | — | **禁止加入**（界面会拦截） |
 
-建议 WebDAV 地址以 `/` 结尾，并为本程序使用单独的远端文件夹，例如：
+`Others/` 里的文件分两种情况：
 
-```text
-https://dav.example.com/rime-sync/
-```
+| 情况 | 处理 |
+| --- | --- |
+| 本设备已登记 | 参与并集 → 写回本地源 → 覆盖 `Others/` |
+| 本设备未登记（他机登记过） | **只搬运，不合并不写回本地** |
 
-点击“测试连接”后，程序会：
+建议把自定义内容外置：新建 `my_words.dict.yaml` 挂到 schema 的 `dictionary:` 列表，
+而不是直接改 `cn_dicts/base.dict.yaml`。这样方案升级不会覆盖你的改动，也不存在版本漂移。
 
-1. 在 WebDAV 中上传一个随机命名的临时文件；
-2. 下载该文件；
-3. 校验下载内容是否与上传内容完全一致；
-4. 删除远端临时文件。
-
-以上操作全部成功后才会显示测试通过。
-
-WebDAV 密码以 Base64 形式保存在 INI 中。Base64 仅用于避免密码直接显示为明文，不等同
-于安全加密；请妥善保护程序目录和 INI 文件。
-
-### 3. 选择其他同步文件（可选）
-
-点击 WebDAV 设置右侧的“同步文件选择”，点击“添加文件”可从当前 RIME 用户词库目录
-多选文件。每个文件可单独设置同步方式和是否回写：
-
-- **按并集同步**：合并两侧 UTF-8 文本内容；词条和编码相同时保留较大权重。不能用于
-  gram 等二进制文件。
-- **按时间同步**：比较修改时间，以较新的文件覆盖较旧的文件，适合 gram 或其他无需
-  文本合并的文件。
-- **是否回写**：选择“是”时，同步完成后将最终文件覆盖回 RIME 用户目录中的源文件；
-  选择“否”时只更新同步数据，不修改源文件。新添加的文件默认选择“是”。
-
-列表左侧可勾选多个文件，并通过底部按钮批量改为按并集、按时间、回写或不回写。
-
-`wanxiang-lts-zh-hans.gram` 默认不再同步。如需同步，可手动添加并选择“按时间同步”。
-保存后，文件路径按分号分隔写入 INI：
-
-```ini
-[sync_files]
-file=default.custom.yaml/newest/N;custom/a.dict.yaml/union/Y
-```
-
-每项按 `文件名/同步方式/回写参数` 保存：同步方式为 `union`（按并集同步）或
-`newest`（按时间同步）；回写参数为 `Y`（覆盖源文件）或 `N`（不回写）。多个文件用
-`;` 分隔。
-
-### 4. 设置 macOS 配置目录（可选）
-
-此功能仅在 macOS 显示。点击主窗口“同步文件选择”旁边的“配置文件”，可选择用于保存
-以下内容的目录：
-
-- `Sync` 目录
-- `RimeUserDictSync.ini`
-- `RimeSync.log`
-
-保存时程序会将当前配置、日志和 Sync 数据移动到新目录，并同步修改
-`installation.yaml` 中的 `sync_dir`。以后启动程序时继续使用该目录。Windows 不显示
-该按钮，仍将以上内容保存在 EXE 所在目录。
-
-配置窗口中的“打开配置”会直接通过访达打开当前配置目录。
+**不要同步**：没改过的方案原版文件（避免版本漂移）、`*.userdb/`（leveldb 目录）、
+`build/`、`installation.yaml`、`user.yaml`、万象 `.gram` 与模型文件。
 
 ## 使用方法
 
-完成首次配置后，点击“开始同步”。同步期间可以通过进度条和日志区域查看当前状态。
+### 后台搬运
 
-需要中止时点击“停止同步”。程序会在当前文件或网络操作结束后停止后续步骤；如果
-RIME 部署程序仍在运行，程序会终止本次启动的部署进程。
-
-为避免词库文件在同步过程中被其他程序修改，建议同步时不要手动编辑相关文件。
-
-## 完整同步机制
-
-程序严格按照以下顺序执行：
-
-以下步骤中的工作目录在两个平台上分别为：
-
-- 小狼毫（Windows）：`程序所在目录\Sync`
-- 鼠须管（macOS）：`用户选择的配置目录/Sync`，未设置时为
-  `~/Library/Application Support/RimeUserDictSync/Sync`
-
-### 步骤 1：第一次运行 RIME 用户资料同步
-
-Windows 上调用小狼毫：
+主窗口勾选「后台搬运」并设置间隔（默认 10 分钟）。一轮的动作是：
 
 ```text
-WeaselDeployer.exe /sync
+取本地锁 → 校验 session_token
+① 拉：远端 Others/ 有变化就下载覆盖本地
+② 拉：比对其他设备 <ID_x>/.index.json，增量下载变化的 userdb 快照
+③ 推：本地 Others/ 有变化则上传
+④ 推：本设备 <ID_A>/ 快照有变化则上传 + 更新 .index.json
+解锁
 ```
 
-macOS 上调用鼠须管：
+这一轮**完全不读、不写 `RIME/` 根目录下的源文件**，所以打字不受影响。
+比对优先用 PROPFIND 的 `getetag`，拿不到就用 `size`+`mtime`，两者都不可信才下载全文比 hash。
 
-```text
-/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --sync
+### 手动「同步词库」
+
+```
+取本地锁 → 先跑完一轮后台搬运（保证拉到最新）
+→ ① 合并：Rime/<自选文件> ∪ Others/<同名文件>  → 写回 Rime/<自选文件>
+→ ② 上传 Others/ 的变更（不等下一个 10 分钟）
+→ ③ RIME /sync：合并 Sync/<各ID>/ 下的 userdb 快照（自造词与删除传播在此）
+→ ④ 上传本次 /sync 产生的本机快照
+→ ⑤ /deploy（macOS 为 --reload）：生效
+解锁
 ```
 
-完成后，RIME 自带同步数据位于当前平台的设备同步目录。程序另将“同步文件选择”中
-启用的文件复制到该目录：
+**顺序不能颠倒**：反过来会用本地旧内容盖掉他机已上传的新内容。
 
-- 小狼毫（Windows）：`程序所在目录\Sync\<installation_id>`
-- 鼠须管（macOS）：`<macOS 配置目录>/Sync/<installation_id>`
+`/deploy` 会让输入法短暂不可用，正在输入的 composition 会丢，所以只在手动同步时执行。
 
-小狼毫（Windows）路径使用 `\` 分隔，鼠须管（macOS）路径使用 `/` 分隔。
+## 后台运行方式
 
-### 步骤 2：下载 WebDAV
+后台搬运有两种运行方式，二者共用同一把锁，永远不会同时动手：
 
-程序递归读取 WebDAV 文件夹。其本地镜像目录分别是：
+| 方式 | 何时用 | 说明 |
+| --- | --- | --- |
+| **Windows 服务**（推荐） | 想让它一直生效 | 开机即跑，不用打开本程序；只做搬运 |
+| 程序内建线程（兜底） | 不想装服务 | 只在程序运行期间跑；检测到服务已在运行就自动让位 |
 
-- 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
-- 鼠须管（macOS）：`<macOS 配置目录>/Sync/WebDAV`
+### 为什么服务只做搬运
 
-两个平台执行相同的 WebDAV 处理：
+`/sync` 与 `/deploy` **必须在用户的登录会话里**操作输入法进程，而服务跑在会话 0，做不了。
+搬运只是文件与 WebDAV 的读写，跑在会话 0 完全没问题。所以：
 
-- WebDAV 远端已有压缩包 `webdav-sync.zip`：只下载这一个文件，解压到 `Sync\WebDAV`
-  镜像目录。压缩包内条目保留原始修改时间，供“按时间同步”使用。
-- WebDAV 远端只有旧版散文件（无压缩包）：进入兼容迁移模式，按旧逻辑完整下载全部
-  文件；本次上传后即自动完成向压缩包格式的迁移。
-- WebDAV 没有内容时，用当前同步资料初始化 `Sync\WebDAV`，打包 `webdav-sync.zip`
-  并上传。
+- **服务** = 后台搬运（零打扰）；
+- **GUI 的「同步词库」按钮** = 合并 + `/sync` + `/deploy`（会短暂打断输入法）。
 
-每次下载完成后，程序都会检查当前平台 WebDAV 镜像目录中的
-`installation.yaml`：
+### 安装与卸载
 
-```text
-小狼毫（Windows）：程序所在目录\Sync\WebDAV\installation.yaml
-鼠须管（macOS）：<macOS 配置目录>/Sync/WebDAV/installation.yaml
+在 GUI 底部点「安装 / 更新后台服务」，会弹出 UAC 提权提示；也可以手动执行：
+
+```powershell
+# 需要管理员权限的命令行
+RimeUserDictSync.exe --install-service --app-dir "<本程序的配置目录>"
+RimeUserDictSync.exe --uninstall-service
+RimeUserDictSync.exe --service-status
 ```
 
-该文件的 `installation_id` 必须为：
+| 项 | 值 |
+| --- | --- |
+| 服务名 | `RimeUserDictSync` |
+| 显示名 | RIME 用户词库同步后台搬运 |
+| 运行账号 | `LocalSystem`（不保存用户密码，改密码也不会让服务起不来） |
+| 启动方式 | 自动（**延迟启动**，不拖慢开机） |
+| 失败恢复 | 60 秒后重启，仍失败则 300 秒后重启，24 小时无故障后重置计数 |
+| 程序位置 | `%ProgramData%\RimeUserDictSync\RimeUserDictSync.exe`（安装时自动复制） |
+| 调度 | 每 30 秒醒一次判断是否到期；到期或收到唤醒标记就跑一轮 |
+| 配置来源 | 安装时用 `--app-dir` 记下的那个目录里的同一个 INI 与同一份 `device.json` |
 
-```yaml
-installation_id: WebDAV
+**服务是怎么找到配置目录的（这点踩过坑）**：一开始把它写进服务的
+`lpBinaryPathName`（`sc qc` 里能看到），结果服务日志显示 `ServiceMain` **只收到服务名**，
+`--app-dir` 根本没传进去 —— SCM 只把 `StartService` 的参数交给 `ServiceMain`，
+命令行里的参数不会出现。所以现在按下面的顺序解析：
+
+1. 启动参数（用 `StartService` 参数启动时有效）；
+2. `HKLM\SOFTWARE\RimeUserDictSync\AppDir`（安装时写入，开机自启走的就是这条）；
+3. `%ProgramData%\RimeUserDictSync\app-dir.txt`（安装时写入，注册表读不到时的兜底）；
+4. 都没有 → 退回服务自身目录，并写一条明确的告警。
+
+几个实际影响：
+
+- **服务从固定位置启动**，所以你把便携版程序挪走、删掉，都不会把服务弄坏。
+- **复制到 ProgramData** 意味着升级程序后要重新点一次「安装 / 更新后台服务」，
+  让它把新版本复制过去（按钮对已安装的服务是原地改配置，不会报错）。
+- **改了配置目录**（macOS 才有该功能）或换了 Rime 用户目录后，重新点一次安装按钮即可改指向。
+- 服务以 `LocalSystem` 写入 `Rime/.rime-sync/` 与 `Sync/` 的文件，属主是 `SYSTEM`；
+  正常情况下 ACL 继承会让用户仍可读写，若真遇到权限问题请在 issue 里反馈。
+
+### 调度细节
+
+不是「睡满 10 分钟」，而是**每 30 秒醒一次，判断「下次到期时刻」到了没有**：
+
+- 合盖休眠、待机唤醒后会**立刻补跑一轮**，不会把错过的间隔一笔勾销；
+- 轮次本身的耗时不会累积成周期漂移（跑一轮 30 秒，不会变成 10 分 30 秒一次）；
+- 点「立刻搬运一轮」（或保存 WebDAV / 同步列表设置）会在 `Rime/.rime-sync/` 落一个 `wake`
+  标记，服务下一个 tick 就看到并立刻跑，**不用等满间隔**；
+- 停止服务时会把取消标志传给正在跑的那一轮，它会在下一个检查点退出。
+
+服务与内建线程都从磁盘重新读取设置，所以改完间隔、改完 WebDAV 地址**不需要重启服务**。
+
+### 快捷方式「同步词库」
+
+服务只搬运文件，**`/sync` 与 `/deploy` 必须由你在登录会话里触发**，所以才需要这个入口。
+它建在**程序所在目录**（不往桌面塞东西），需要的话自己拖到桌面、开始菜单或任务栏。
+在 GUI 底部点「创建 / 更新快捷方式」，或手动执行：
+
+```powershell
+RimeUserDictSync.exe --install-shortcut --app-dir "<本程序的配置目录>"
+RimeUserDictSync.exe --uninstall-shortcut
 ```
 
-如果字段不存在或值不是 `WebDAV`，程序会立即修正；修正后的内容会随压缩包一并上传回
-WebDAV。此操作不会修改 RIME 用户词库目录中 `installation.yaml` 的
-`installation_id`。
+命令**只在该目录下生成一个文件**：`同步词库.lnk`，**不会**在磁盘上多出一个 `.ico`。
+EXE 自己的图标（weasel）也保持不变。
 
-### 步骤 3：检查目录关系
+图标信息在 `.lnk` 里分两处存放，缺一不可：
 
-程序确认本地文件夹和同步文件夹位于当前平台的同一个 `Sync` 根目录：
+| 位置 | 内容 | 说明 |
+| --- | --- | --- |
+| `ShellLinkHeader.IconIndex`（偏移 56） | `-101` | 负数表示"按资源 ID 取图标" |
+| StringData 的 `ICON_LOCATION` | EXE 的**裸路径** | **不能**接 `,索引` |
 
-```text
-小狼毫（Windows）：程序所在目录\Sync\WebDAV
-                  程序所在目录\Sync\<installation_id>
+齿轮以资源 ID 101 内嵌在 EXE 里（`assets/sync-gear.ico`，由 `build.rs` 用 winres 嵌入），
+索引 0 仍是 weasel。
 
-鼠须管（macOS）：<macOS 配置目录>/Sync/WebDAV
-                <macOS 配置目录>/Sync/<installation_id>
+> 这两条都是踩过坑才确认的，用十六进制对过 Windows 自己写出的 `.lnk`：
+>
+> 1. `ICON_LOCATION` **只存路径**。写成 `路径,-101` 时资源管理器会把整个字符串当成文件名，
+>    弹出「Windows 找不到文件 xxxxxx.exe,-101」，图标自然为空 —— 之前那几版就是这么坏掉的。
+> 2. 图标**索引**在头部的 `IconIndex` 字段里。`mslnk` 不写这个字段、也没有接口设置它，
+>    所以生成后由我们补写那 4 个字节。
+>
+> 齿轮图由 `tools/make_gear_icon.py` 从原始 PNG 生成（白底、7 种尺寸、16×16 仍可辨认）。
+> 想核对就跑 `tools\verify-shortcut-icon.ps1`：它直接按 MS-SHLLINK 结构解析 `.lnk` 字节，
+> 校验上面两处，并用 `SHDefExtractIconW` 把索引 0 和索引 -101 各导出成 PNG 供肉眼比对。
+
+双击它即执行 `--sync-now --notify`，也就是完整的手动同步：
+
+```
+拉取远端 → 并集合并 → 写回本地源文件 → 上传 → RIME /sync → /deploy
 ```
 
-目录关系不符合要求时停止同步，防止操作错误位置。
+为什么不是"只跑 RIME 的 /sync + /deploy"：`Sync/Others/` 里的自定义短语、词典
+**必须先回写**到 `RIME/` 目录，`/deploy` 才编译得到它们；少了这一步，
+"多机合并"能生效而"并集后的其他同步文件"不会生效。
 
-### 步骤 4：第二次运行 RIME 用户资料同步
+容错原则：**网络问题不阻止本机生效，本机生效失败才算失败。**
+所有与 WebDAV 有关的步骤都是尽力而为（失败只写警告日志），
+合并、写回、`/sync`、`/deploy` 仍然严格报错。
+所以离线时双击快捷方式也能把已经拉到本地的内容合并并生效。
 
-Windows 上再次调用小狼毫：
+`--notify` 只在结束时弹一个结果消息框（双击启动没有控制台，`println!` 会石沉大海）；
+从命令行调用可以省略。
 
-```text
-WeaselDeployer.exe /sync
+### 命令行（无界面）
+
+带参数启动时不会打开窗口，结果写入配置目录下的 `RimeSync.log`：
+
+```
+--sync-now             执行一次完整「同步词库」：拉取 → 并集 → 写回 → 上传
+                       → RIME /sync → /deploy（桌面快捷方式用的就是它）
+--round                只执行一轮后台搬运后退出（不合并、不部署）
+--install-service      安装并启动 Windows 后台服务（需要管理员权限）
+--uninstall-service    停止并卸载 Windows 后台服务（需要管理员权限）
+--install-shortcut     在程序所在目录创建「同步词库」快捷方式
+--uninstall-shortcut   删除该快捷方式
+--run-service          由服务控制管理器调用，不应手工执行
+--service-status       打印后台服务状态
+--notify               结束时弹消息框（快捷方式用；命令行下不需要）
+--app-dir <目录>       指定配置目录（默认是程序所在目录）
+--help                 显示帮助
 ```
 
-macOS 上再次调用鼠须管：
+退出码：`0` 成功，`1` 执行失败，`2` 参数错误。
 
-```text
-/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --sync
-```
+> 更新已安装的服务时，程序会**自动停止并重新启动它**。这是必须的：
+> `change_config` 只改 SCM 里的登记，不会影响已经在跑的进程 ——
+> 不重启的话会出现"`sc qc` 看着是对的，服务日志里却指向旧配置目录"。
 
-### 步骤 5：同步自选文件
+## 合并与冲突
 
-#### 自选文件同步
+并集是幂等的，所以双端几乎同时点「同步词库」时**丢不掉**：被覆盖的那台本地源文件里
+仍有自己的词，下次再点同步就会并回来，只是延迟一轮。
 
-程序根据“同步文件选择”中为每个文件指定的方式处理：
+newest 型文件则会真的丢内容，因此必须配三向判断。程序本地维护
+`.rime-sync/sync-index.json`，记录每个文件**上次同步后的内容 hash**：
 
-- 按并集同步：对 UTF-8 文本执行有序并集合并；词条和编码相同时保留较大权重。
-- 按时间同步：一侧没有文件时从另一侧复制；两侧都有时，修改日期较新的覆盖较旧的；
-  修改日期相同时不覆盖。
+| 本地 vs 基线 | Others vs 基线 | 判定 | 动作 |
+| --- | --- | --- | --- |
+| 相同 | 不同 | 他机改了 | Others → 覆盖本地源 |
+| 不同 | 相同 | 本机改了 | 本地源 → 覆盖 Others |
+| 都不同 | 都不同 | **冲突** | 保留本地，远端副本另存为 `<name>.conflict-<时间戳>.<扩展名>` 并提示 |
+| 都相同 | — | 无变化 | 跳过 |
 
-未在“同步文件选择”中启用的文件不会参与同步，包括
-`wanxiang-lts-zh-hans.gram`。
+同一份远端内容只会提示一次，不会每轮都生成新副本。
 
-#### 回写同步结果
+## 上传前校验
 
-自选文件选择“回写：是”时，最终结果直接覆盖 RIME 用户目录中的源文件；选择
-“回写：否”时不修改源文件。以上操作完成后程序才会重新部署。
+`Others/` 是共享文件，两台设备若几乎同时点「同步词库」，后传的会覆盖先传的。
+程序按服务端能力选档：
 
-#### 重新部署
+| 档 | 服务端能力 | 做法 |
+| --- | --- | --- |
+| A | ETag + `If-Match` | PUT 带 `If-Match`；返回 412 → 本轮不传并提示，留到下一轮 |
+| B | 只有 ETag | 上传前重取一次 ETag，与本轮开始时不同 → 本轮不传 |
+| C | 都没有 | 用 `getlastmodified`+`getcontentlength` 粗筛；仍不可信则下载全文比 hash |
 
-以上合并完成后，Windows 上调用小狼毫：
+C 档是兜底：**即使服务端一点元数据都不给，方案仍然可用**，只是多一次全量下载。
+有 `MOVE` 时用 `.tmp` → `MOVE` 原子发布；没有则在 PUT 后校验 hash。
 
-```text
-WeaselDeployer.exe /deploy
-```
+## 删除与同步列表
 
-macOS 上调用鼠须管：
+**A 移除一个同步文件，只影响 A，B 完全不受影响。**
 
-```text
-/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel --reload
-```
+- 移除 = 写进 A 本地的排除集，A 不再合并、不再搬运该文件；
+- **A 不删除 `Others/` 里的该文件** —— 那是公共结果，可能正是 B 在用的；
+- 想让某文件在所有设备消失，就各设备各自移除一次。
 
-重新部署成功后才继续后续步骤。
+已知限制：词条级删除传播不了。从 `my_words.dict.yaml` 删掉一行，只要文件还在同步列表，
+并集就会从 `Others/` 把它拉回来。这与 userdb 的行为不一致 —— userdb 的删除**能**跨设备
+传播（librime 负 commits + `abs(commits)` 规则）。
 
-### 步骤 6：打包上传 WebDAV
+## 从 v0.2.5 升级
 
-程序将当前平台的 WebDAV 镜像目录打包为单个 `webdav-sync.zip`，然后使用 `PUT`
-上传覆盖远端同名文件：
+首次启动会自动迁移，无需手动操作：
 
-- 小狼毫（Windows）：`程序所在目录\Sync\WebDAV`
-- 鼠须管（macOS）：`<macOS 配置目录>/Sync/WebDAV`
+- 本地 `Sync/WebDAV/` 的内容 → `Sync/Others/`，然后删除该目录
+  （否则 librime 会把它当成一台设备参与合并）；
+- 远端 `webdav-sync.zip` 与更早的散文件 → `Sync/Others/`，并删除远端旧文件；
+- INI 里的 `[sync_files]` 列表 → `.rime-sync/sync-list.json`，迁移后自动清理 INI 段落。
 
-上传成功后，程序会列出远端顶层目录并清理其中除 `webdav-sync.zip` 以外的全部旧
-文件与目录（即旧版散文件或已废弃的目录）。清理失败的项会记录在日志中，不影响本次
-同步结果，可稍后手动删除。
-
-> 注意：请为本程序使用专用的 WebDAV 远端文件夹。上传成功后该文件夹内除压缩包外的
-> 其他内容会被自动清理。
-
-### 步骤 7：清理工作目录
-
-只有步骤 6 全部上传成功后，程序才会删除当前平台以下两个目录中的所有文件和子目录：
-
-```text
-小狼毫（Windows）：程序所在目录\Sync\WebDAV
-                  程序所在目录\Sync\<installation_id>
-
-鼠须管（macOS）：<macOS 配置目录>/Sync/WebDAV
-                <macOS 配置目录>/Sync/<installation_id>
-```
-
-两个根目录本身会保留。若上传失败或同步被停止，程序不会执行这一步，以避免本地数据
-丢失。
+迁移完成后还需要**做一次「设备设置」**：新版每个设备都要有 `session_token` 才能同步。
+旧 ID 可以继续用（在远端还没有 `<ID>/` 目录时会被直接抢占注册），
+如果该 ID 已被别的设备注册过，就需要密码验证接管或换一个 ID。
 
 ## 日志
 
-日志同时显示在主窗口中。Windows 保存到程序目录，macOS 保存到当前配置目录（默认
-为 `~/Library/Application Support/RimeUserDictSync`）：
+日志同时显示在主窗口，并追加写入程序目录下的 `RimeSync.log`
+（macOS 为当前配置目录）。每条记录带 `YYYYMMDDHHmmss` 前缀。日志不会记录任何密码。
+
+**GUI 与后台服务写的是同一个文件，窗口也是从该文件增量读取的**，
+所以服务在后台搬运时，日志窗口里同样能看到它写的行（谁先写都不影响）。
+窗口只保留末尾约 512 KB。
+
+服务每轮都会留下明确的起止记录，便于确认它是否真的在工作：
 
 ```text
-RimeSync.log
+20261003220612 收到唤醒请求，开始一轮后台搬运（间隔 10 分钟）。
+20261003220612 后台搬运完成：下载 2 项，上传 1 项。
 ```
-
-每条记录前都有 `YYYYMMDDHHmmss` 格式的时间戳，例如：
-
-```text
-20260827114512 步骤 2/7：远端为旧版散文件 15 个，进入兼容迁移模式。
-20260827114512 步骤 6/7：已清理远端遗留的旧文件/目录 16 项。
-```
-
-日志不会记录 WebDAV 密码。
 
 ## 常见问题
 
-### 找不到 `installation.yaml`
+### 提示"尚未完成设备设置"
 
-请重新点击“指定RIME用户词库”，选择真正的 RIME 用户词库目录，而不是 `Sync`、
-`Sync\WebDAV` 或其他备份目录。
+说明 `.rime-sync/device.json` 还没有 `session_token`。请到「设备设置」注册 ID 与密码，
+或用「导入配置」恢复之前的设备身份。
+
+### 提示"此 ID 已被其他设备接管"
+
+`owner.json` 里的 `session_token` 与本机不一致：该 ID 已在别处被接管。
+请换一个 ID，或导入最新的设备配置。
+
+### 提示"另一个同步实例正在运行"
+
+同一时刻只能有一个同步在跑（后台轮次与手动同步共用锁）。稍后重试；
+若确认没有其它实例，可能是上次异常退出后锁未释放，重启程序即可。
+
+### 远端已有同名 ID，怎么办
+
+程序**不会**自动占用。填好密码后重试「注册 / 验证并接管」；
+忘记密码就用「强制接管」并重设新密码；不想复用就换一个 ID。
 
 ### 找不到 `WeaselDeployer.exe`
 
-Windows 会先查找自身所在目录，然后查找小狼毫的注册表安装位置。如仍无法找到，可在
-`RimeUserDictSync.ini` 的 `[rime]` 部分手动设置完整路径：
+Windows 会先查找自身所在目录，再查找小狼毫的注册表安装位置。仍找不到时可在 INI 中指定：
 
 ```ini
 [rime]
 deployer_path=C:\Program Files\Rime\weasel-x.x.x\WeaselDeployer.exe
 ```
 
-macOS 默认使用：
-
-```text
-/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel
-```
-
 ### WebDAV 测试失败
 
-请检查：
+检查地址是否指向可读写文件夹、用户名密码是否正确、账号是否有创建/上传/下载/删除权限、
+服务器是否支持所用方法、防火墙或代理是否阻止连接。只读共享会在 `MKCOL`/`PUT` 阶段失败。
 
-- WebDAV 地址是否指向可读写文件夹；
-- 用户名和密码是否正确；
-- 账户是否有创建、上传、下载和删除文件的权限；
-- 服务器是否支持本程序使用的 WebDAV 方法；
-- 防火墙、代理或证书是否阻止连接。
+### 同步被中断后目录里仍有文件
 
-### 同步中断后目录中仍有文件
-
-这是正常的安全保护。程序只在 WebDAV 完整上传成功后清空工作目录。解决连接问题后
-重新运行同步即可。
-
-### 从旧版升级后，WebDAV 里的散文件会怎样？
-
-新版使用单个 `webdav-sync.zip` 存储全部同步数据。首次使用新版同步时，程序会
-自动检测到远端只有旧版散文件，进入兼容迁移模式：先完整下载并合并散文件，再打包
-上传新压缩包，上传成功后自动清理远端遗留的散文件与目录。整个过程无需手动操作。
-
-### 远端为什么只剩一个 `webdav-sync.zip`
-
-这是新版设计。所有同步数据（含安装标识与备份）都打包进这一个文件，下载时只需
-获取并解压它。请为该程序使用专用的 WebDAV 文件夹，不要在目录中混放其他内容，
-否则会被自动清理。
-
-## 数据安全建议
-
-- 首次使用前建议备份 RIME 用户词库和 WebDAV 数据。
-- 为程序使用专用的 WebDAV 文件夹，避免与其他文件混用（上传成功后远端会清理除压缩包
-  外的其他内容）。
-- 不要同时运行多个本程序实例。
-- 不要在同步过程中关闭计算机或手动移动 `Sync` 目录。
-- 不要公开包含 WebDAV 凭据的 `RimeUserDictSync.ini`。
-- 定期检查 `RimeSync.log`，确认所有步骤成功完成。
+这是正常的安全保护：只有在远端完整写入成功后才更新本地基线，不会因为中断而丢数据。
+解决连接问题后重新点「同步词库」即可。
 
 ## 从源代码构建
 
-安装当前稳定版 Rust 工具链后，在目标平台运行：
+安装当前稳定版 Rust 工具链（需要 1.85 以上，edition 2024）后运行：
 
 ```bash
 cargo test
 cargo build --release
 ```
 
-Windows 输出：
+Windows 输出 `target/release/RimeUserDictSync.exe`；
+macOS 可运行 `./build-macos.sh` 一次生成 ARM64、x86_64 与 Universal 2 三个 `.app` 压缩包。
 
-```text
-target/release/RimeUserDictSync.exe
-```
-
-macOS 可运行 `./build-macos.sh`，一次生成 ARM64、x86_64 和 Universal 2 三个 `.app`
-压缩包。源码中的 `Program.cs`、`MainForm.cs` 与 `build.cmd` 暂时保留为旧版实现参考；
-新的主构建入口是 `Cargo.toml`。
-
-首次运行时程序会自动生成 INI、日志和工作目录。请勿将包含真实 WebDAV 凭据的
-`RimeUserDictSync.ini` 提交到版本库。
+源码中的 `Program.cs`、`MainForm.cs`、`UserDictSync.csproj` 与 `build.cmd`
+是旧版 C# 实现，仅作参考保留；构建入口是 `Cargo.toml`。
 
 ## 自动构建和发布
 
-仓库中的 `.github/workflows/release.yml` 会在推送 `v*` 标签时，自动使用 GitHub
-托管的 Windows 与 macOS 构建机完成测试、编译和打包。两个平台全部成功后，工作流
-将 Windows x64、macOS ARM64、Intel、Universal 2 和 `SHA256SUMS.txt` 上传到同一个
-GitHub Release。
+`.github/workflows/release.yml` 在推送 `v*` 标签时，用 GitHub 托管的 Windows 与 macOS
+构建机完成测试、编译和打包，两个平台全部成功后上传到同一个 GitHub Release。
 
-发布新版本时，先将 `Cargo.toml` 的版本号修改并提交，再推送匹配的标签。例如：
+发布新版本时，先把 `Cargo.toml` 的版本号改好并提交，再推送匹配的标签：
 
 ```bash
-git tag v0.1.2
+git tag v0.3.0
 git push origin main
-git push origin v0.1.2
+git push origin v0.3.0
 ```
 
-标签必须是 `v` 加 `Cargo.toml` 中的版本号，否则构建会主动失败。也可以在 GitHub 的
-Actions 页面选择“Build and publish release”，点击“Run workflow”并填写标签手动触发。
-普通的 `main` 分支提交不会创建 Release。
+标签必须是 `v` 加 `Cargo.toml` 中的版本号，否则构建会主动失败。
+
+## 数据安全建议
+
+- 首次使用前备份 RIME 用户词库与远端数据。
+- 为程序使用专用的 WebDAV 文件夹。
+- 不要同时运行多个本程序实例。
+- 不要在同步过程中关闭计算机或手动移动 `Sync` 目录。
+- 不要公开包含 WebDAV 凭据的 `RimeUserDictSync.ini`。
+- 定期检查 `RimeSync.log`。
+
+## 已知限制
+
+1. **userdb 删除是条件性的**：对方 `commits` 绝对值更大时，你的删除压不过去，
+   且会被反向复活（librime 刻意设计）。
+2. **生效有延迟**：后台只搬运，要等下一次手动「同步词库」才生效。
+3. **做不到秒级**：RIME 没有热更新 userdb 的接口，生效必须重新加载。
+4. **词条级删除不传播**（文本词典）；userdb 的删除可以传播。
+5. **服务端可见明文**：介意的话需要换支持端到端加密的服务端。
 
 ## 开源许可与致谢
 

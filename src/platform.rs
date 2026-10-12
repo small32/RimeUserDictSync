@@ -156,6 +156,80 @@ pub fn run(command: &RimeCommand, arg: &str, cancel: &AtomicBool) -> Result<()> 
     }
 }
 
+/// 按 Windows 命令行分隔规则给参数加引号（含空白或引号时才包裹）。
+#[cfg(target_os = "windows")]
+pub fn quote_windows_argument(argument: &str) -> String {
+    if argument.is_empty() {
+        return "\"\"".to_owned();
+    }
+    if !argument.contains([' ', '\t', '"']) {
+        return argument.to_owned();
+    }
+    let mut out = String::with_capacity(argument.len() + 2);
+    out.push('"');
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        match character {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '"' => {
+                // 引号前的反斜杠要翻倍，再转义引号本身。
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('\\');
+                out.push('"');
+            }
+            other => {
+                backslashes = 0;
+                out.push(other);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// 无界面模式的结果提示。
+///
+/// 桌面快捷方式双击启动时没有控制台，`println!` 会石沉大海，所以 Windows 用消息框；
+/// 其他平台退化为 stderr。
+pub fn notify(title: &str, message: &str, error: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+        };
+        let wide = |text: &str| {
+            text.encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let text = wide(message);
+        let caption = wide(title);
+        let style = MB_OK
+            | MB_SETFOREGROUND
+            | if error {
+                MB_ICONERROR
+            } else {
+                MB_ICONINFORMATION
+            };
+        // HWND 在 windows-sys 0.52 里是 isize，0 表示无父窗口。
+        unsafe { MessageBoxW(0, text.as_ptr(), caption.as_ptr(), style) };
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = error;
+        eprintln!("{title}: {message}");
+    }
+}
+
 /// 展开 %VAR% 形式的环境变量（注册表 REG_EXPAND_SZ 与旧版 INI 值可能包含）。
 pub fn expand_env(value: &str) -> String {
     let mut out = String::with_capacity(value.len());

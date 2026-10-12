@@ -1,19 +1,31 @@
 use crate::{
-    config::{self, Settings, SyncFile, SyncFileMode},
-    sync::{self, Reporter},
-    webdav::WebDav,
+    config::{self, Settings},
+    context::{self, Context, DeviceFile},
+    daemon,
+    device::{self, Claim, DeviceAction, DeviceSeed},
+    engine, identity,
+    paths::{self, Layout},
+    platform,
+    report::Reporter,
+    state::SyncList,
+    transport, webdav,
 };
+use anyhow::{Context as _, Result, bail};
 use eframe::egui;
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
-    path::PathBuf,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
+    time::Duration,
 };
+// 这一项只在 Windows 的服务状态轮询里用到；不单独 cfg 会让 macOS 构建报 unused。
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_TITLE: &str = concat!("RIME 用户词库同步工具 v", env!("CARGO_PKG_VERSION"));
@@ -22,6 +34,9 @@ const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/small32/RimeUserDictSync/releases/latest";
 const CONFIG_BROKEN_NOTICE: &str =
     "配置文件读取失败，为避免覆盖原有配置已禁用保存；请手动修复或删除配置文件后重启程序。";
+/// 后台服务状态的轮询间隔：SCM 查询很便宜，这个频率足够跟上提权安装的节奏。
+#[cfg(target_os = "windows")]
+const SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct UpdateInfo {
@@ -32,35 +47,42 @@ struct UpdateInfo {
 enum Event {
     Log(String),
     Progress(u8),
-    Finished(Result<(), String>),
-    Tested(Result<(), String>),
+    /// 手动「同步词库」结束。
+    Manual(Result<String, String>),
+    /// 后台轮次结束。
+    Round(Result<String, String>),
+    Tested(Result<String, String>),
+    /// 设备设置（抢占 / 接管 / 注销 / 导入）结束。
+    Device(Result<String, String>),
     UpdateChecked(Option<UpdateInfo>),
 }
+
 struct ChannelReporter {
     tx: Sender<Event>,
 }
+
 impl Reporter for ChannelReporter {
-    fn log(&self, t: &str) {
-        let _ = self.tx.send(Event::Log(sync::timestamped(t)));
+    fn log(&self, text: &str) {
+        let _ = self.tx.send(Event::Log(crate::report::timestamped(text)));
     }
-    fn progress(&self, v: u8) {
-        let _ = self.tx.send(Event::Progress(v));
+    fn progress(&self, value: u8) {
+        let _ = self.tx.send(Event::Progress(value));
     }
 }
 
 pub fn run() -> eframe::Result {
     let icon = load_icon();
     let min_width = if cfg!(target_os = "macos") {
-        760.
+        880.
     } else {
-        620.
+        780.
     };
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([760., 520.])
-        .with_min_inner_size([min_width, 420.])
+        .with_inner_size([880., 600.])
+        .with_min_inner_size([min_width, 460.])
         .with_title(APP_TITLE);
-    let viewport = if let Some(i) = icon {
-        viewport.with_icon(i)
+    let viewport = if let Some(icon) = icon {
+        viewport.with_icon(icon)
     } else {
         viewport
     };
@@ -76,6 +98,7 @@ pub fn run() -> eframe::Result {
         }),
     )
 }
+
 fn load_icon() -> Option<Arc<egui::IconData>> {
     #[cfg(target_os = "macos")]
     let bytes = include_bytes!("../macos/AppIcon.png");
@@ -89,8 +112,9 @@ fn load_icon() -> Option<Arc<egui::IconData>> {
         height: h,
     }))
 }
+
 fn set_fonts(ctx: &egui::Context) {
-    let mut f = egui::FontDefinitions::default();
+    let mut fonts = egui::FontDefinitions::default();
     let candidates: Vec<PathBuf> = if cfg!(windows) {
         vec![
             PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
@@ -98,9 +122,6 @@ fn set_fonts(ctx: &egui::Context) {
         ]
     } else if cfg!(target_os = "macos") {
         vec![
-            // PingFang is not stored at a stable public path on every macOS release.
-            // Hiragino Sans GB and STHeiti are system CJK fonts available on both
-            // Intel and Apple Silicon macOS installations.
             PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
             PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
             PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
@@ -113,23 +134,25 @@ fn set_fonts(ctx: &egui::Context) {
     };
     if let Some((_, bytes)) = candidates
         .into_iter()
-        .find_map(|p| fs::read(&p).ok().map(|b| (p, b)))
+        .find_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)))
     {
         let font = egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
             y_offset: 1.5,
             ..Default::default()
         });
-        f.font_data.insert("cjk".into(), Arc::new(font));
-        f.families
+        fonts.font_data.insert("cjk".into(), Arc::new(font));
+        fonts
+            .families
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
             .insert(0, "cjk".into());
-        f.families
+        fonts
+            .families
             .get_mut(&egui::FontFamily::Monospace)
             .unwrap()
             .insert(0, "cjk".into());
     }
-    ctx.set_fonts(f);
+    ctx.set_fonts(fonts);
 }
 
 struct App {
@@ -137,26 +160,60 @@ struct App {
     ini: PathBuf,
     log_path: PathBuf,
     settings: Settings,
+    context: Option<Context>,
+    context_error: Option<String>,
     logs: String,
+    /// 已经显示过的日志字节数；界面靠它增量读取 `RimeSync.log`。
+    ///
+    /// 后台服务写的是同一个文件，所以日志窗口必须从文件读，
+    /// 而不是只维护"本进程写了什么"。
+    log_offset: u64,
     progress: u8,
     busy: bool,
+    busy_flag: Arc<AtomicBool>,
+    /// 后台服务是否在跑。服务接管搬运后，内建线程就让位，避免重复劳动。
+    service_running: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    service_text: String,
+    #[cfg(target_os = "windows")]
+    shortcut_text: String,
+    #[cfg(target_os = "windows")]
+    service_checked_at: Instant,
+    config_broken: bool,
+
     show_webdav: bool,
-    show_about: bool,
+    show_device: bool,
     show_sync_files: bool,
-    sync_files_draft: Vec<SyncFile>,
-    sync_files_selected: Vec<bool>,
+    show_about: bool,
     #[cfg(target_os = "macos")]
     show_config_files: bool,
     #[cfg(target_os = "macos")]
     config_dir_draft: String,
-    password_visible: bool,
-    config_broken: bool,
+
+    dav_url: String,
+    dav_username: String,
+    dav_password: String,
+    dav_password_visible: bool,
+    capability_text: String,
+
+    device_id_draft: String,
+    device_password_draft: String,
+    device_password_confirm: String,
+    device_skip_password: bool,
+    device_confirm_takeover: bool,
+    device_info_text: String,
+    exported_text: String,
+
+    sync_files_draft: Vec<String>,
+    sync_files_selected: Vec<bool>,
+
     cancel: Arc<AtomicBool>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     notice: Option<String>,
     available_update: Option<UpdateInfo>,
 }
+
 impl App {
     fn new() -> Self {
         let base = config::app_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -167,161 +224,490 @@ impl App {
         }
         let log_path = base.join("RimeSync.log");
         let mut logs = fs::read_to_string(&log_path).unwrap_or_default();
-        // 加载失败时不能静默换成空配置，否则用户再次保存会用空配置覆盖原文件。
         let (settings, config_broken) = match Settings::load(&ini) {
             Ok(settings) => (settings, false),
             Err(error) => {
-                let line = sync::timestamped(&format!(
+                let line = crate::report::timestamped(&format!(
                     "警告: 读取配置文件失败，已显示默认空配置且禁用保存，请修复或删除 {}: {error}",
                     ini.display()
                 ));
                 logs.push_str(&line);
                 logs.push('\n');
-                if let Ok(mut f) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    let _ = writeln!(f, "{line}");
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = writeln!(file, "{line}");
                 }
                 (Settings::default(), true)
             }
         };
         let (tx, rx) = mpsc::channel();
         check_for_update(tx.clone());
-        fs::create_dir_all(base.join("Sync/WebDAV")).ok();
-        Self {
+        let busy_flag = Arc::new(AtomicBool::new(false));
+        let service_running = Arc::new(AtomicBool::new(false));
+        spawn_background(
+            base.clone(),
+            ini.clone(),
+            tx.clone(),
+            busy_flag.clone(),
+            service_running.clone(),
+        );
+
+        let mut app = Self {
             base,
             ini,
             log_path,
+            dav_url: settings.webdav_url.clone(),
+            dav_username: settings.username.clone(),
+            dav_password: settings.password.clone(),
             settings,
+            context: None,
+            context_error: None,
+            log_offset: logs.len() as u64,
             logs,
             progress: 0,
             busy: false,
+            busy_flag,
+            service_running,
+            #[cfg(target_os = "windows")]
+            service_text: String::new(),
+            #[cfg(target_os = "windows")]
+            shortcut_text: String::new(),
+            #[cfg(target_os = "windows")]
+            service_checked_at: Instant::now() - SERVICE_POLL_INTERVAL,
+            config_broken,
             show_webdav: false,
-            show_about: false,
+            show_device: false,
             show_sync_files: false,
-            sync_files_draft: Vec::new(),
-            sync_files_selected: Vec::new(),
+            show_about: false,
             #[cfg(target_os = "macos")]
             show_config_files: false,
             #[cfg(target_os = "macos")]
             config_dir_draft: String::new(),
-            password_visible: false,
-            config_broken,
+            dav_password_visible: false,
+            capability_text: String::new(),
+            device_id_draft: String::new(),
+            device_password_draft: String::new(),
+            device_password_confirm: String::new(),
+            device_skip_password: false,
+            device_confirm_takeover: false,
+            device_info_text: String::new(),
+            exported_text: String::new(),
+            sync_files_draft: Vec::new(),
+            sync_files_selected: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
             notice: None,
             available_update: None,
+        };
+        app.startup();
+        Self::trim_display(&mut app.logs);
+        app
+    }
+
+    /// 启动时：迁移旧布局（`Sync/WebDAV/`、`webdav-sync.zip`），然后构建上下文并记录提示。
+    fn startup(&mut self) {
+        let ini = self.ini.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let reporter = ChannelReporter { tx: tx.clone() };
+            let settings = Settings::load(&ini).unwrap_or_default();
+            let rime_dir = context::resolve_rime_dir(&settings);
+            let existing_id =
+                config::yaml_scalar_opt(&rime_dir.join("installation.yaml"), "installation_id")
+                    .filter(|id| paths::validate_installation_id(id).is_ok());
+            let dav = build_webdav(&settings).ok().flatten();
+            if let Some(id) = existing_id {
+                let layout = Layout::new(&rime_dir, &id);
+                let _ = layout.ensure_dirs();
+                // 迁移会读写 Sync/，必须和后台上传/手动同步共用同一把锁。
+                match crate::state::LocalLock::acquire(&layout.lock_file()) {
+                    Ok(_lock) => {
+                        match context::migrate_legacy_layout(&layout, dav.as_ref(), &|line| {
+                            reporter.log(line)
+                        }) {
+                            Ok(notices) => {
+                                for notice in notices {
+                                    reporter.log(&notice);
+                                }
+                            }
+                            Err(error) => reporter.log(&format!("旧版布局迁移失败：{error}")),
+                        }
+                    }
+                    Err(error) => {
+                        reporter.log(&format!("跳过旧版布局迁移（{error}），下次启动会重试。"))
+                    }
+                }
+            }
+        });
+        self.refresh_context();
+    }
+
+    /// 重新构建同步上下文（保存 WebDAV / 设备设置后调用）。
+    fn refresh_context(&mut self) {
+        match build_context(&self.base, &self.ini) {
+            Ok(context) => {
+                let notices = context.notices().to_vec();
+                self.device_id_draft = context.device.installation_id.clone();
+                self.context = Some(context);
+                self.context_error = None;
+                for notice in notices {
+                    self.append(&crate::report::timestamped(&notice));
+                }
+            }
+            Err(error) => {
+                self.context = None;
+                self.context_error = Some(error.to_string());
+            }
         }
     }
+
+    /// 追加一行日志。
+    ///
+    /// 界面不再自己维护"显示缓冲"，而是统一从 `RimeSync.log` 增量读取：
+    /// 后台服务写的是同一个文件，这样服务的搬运动作也会出现在窗口里。
     fn append(&mut self, line: &str) {
-        self.logs.push_str(line);
-        self.logs.push('\n');
-        if let Ok(mut f) = OpenOptions::new()
+        let written = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .is_ok();
+        if written {
+            self.tail_log();
+            return;
+        }
+        // 写不了文件（权限、被杀软锁住等）时，至少让界面看得到这一行。
+        self.logs.push_str(line);
+        self.logs.push('\n');
+        Self::trim_display(&mut self.logs);
+    }
+
+    /// 从上次读到的位置继续读日志，只消费到最后一个换行，
+    /// 避免把别的进程正在写的半行读进来。
+    fn tail_log(&mut self) {
+        let Ok(metadata) = fs::metadata(&self.log_path) else {
+            return;
+        };
+        let length = metadata.len();
+        if length < self.log_offset {
+            // 文件被截断或轮转过了
+            self.log_offset = 0;
+        }
+        if length == self.log_offset {
+            return;
+        }
+        let Ok(mut file) = fs::File::open(&self.log_path) else {
+            return;
+        };
+        if file.seek(SeekFrom::Start(self.log_offset)).is_err() {
+            return;
+        }
+        let mut buffer = Vec::new();
+        if file.read_to_end(&mut buffer).is_err() {
+            return;
+        }
+        let Some(cut) = buffer.iter().rposition(|byte| *byte == b'\n') else {
+            return;
+        };
+        let consumed = cut + 1;
+        self.log_offset += consumed as u64;
+        let text = String::from_utf8_lossy(&buffer[..consumed]).into_owned();
+        self.logs.push_str(&text);
+        Self::trim_display(&mut self.logs);
+    }
+
+    /// 只保留末尾一段，避免长时间运行后界面缓冲无限增长。
+    /// 切点一定取在换行之后，所以不会切坏 UTF-8。
+    fn trim_display(logs: &mut String) {
+        const MAX_BYTES: usize = 512 * 1024;
+        if logs.len() <= MAX_BYTES {
+            return;
+        }
+        let cut = logs.len() - MAX_BYTES;
+        if let Some(position) = logs
+            .as_bytes()
+            .get(cut..)
+            .and_then(|tail| tail.iter().position(|byte| *byte == b'\n'))
         {
-            let _ = writeln!(f, "{line}");
+            logs.drain(..cut + position + 1);
         }
     }
+
     fn poll(&mut self) {
-        while let Ok(e) = self.rx.try_recv() {
-            match e {
-                Event::Log(x) => self.append(&x),
-                Event::Progress(x) => self.progress = x,
-                Event::Finished(r) => {
-                    self.busy = false;
-                    self.notice = Some(match r {
-                        Ok(_) => "同步完成。".into(),
-                        Err(e) => {
-                            let x = sync::timestamped(&format!("失败: {e}"));
-                            self.append(&x);
-                            e
+        // 服务往同一个日志文件里写，这里每帧顺带把新增行捞进窗口。
+        self.tail_log();
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                Event::Log(text) => self.append(&text),
+                Event::Progress(value) => self.progress = value,
+                Event::Manual(result) => {
+                    self.set_busy(false);
+                    self.notice = Some(match result {
+                        Ok(message) => message,
+                        Err(error) => {
+                            self.append(&crate::report::timestamped(&format!("失败: {error}")));
+                            error
                         }
-                    })
-                }
-                Event::Tested(r) => {
-                    self.busy = false;
-                    self.notice = Some(match r {
-                        Ok(_) => "连接成功，上传和下载测试均已通过。".into(),
-                        Err(e) => format!("测试失败：{e}"),
                     });
+                    self.refresh_context();
+                }
+                Event::Round(result) => match result {
+                    Ok(message) => self.append(&crate::report::timestamped(&message)),
+                    Err(error) => self.append(&crate::report::timestamped(&format!(
+                        "后台搬运未完成: {error}"
+                    ))),
+                },
+                Event::Tested(result) => {
+                    self.set_busy(false);
+                    match result {
+                        Ok(text) => {
+                            self.capability_text = text.clone();
+                            self.notice = Some(format!("连接测试通过（含写入测试）。\n{text}"));
+                        }
+                        Err(error) => self.notice = Some(format!("测试失败：{error}")),
+                    }
+                }
+                Event::Device(result) => {
+                    self.set_busy(false);
+                    self.notice = Some(match result {
+                        Ok(message) => message,
+                        Err(error) => format!("设备设置失败：{error}"),
+                    });
+                    self.refresh_context();
                 }
                 Event::UpdateChecked(update) => self.available_update = update,
             }
         }
+        self.refresh_service_state();
     }
-    fn start(&mut self) {
+
+    /// 每 5 秒问一次 SCM：服务装没装、跑没跑。
+    #[cfg(target_os = "windows")]
+    fn refresh_service_state(&mut self) {
+        if self.service_checked_at.elapsed() < SERVICE_POLL_INTERVAL {
+            return;
+        }
+        self.service_checked_at = Instant::now();
+        let text = crate::service::describe();
+        let running = crate::service::status() == crate::service::Status::Running;
+        // 状态变化才写日志，避免每 5 秒刷一行。
+        if !self.service_text.is_empty() && self.service_text != text {
+            self.append(&crate::report::timestamped(&format!(
+                "后台服务状态变化：{text}"
+            )));
+        }
+        self.service_text = text;
+        self.shortcut_text = crate::shortcut::describe(&self.base);
+        self.service_running.store(running, Ordering::Relaxed);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn refresh_service_state(&mut self) {
+        self.service_running.store(false, Ordering::Relaxed);
+    }
+
+    /// 请后台服务立刻跑一轮；没装服务时由内建线程消费，效果一样。
+    fn request_background_round(&self) {
+        if let Some(context) = &self.context
+            && let Err(error) = daemon::request_wake(&context.layout.meta)
+        {
+            let _ = error;
+        }
+    }
+
+    /// 安装 / 卸载服务需要管理员权限，先尝试直接执行，被拒则弹 UAC 重新拉起自己。
+    #[cfg(target_os = "windows")]
+    fn run_service_action(&mut self, uninstall: bool) {
         if self.busy {
             return;
         }
+        let mut arguments = vec![if uninstall {
+            "--uninstall-service".to_owned()
+        } else {
+            "--install-service".to_owned()
+        }];
+        arguments.push("--app-dir".to_owned());
+        arguments.push(self.base.to_string_lossy().into_owned());
+        match crate::service::request_elevated(&arguments) {
+            Ok(()) => {
+                self.append(&crate::report::timestamped(if uninstall {
+                    "已请求管理员权限卸载后台服务。"
+                } else {
+                    "已请求管理员权限安装后台服务。"
+                }));
+                self.notice = Some(
+                    "请在管理员权限提示（UAC）中确认；完成后本窗口会自动刷新服务状态。".to_owned(),
+                );
+                // 缩短下一次轮询，让状态尽快反映出来（提权进程还在跑时可能仍是旧状态）。
+                self.service_checked_at = Instant::now();
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// 创建 / 删除「同步词库」快捷方式；不需要管理员权限。
+    #[cfg(target_os = "windows")]
+    fn run_shortcut_action(&mut self, uninstall: bool) {
+        let result = if uninstall {
+            crate::shortcut::uninstall(&self.base)
+        } else {
+            crate::shortcut::install(&self.base)
+        };
+        match result {
+            Ok(message) => {
+                self.append(&crate::report::timestamped(&message));
+                self.notice = Some(message);
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        self.shortcut_text = crate::shortcut::describe(&self.base);
+    }
+
+    fn set_busy(&mut self, value: bool) {
+        self.busy = value;
+        self.busy_flag.store(value, Ordering::Relaxed);
+    }
+
+    fn start_manual_sync(&mut self) {
+        if self.busy {
+            return;
+        }
+        if self.context.is_none() {
+            self.notice = Some(format!(
+                "无法开始同步：{}",
+                self.context_error.clone().unwrap_or_default()
+            ));
+            return;
+        }
+        self.set_busy(true);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.progress = 0;
-        self.busy = true;
         let base = self.base.clone();
-        let settings = self.settings.clone();
+        let ini = self.ini.clone();
         let cancel = self.cancel.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let reporter = ChannelReporter { tx: tx.clone() };
-            let result = sync::run(&base, settings, cancel, &reporter).map_err(|e| e.to_string());
-            let _ = tx.send(Event::Finished(result));
+            let result = (|| -> Result<String> {
+                let context = build_context(&base, &ini)?;
+                let outcome = engine::manual_sync(&context, &cancel, &reporter)?;
+                let mut message = format!(
+                    "同步完成：合并 {} 个文件，上传 {} 项。",
+                    outcome.merged, outcome.uploaded
+                );
+                if !outcome.conflicts.is_empty() {
+                    message.push_str(&format!(
+                        "\n有 {} 个文件存在双端修改冲突，远端版本已另存为副本：\n{}",
+                        outcome.conflicts.len(),
+                        outcome.conflicts.join("\n")
+                    ));
+                }
+                Ok(message)
+            })()
+            .map_err(|error| error.to_string());
+            let _ = tx.send(Event::Manual(result));
         });
     }
+
+    fn test_webdav(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.set_busy(true);
+        let url = self.dav_url.trim().to_owned();
+        let username = self.dav_username.trim().to_owned();
+        let password = self.dav_password.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                let dav = webdav::WebDav::new(&url, &username, &password)?;
+                dav.test_write()?;
+                let capabilities = dav.probe_capabilities();
+                Ok(format!(
+                    "服务端能力：{}\n上传校验档位：{}",
+                    capabilities.describe(),
+                    capabilities.tier().label()
+                ))
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
+            let _ = tx.send(Event::Tested(result));
+        });
+    }
+
+    fn save_webdav(&mut self) -> Result<()> {
+        if self.config_broken {
+            bail!("{CONFIG_BROKEN_NOTICE}");
+        }
+        self.settings.webdav_url = self.dav_url.trim().to_owned();
+        self.settings.username = self.dav_username.trim().to_owned();
+        self.settings.password = self.dav_password.clone();
+        self.settings.save(&self.ini)?;
+        self.append(&crate::report::timestamped("已保存 WebDAV 设置。"));
+        self.refresh_context();
+        self.request_background_round();
+        Ok(())
+    }
+
     fn choose_rime(&mut self) {
         if self.config_broken {
             self.notice = Some(CONFIG_BROKEN_NOTICE.into());
             return;
         }
-        if let Some(dir) = rfd::FileDialog::new()
-            .set_directory(if self.settings.user_data_dir.is_empty() {
-                crate::platform::default_user_dir()
-            } else {
-                PathBuf::from(&self.settings.user_data_dir)
-            })
-            .pick_folder()
-        {
-            let yaml = dir.join("installation.yaml");
-            let result = (|| -> anyhow::Result<String> {
-                let id = config::yaml_scalar(&yaml, "installation_id")?;
-                config::validate_installation_id(&id)?;
-                let root = self.base.join("Sync");
-                config::set_yaml_scalar(&yaml, "sync_dir", root.to_string_lossy().as_ref())?;
-                self.settings.user_data_dir = dir.to_string_lossy().into_owned();
-                self.settings.save(&self.ini)?;
-                fs::create_dir_all(root.join(&id))?;
-                fs::create_dir_all(root.join("WebDAV"))?;
-                Ok(id)
-            })();
-            match result{Ok(id)=>self.append(&sync::timestamped(&format!("已指定 RIME 用户词库，installation_id 保持为 {id}，sync_dir 已指向程序目录下 Sync。"))),Err(e)=>self.notice=Some(e.to_string())}
-        }
-    }
-    fn test_webdav(&mut self) {
-        if self.busy {
-            return;
-        }
-        self.busy = true;
-        let s = self.settings.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let r = (|| WebDav::new(&s.webdav_url, &s.username, &s.password)?.test())()
-                .map_err(|e: anyhow::Error| e.to_string());
-            let _ = tx.send(Event::Tested(r));
-        });
-    }
-    fn choose_sync_files(&mut self) {
-        let user_dir = if self.settings.user_data_dir.trim().is_empty() {
-            crate::platform::default_user_dir()
+        let start = if self.settings.user_data_dir.trim().is_empty() {
+            platform::default_user_dir()
         } else {
             PathBuf::from(&self.settings.user_data_dir)
         };
+        let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() else {
+            return;
+        };
+        let installation = dir.join("installation.yaml");
+        if !installation.is_file() {
+            self.notice = Some(format!(
+                "{} 中没有 installation.yaml，请选择真正的 RIME 用户目录。",
+                dir.display()
+            ));
+            return;
+        }
+        self.settings.user_data_dir = dir.to_string_lossy().into_owned();
+        if let Err(error) = self.settings.save(&self.ini) {
+            self.notice = Some(error.to_string());
+            return;
+        }
+        // sync_dir 由 device.json 权威接管，这里只提示一次。
+        if let Some(id) = config::yaml_scalar_opt(&installation, "installation_id") {
+            self.append(&crate::report::timestamped(&format!(
+                "已指定 RIME 用户词库，installation_id 读作 {id}；sync_dir 将指向其中的 Sync 目录。"
+            )));
+        } else {
+            self.append(&crate::report::timestamped(
+                "已指定 RIME 用户词库；installation.yaml 缺少 installation_id，请在「设备设置」中注册。",
+            ));
+        }
+        self.refresh_context();
+    }
+
+    fn open_sync_files(&mut self) {
+        let Some(context) = &self.context else {
+            self.notice =
+                Some("请先完成设备设置，同步列表保存在 RIME/.rime-sync/sync-list.json。".into());
+            return;
+        };
+        match context.load_list() {
+            Ok(list) => {
+                self.sync_files_draft = list.files.iter().map(|file| file.path.clone()).collect();
+                self.sync_files_selected = vec![false; self.sync_files_draft.len()];
+                self.show_sync_files = true;
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    fn add_sync_files(&mut self) {
+        let user_dir = context::resolve_rime_dir(&self.settings);
         let Some(files) = rfd::FileDialog::new().set_directory(&user_dir).pick_files() else {
             return;
         };
-        // 规范化两侧路径，避免符号链接（如 /var 与 /private/var）导致前缀比较失败。
         let canonical_root = user_dir.canonicalize().unwrap_or(user_dir);
         for file in files {
             let canonical_file = file.canonicalize().unwrap_or(file);
@@ -329,29 +715,78 @@ impl App {
                 self.notice = Some("同步文件必须位于当前 RIME 用户词库目录内。".into());
                 continue;
             };
-            let path = relative.to_string_lossy().replace('\\', "/");
-            if path.is_empty() || path.contains(';') {
-                self.notice = Some("同步文件名不能为空，也不能包含分号。".into());
-                continue;
-            }
-            if !self.sync_files_draft.iter().any(|item| item.path == path) {
-                self.sync_files_draft.push(SyncFile {
-                    path,
-                    mode: SyncFileMode::Newest,
-                    writeback: true,
-                });
-                self.sync_files_selected.push(false);
+            let candidate = relative.to_string_lossy().replace('\\', "/");
+            match paths::validate_sync_file_path(&candidate) {
+                Ok(relative) => {
+                    if relative.to_ascii_lowercase().ends_with(".userdb.txt") {
+                        self.notice = Some(
+                            "userdb 快照不能加入同步列表：它由 RIME 的 /sync 与 Sync/<ID>/ 负责。"
+                                .into(),
+                        );
+                        continue;
+                    }
+                    if !self.sync_files_draft.iter().any(|item| item == &relative) {
+                        self.sync_files_draft.push(relative);
+                        self.sync_files_selected.push(false);
+                    }
+                }
+                Err(error) => self.notice = Some(error.to_string()),
             }
         }
     }
+
+    fn save_sync_files(&mut self) -> Result<()> {
+        let context = self.context.as_ref().context("请先完成设备设置")?;
+        let mut list = context.load_list()?;
+        let removed: Vec<String> = list
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .filter(|path| !self.sync_files_draft.contains(path))
+            .collect();
+        // §6：移除 = 写进本设备排除集，绝不删除 Others/ 里的公共文件。
+        for path in removed {
+            list.remove(&path);
+        }
+        let mut fresh = SyncList {
+            files: Vec::new(),
+            excluded: list.excluded.clone(),
+        };
+        for path in &self.sync_files_draft {
+            fresh.register(path);
+        }
+        let kept: Vec<String> = fresh.files.iter().map(|file| file.path.clone()).collect();
+        fresh.excluded.retain(|item| !kept.contains(item));
+        context.save_list(&fresh)?;
+        self.append(&crate::report::timestamped(&format!(
+            "已保存同步文件选择（{} 项）；移除的文件只影响本设备，Others/ 中的公共副本保持不变。",
+            fresh.files.len()
+        )));
+        self.request_background_round();
+        Ok(())
+    }
+
+    fn submit_device_action(&mut self, action: DeviceAction) {
+        if self.busy {
+            return;
+        }
+        let ini = self.ini.clone();
+        let tx = self.tx.clone();
+        self.set_busy(true);
+        std::thread::spawn(move || {
+            let result = run_device_action(&ini, action).map_err(|error| error.to_string());
+            let _ = tx.send(Event::Device(result));
+        });
+    }
+
     #[cfg(target_os = "macos")]
-    fn save_config_dir(&mut self) -> anyhow::Result<()> {
+    fn save_config_dir(&mut self) -> Result<()> {
         if self.config_broken {
-            anyhow::bail!("{}", CONFIG_BROKEN_NOTICE);
+            bail!("{CONFIG_BROKEN_NOTICE}");
         }
         let target = PathBuf::from(self.config_dir_draft.trim());
         if !target.is_absolute() {
-            anyhow::bail!("配置目录必须是绝对路径");
+            bail!("配置目录必须是绝对路径");
         }
         fs::create_dir_all(&target)?;
         let source = self
@@ -360,82 +795,32 @@ impl App {
             .unwrap_or_else(|_| self.base.clone());
         let target = target.canonicalize()?;
         if target != source && target.starts_with(&source) {
-            anyhow::bail!("配置目录不能放在当前配置目录的子目录中");
+            bail!("配置目录不能放在当前配置目录的子目录中");
         }
         if target != source {
-            copy_tree_if_present(&source.join("Sync"), &target.join("Sync"))?;
+            fs::create_dir_all(target.join("Sync"))?;
             if self.log_path.is_file() {
                 fs::copy(&self.log_path, target.join("RimeSync.log"))?;
             }
         }
         let ini = target.join("RimeUserDictSync.ini");
         self.settings.save(&ini)?;
-        if !self.settings.user_data_dir.trim().is_empty() {
-            let installation =
-                PathBuf::from(&self.settings.user_data_dir).join("installation.yaml");
-            if installation.is_file() {
-                config::set_yaml_scalar(
-                    &installation,
-                    "sync_dir",
-                    target.join("Sync").to_string_lossy().as_ref(),
-                )?;
-            }
-        }
         config::set_app_dir(&target)?;
-        let resolved = config::app_dir()?.canonicalize()?;
-        if resolved != target {
-            anyhow::bail!("配置目录保存后校验失败，程序仍指向旧目录");
-        }
         self.base = target.clone();
         self.ini = ini;
         self.log_path = target.join("RimeSync.log");
         self.config_dir_draft = target.to_string_lossy().into_owned();
-        if target != source {
-            let old_sync = source.join("Sync");
-            if old_sync.is_dir() {
-                fs::remove_dir_all(old_sync)?;
-            }
-            for name in ["RimeUserDictSync.ini", "RimeSync.log"] {
-                let old_file = source.join(name);
-                if old_file.is_file() {
-                    fs::remove_file(old_file)?;
-                }
-            }
-        }
         Ok(())
     }
-}
-
-#[cfg(target_os = "macos")]
-fn copy_tree_if_present(source: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
-    if !source.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let destination = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree_if_present(&entry.path(), &destination)?;
-        } else {
-            fs::copy(entry.path(), &destination)?;
-            if let Ok(modified) = entry.metadata()?.modified() {
-                filetime::set_file_mtime(
-                    destination,
-                    filetime::FileTime::from_system_time(modified),
-                )?;
-            }
-        }
-    }
-    Ok(())
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
-        ctx.request_repaint_after(std::time::Duration::from_millis(150));
-        egui::TopBottomPanel::top("progress_panel")
-            .exact_height(44.)
+        ctx.request_repaint_after(Duration::from_millis(200));
+
+        egui::TopBottomPanel::top("status_panel")
+            .exact_height(64.)
             .show(ctx, |ui| {
                 ui.add_space(8.);
                 ui.add(
@@ -443,31 +828,51 @@ impl eframe::App for App {
                         .show_percentage()
                         .animate(self.busy),
                 );
+                ui.horizontal(|ui| match (&self.context, &self.context_error) {
+                    (Some(context), _) => {
+                        ui.label(format!(
+                            "设备 ID：{}　共享目录：{}",
+                            context.device.installation_id,
+                            context.layout.others.display()
+                        ));
+                    }
+                    (None, Some(error)) => {
+                        ui.colored_label(egui::Color32::from_rgb(200, 120, 0), error);
+                    }
+                    _ => {
+                        ui.label("尚未配置。");
+                    }
+                });
             });
+
         egui::TopBottomPanel::bottom("actions_panel")
-            .exact_height(52.)
+            .exact_height(178.)
             .show(ctx, |ui| {
-                ui.add_space(8.);
-                ui.horizontal(|ui| {
+                ui.add_space(6.);
+                ui.horizontal_wrapped(|ui| {
                     if ui
-                        .add_enabled(!self.busy, egui::Button::new("指定RIME用户词库"))
+                        .add_enabled(!self.busy, egui::Button::new("指定 RIME 用户词库"))
                         .clicked()
                     {
                         self.choose_rime();
                     }
                     if ui
-                        .add_enabled(!self.busy, egui::Button::new("WebDAV设置"))
+                        .add_enabled(!self.busy, egui::Button::new("WebDAV 设置"))
                         .clicked()
                     {
                         self.show_webdav = true;
                     }
                     if ui
+                        .add_enabled(!self.busy, egui::Button::new("设备设置"))
+                        .clicked()
+                    {
+                        self.show_device = true;
+                    }
+                    if ui
                         .add_enabled(!self.busy, egui::Button::new("同步文件选择"))
                         .clicked()
                     {
-                        self.sync_files_draft = self.settings.sync_files.clone();
-                        self.sync_files_selected = vec![false; self.sync_files_draft.len()];
-                        self.show_sync_files = true;
+                        self.open_sync_files();
                     }
                     #[cfg(target_os = "macos")]
                     if ui
@@ -477,9 +882,38 @@ impl eframe::App for App {
                         self.config_dir_draft = self.base.to_string_lossy().into_owned();
                         self.show_config_files = true;
                     }
+                    if ui.button("关于").clicked() {
+                        self.show_about = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut enabled = self.settings.background_enabled;
+                    if ui
+                        .add_enabled(!self.busy, egui::Checkbox::new(&mut enabled, "后台搬运"))
+                        .changed()
+                    {
+                        self.settings.background_enabled = enabled;
+                        let _ = self.settings.save(&self.ini);
+                    }
+                    ui.add_enabled(
+                        !self.busy && self.settings.background_enabled,
+                        egui::Slider::new(&mut self.settings.background_minutes, 1..=240)
+                            .text("分钟"),
+                    );
+                    if ui.button("保存间隔").clicked() {
+                        let _ = self.settings.save(&self.ini);
+                        self.request_background_round();
+                    }
+                    if ui.button("立刻搬运一轮").clicked() {
+                        self.request_background_round();
+                    }
+                    ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("关于").clicked() {
-                            self.show_about = true;
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("同步词库"))
+                            .clicked()
+                        {
+                            self.start_manual_sync();
                         }
                         if ui
                             .add_enabled(self.busy, egui::Button::new("停止同步"))
@@ -487,15 +921,53 @@ impl eframe::App for App {
                         {
                             self.cancel.store(true, Ordering::Relaxed);
                         }
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("开始同步"))
-                            .clicked()
-                        {
-                            self.start();
-                        }
                     });
                 });
+                #[cfg(target_os = "windows")]
+                ui.horizontal(|ui| {
+                    if self.service_text.is_empty() {
+                        self.refresh_service_state();
+                    }
+                    ui.label(&self.service_text);
+                    let installed =
+                        crate::service::status() != crate::service::Status::NotInstalled;
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("安装 / 更新后台服务"))
+                        .clicked()
+                    {
+                        self.run_service_action(false);
+                    }
+                    if ui
+                        .add_enabled(!self.busy && installed, egui::Button::new("卸载后台服务"))
+                        .clicked()
+                    {
+                        self.run_service_action(true);
+                    }
+                });
+                #[cfg(target_os = "windows")]
+                ui.horizontal(|ui| {
+                    if self.shortcut_text.is_empty() {
+                        self.refresh_service_state();
+                    }
+                    ui.label(&self.shortcut_text);
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("创建 / 更新快捷方式"))
+                        .clicked()
+                    {
+                        self.run_shortcut_action(false);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && crate::shortcut::exists(&self.base),
+                            egui::Button::new("删除快捷方式"),
+                        )
+                        .clicked()
+                    {
+                        self.run_shortcut_action(true);
+                    }
+                });
             });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both()
                 .stick_to_bottom(true)
@@ -510,344 +982,405 @@ impl eframe::App for App {
                     );
                 });
         });
-        if self.show_webdav {
-            let mut open = true;
-            egui::Window::new("WebDAV设置")
-                .collapsible(false)
-                .resizable(false)
-                .fixed_size([720., 280.])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.set_min_size(egui::vec2(690., 240.));
-                    egui::Grid::new("dav").show(ui, |ui| {
-                        ui.label("地址");
-                        ui.add_sized(
-                            [610., 28.],
-                            egui::TextEdit::singleline(&mut self.settings.webdav_url)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                        ui.label("用户名");
-                        ui.add_sized(
-                            [610., 28.],
-                            egui::TextEdit::singleline(&mut self.settings.username)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                        ui.label("密码");
-                        ui.add_sized(
-                            [610., 28.],
-                            egui::TextEdit::singleline(&mut self.settings.password)
-                                .desired_width(f32::INFINITY)
-                                .password(!self.password_visible),
-                        );
-                        ui.end_row();
-                    });
-                    ui.checkbox(&mut self.password_visible, "显示密码");
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(!self.busy, egui::Button::new("测试连接"))
-                                .clicked()
-                            {
-                                self.test_webdav();
-                            }
-                            if ui.button("保存").clicked() {
-                                if self.config_broken {
-                                    self.notice = Some(CONFIG_BROKEN_NOTICE.into());
-                                } else {
-                                    match self.settings.save(&self.ini) {
-                                        Ok(_) => {
-                                            self.append(&sync::timestamped("已保存 WebDAV 设置。"));
-                                            self.show_webdav = false;
-                                        }
-                                        Err(e) => self.notice = Some(e.to_string()),
-                                    }
-                                }
-                            }
-                            if ui.button("取消").clicked() {
-                                self.show_webdav = false;
-                            }
-                        });
-                    });
-                });
-            if !open {
-                self.show_webdav = false;
-            }
-        }
-        if self.show_sync_files {
-            let mut open = true;
-            egui::Window::new("同步文件选择")
-                .collapsible(false)
-                .resizable(false)
-                .fixed_size([960., 360.])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.set_min_size(egui::vec2(930., 320.));
-                    ui.label("可多选 RIME 用户目录内的文件；按并集同步仅适用于 UTF-8 文本文件。");
-                    ui.separator();
-                    let mut remove = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(220.)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            egui::Grid::new("sync_files_grid")
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for (index, file) in
-                                        self.sync_files_draft.iter_mut().enumerate()
-                                    {
-                                        ui.checkbox(&mut self.sync_files_selected[index], "选择");
-                                        ui.add_sized(
-                                            [260., 24.],
-                                            egui::Label::new(&file.path).truncate(),
-                                        );
-                                        let mut union = file.mode == SyncFileMode::Union;
-                                        if ui.checkbox(&mut union, "按并集").clicked() {
-                                            file.mode = SyncFileMode::Union;
-                                        }
-                                        let mut newest = file.mode == SyncFileMode::Newest;
-                                        if ui.checkbox(&mut newest, "按时间").clicked() {
-                                            file.mode = SyncFileMode::Newest;
-                                        }
-                                        ui.checkbox(&mut file.writeback, "回写");
-                                        if ui.button("删除").clicked() {
-                                            remove = Some(index);
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                    if let Some(index) = remove {
-                        self.sync_files_draft.remove(index);
-                        self.sync_files_selected.remove(index);
-                    }
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("添加文件").clicked() {
-                                self.choose_sync_files();
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.sync_files_draft.is_empty(),
-                                    egui::Button::new("清空"),
-                                )
-                                .clicked()
-                            {
-                                self.sync_files_draft.clear();
-                                self.sync_files_selected.clear();
-                            }
-                            if ui.button("保存").clicked() {
-                                if self.config_broken {
-                                    self.notice = Some(CONFIG_BROKEN_NOTICE.into());
-                                } else {
-                                    self.settings.sync_files = self.sync_files_draft.clone();
-                                    match self.settings.save(&self.ini) {
-                                        Ok(_) => {
-                                            self.append(&sync::timestamped("已保存同步文件选择。"));
-                                            self.show_sync_files = false;
-                                        }
-                                        Err(e) => self.notice = Some(e.to_string()),
-                                    }
-                                }
-                            }
-                            if ui.button("取消").clicked() {
-                                self.show_sync_files = false;
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("全选").clicked() {
-                                self.sync_files_selected.fill(true);
-                            }
-                            if ui.button("取消选择").clicked() {
-                                self.sync_files_selected.fill(false);
-                            }
-                            let has_selected =
-                                self.sync_files_selected.iter().any(|selected| *selected);
-                            if ui
-                                .add_enabled(has_selected, egui::Button::new("批量按并集"))
-                                .clicked()
-                            {
-                                for (file, selected) in self
-                                    .sync_files_draft
-                                    .iter_mut()
-                                    .zip(&self.sync_files_selected)
-                                {
-                                    if *selected {
-                                        file.mode = SyncFileMode::Union;
-                                    }
-                                }
-                            }
-                            if ui
-                                .add_enabled(has_selected, egui::Button::new("批量按时间"))
-                                .clicked()
-                            {
-                                for (file, selected) in self
-                                    .sync_files_draft
-                                    .iter_mut()
-                                    .zip(&self.sync_files_selected)
-                                {
-                                    if *selected {
-                                        file.mode = SyncFileMode::Newest;
-                                    }
-                                }
-                            }
-                            if ui
-                                .add_enabled(has_selected, egui::Button::new("批量回写"))
-                                .clicked()
-                            {
-                                for (file, selected) in self
-                                    .sync_files_draft
-                                    .iter_mut()
-                                    .zip(&self.sync_files_selected)
-                                {
-                                    if *selected {
-                                        file.writeback = true;
-                                    }
-                                }
-                            }
-                            if ui
-                                .add_enabled(has_selected, egui::Button::new("批量不回写"))
-                                .clicked()
-                            {
-                                for (file, selected) in self
-                                    .sync_files_draft
-                                    .iter_mut()
-                                    .zip(&self.sync_files_selected)
-                                {
-                                    if *selected {
-                                        file.writeback = false;
-                                    }
-                                }
-                            }
-                        });
-                        ui.label(format!("文件总数：{}", self.sync_files_draft.len()));
-                    });
-                });
-            if !open {
-                self.show_sync_files = false;
-            }
-        }
+
+        self.webdav_window(ctx);
+        self.device_window(ctx);
+        self.sync_files_window(ctx);
         #[cfg(target_os = "macos")]
-        if self.show_config_files {
-            let mut open = true;
-            egui::Window::new("配置文件")
-                .collapsible(false)
-                .resizable(false)
-                .fixed_size([720., 190.])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.set_min_size(egui::vec2(690., 150.));
-                    ui.label("该目录用于保存 Sync、RimeUserDictSync.ini 和 RimeSync.log。");
-                    ui.label(format!("当前生效目录：{}", self.base.display()));
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [570., 28.],
-                            egui::TextEdit::singleline(&mut self.config_dir_draft)
-                                .desired_width(f32::INFINITY),
-                        );
-                        if ui.button("选择目录").clicked()
-                            && let Some(directory) = rfd::FileDialog::new()
-                                .set_directory(if self.config_dir_draft.is_empty() {
-                                    self.base.clone()
-                                } else {
-                                    PathBuf::from(&self.config_dir_draft)
-                                })
-                                .pick_folder()
-                        {
-                            self.config_dir_draft = directory.to_string_lossy().into_owned();
+        self.config_dir_window(ctx);
+        self.about_window(ctx);
+        self.update_window(ctx);
+        self.notice_window(ctx);
+    }
+}
+
+impl App {
+    fn webdav_window(&mut self, ctx: &egui::Context) {
+        if !self.show_webdav {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("WebDAV 设置")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([760., 330.])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("dav").show(ui, |ui| {
+                    ui.label("地址");
+                    ui.add_sized(
+                        [620., 26.],
+                        egui::TextEdit::singleline(&mut self.dav_url).desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                    ui.label("用户名");
+                    ui.add_sized(
+                        [620., 26.],
+                        egui::TextEdit::singleline(&mut self.dav_username)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                    ui.label("密码");
+                    ui.add_sized(
+                        [620., 26.],
+                        egui::TextEdit::singleline(&mut self.dav_password)
+                            .desired_width(f32::INFINITY)
+                            .password(!self.dav_password_visible),
+                    );
+                    ui.end_row();
+                });
+                ui.checkbox(&mut self.dav_password_visible, "显示密码");
+                ui.label("测试连接会执行 MKCOL + PUT + GET + DELETE，并探测服务端能力档位。");
+                if !self.capability_text.is_empty() {
+                    ui.label(&self.capability_text);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("测试连接"))
+                        .clicked()
+                    {
+                        self.test_webdav();
+                    }
+                    if ui.button("保存").clicked() {
+                        if let Err(error) = self.save_webdav() {
+                            self.notice = Some(error.to_string());
+                        } else {
+                            self.show_webdav = false;
                         }
-                    });
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("打开配置").clicked()
-                                && let Err(error) =
-                                    std::process::Command::new("open").arg(&self.base).spawn()
-                            {
-                                self.notice = Some(format!("打开配置目录失败：{error}"));
-                            }
-                            if ui.button("保存").clicked() {
-                                match self.save_config_dir() {
-                                    Ok(_) => {
-                                        let directory = self.base.display().to_string();
-                                        self.append(&sync::timestamped(&format!(
-                                            "已移动并切换 macOS 配置目录：{directory}"
-                                        )));
-                                        self.show_config_files = false;
-                                        self.notice =
-                                            Some(format!("配置目录已移动并切换到：\n{directory}"));
-                                    }
-                                    Err(error) => self.notice = Some(error.to_string()),
-                                }
-                            }
-                            if ui.button("取消").clicked() {
-                                self.show_config_files = false;
-                            }
+                    }
+                    if ui.button("取消").clicked() {
+                        self.show_webdav = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_webdav = false;
+        }
+    }
+
+    fn device_window(&mut self, ctx: &egui::Context) {
+        if !self.show_device {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("设备设置")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([820., 560.])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if let Some(context) = &self.context {
+                    ui.label(format!("当前设备 ID：{}", context.device.installation_id));
+                    ui.label(format!("共享目录：{}", context.layout.others.display()));
+                    ui.label(format!(
+                        "session_token：{}…",
+                        identity::short_token(&context.device.session_token)
+                    ));
+                } else {
+                    ui.label("尚未完成设备设置。请先指定 RIME 用户词库并配置 WebDAV。");
+                }
+                ui.separator();
+                egui::Grid::new("device_fields").show(ui, |ui| {
+                    ui.label("设备 ID");
+                    ui.add_sized(
+                        [620., 26.],
+                        egui::TextEdit::singleline(&mut self.device_id_draft)
+                            .hint_text("3~32 位，仅限字母/数字/下划线/连字符，例如 MacBookAir")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                    ui.label("密码");
+                    ui.add_sized(
+                        [620., 26.],
+                        egui::TextEdit::singleline(&mut self.device_password_draft)
+                            .password(true)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                    ui.label("确认密码");
+                    ui.add_sized(
+                        [620., 26.],
+                        egui::TextEdit::singleline(&mut self.device_password_confirm)
+                            .password(true)
+                            .hint_text("仅「强制接管」「修改密码」需要")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                });
+                ui.checkbox(
+                    &mut self.device_skip_password,
+                    "首次注册时跳过设置密码（不推荐）",
+                );
+                ui.checkbox(
+                    &mut self.device_confirm_takeover,
+                    "我已确认：接管会让该 ID 的旧设备在下一轮自动停止同步",
+                );
+
+                if !self.device_info_text.is_empty() {
+                    ui.separator();
+                    ui.label("远端 owner.json 信息：");
+                    let mut info = self.device_info_text.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut info)
+                            .desired_rows(4)
+                            .interactive(false),
+                    );
+                }
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("注册 / 验证并接管"))
+                        .clicked()
+                    {
+                        let skip = self.device_skip_password;
+                        self.submit_device_action(DeviceAction::Claim {
+                            id: self.device_id_draft.trim().to_owned(),
+                            password: Some(self.device_password_draft.clone()),
+                            skip_password: skip,
+                            confirm: self.device_confirm_takeover,
                         });
-                    });
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("强制接管"))
+                        .clicked()
+                    {
+                        self.submit_device_action(DeviceAction::TakeoverForced {
+                            id: self.device_id_draft.trim().to_owned(),
+                            new_password: self.device_password_confirm.clone(),
+                            confirm: self.device_confirm_takeover,
+                        });
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("修改密码"))
+                        .clicked()
+                    {
+                        self.submit_device_action(DeviceAction::ChangePassword {
+                            old_password: self.device_password_draft.clone(),
+                            new_password: self.device_password_confirm.clone(),
+                        });
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("注销此设备"))
+                        .clicked()
+                    {
+                        self.submit_device_action(DeviceAction::Retire {
+                            password: self.device_password_draft.clone(),
+                        });
+                    }
+                    if ui.button("导出配置").clicked() {
+                        self.submit_device_action(DeviceAction::Export);
+                    }
+                    if ui.button("导入配置").clicked() {
+                        self.submit_device_action(DeviceAction::Import {
+                            text: self.exported_text.clone(),
+                        });
+                    }
                 });
-            if !open {
-                self.show_config_files = false;
-            }
+                ui.separator();
+                ui.label("设备配置（导出/导入用，不含密码）：");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.exported_text)
+                        .desired_rows(6)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+        if !open {
+            self.show_device = false;
         }
-        if self.show_about {
-            let mut open = true;
-            egui::Window::new("关于 RIME 用户词库同步工具")
-                .collapsible(false)
-                .resizable(false)
-                .fixed_size([620., 260.])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.heading("关于 RIME 用户词库同步工具");
-                    ui.add_space(6.);
-                    ui.label(format!("版本：v{APP_VERSION}"));
-                    ui.add_space(8.);
-                    ui.label(
-                        "RIME 用户词库同步工具是一款支持 Windows 和 macOS 的 RIME 用户数据 WebDAV 同步工具，适用于小狼毫和鼠须管。",
-                    );
-                    ui.add_space(8.);
-                    ui.label(
-                        "本项目为开源软件。源代码、使用说明、版本更新和问题反馈请访问 GitHub：",
-                    );
-                    ui.hyperlink_to(GITHUB_URL, GITHUB_URL);
-                    ui.add_space(8.);
-                    ui.label("许可证：GNU General Public License v3.0");
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        if ui.button("确定").clicked() {
-                            self.show_about = false;
-                        }
+    }
+
+    fn sync_files_window(&mut self, ctx: &egui::Context) {
+        if !self.show_sync_files {
+            return;
+        }
+        let mut open = true;
+        let mut remove = None;
+        egui::Window::new("同步文件选择")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([860., 420.])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("合并规则按文件类型自动判定：*.dict.yaml 词条并集；*.txt 首列并集；*.yaml/*.json/*.lua 按时间。");
+                ui.label("移除某个文件只影响本设备（写进本机排除集），不会删除 Others/ 里的公共副本。");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(240.)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("sync_files_grid")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (index, path) in self.sync_files_draft.iter().enumerate() {
+                                    ui.checkbox(&mut self.sync_files_selected[index], "选择");
+                                    ui.add_sized(
+                                        [320., 22.],
+                                        egui::Label::new(path).truncate(),
+                                    );
+                                    let mode = crate::merge::MergeMode::for_path(path)
+                                        .map(|mode| mode.label())
+                                        .unwrap_or("不可同步");
+                                    ui.label(mode);
+                                    if ui.button("删除").clicked() {
+                                        remove = Some(index);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
                     });
-                });
-            if !open {
-                self.show_about = false;
-            }
-        }
-        if let Some(update) = self.available_update.clone() {
-            let mut open = true;
-            egui::Window::new("发现新版本")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(format!("当前版本：v{APP_VERSION}"));
-                    ui.label(format!("最新版本：v{}", update.version));
-                    ui.add_space(8.);
-                    ui.label("发现新版本，是否前往 GitHub Release 页面下载？");
-                    ui.add_space(8.);
+                if let Some(index) = remove {
+                    self.sync_files_draft.remove(index);
+                    self.sync_files_selected.remove(index);
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.horizontal(|ui| {
-                        ui.hyperlink_to("前往下载", &update.url);
-                        if ui.button("稍后").clicked() {
-                            self.available_update = None;
+                        if ui.button("添加文件").clicked() {
+                            self.add_sync_files();
+                        }
+                        if ui.button("保存").clicked() {
+                            match self.save_sync_files() {
+                                Ok(()) => self.show_sync_files = false,
+                                Err(error) => self.notice = Some(error.to_string()),
+                            }
+                        }
+                        if ui.button("取消").clicked() {
+                            self.show_sync_files = false;
                         }
                     });
+                    ui.label(format!("文件总数：{}", self.sync_files_draft.len()));
                 });
-            if !open {
-                self.available_update = None;
-            }
+            });
+        if !open {
+            self.show_sync_files = false;
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn config_dir_window(&mut self, ctx: &egui::Context) {
+        if !self.show_config_files {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("配置文件")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([720., 190.])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("该目录用于保存 RimeUserDictSync.ini 和 RimeSync.log。");
+                ui.label(format!("当前生效目录：{}", self.base.display()));
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [560., 26.],
+                        egui::TextEdit::singleline(&mut self.config_dir_draft)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ui.button("选择目录").clicked()
+                        && let Some(directory) = rfd::FileDialog::new()
+                            .set_directory(if self.config_dir_draft.is_empty() {
+                                self.base.clone()
+                            } else {
+                                PathBuf::from(&self.config_dir_draft)
+                            })
+                            .pick_folder()
+                    {
+                        self.config_dir_draft = directory.to_string_lossy().into_owned();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("打开配置").clicked()
+                        && let Err(error) =
+                            std::process::Command::new("open").arg(&self.base).spawn()
+                    {
+                        self.notice = Some(format!("打开配置目录失败：{error}"));
+                    }
+                    if ui.button("保存").clicked() {
+                        match self.save_config_dir() {
+                            Ok(()) => {
+                                let directory = self.base.display().to_string();
+                                self.append(&crate::report::timestamped(&format!(
+                                    "已切换 macOS 配置目录：{directory}"
+                                )));
+                                self.show_config_files = false;
+                                self.notice = Some(format!("配置目录已切换到：\n{directory}"));
+                            }
+                            Err(error) => self.notice = Some(error.to_string()),
+                        }
+                    }
+                    if ui.button("取消").clicked() {
+                        self.show_config_files = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_config_files = false;
+        }
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("关于 RIME 用户词库同步工具")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([620., 280.])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.heading("关于 RIME 用户词库同步工具");
+                ui.label(format!("版本：v{APP_VERSION}"));
+                ui.add_space(6.);
+                ui.label(
+                    "后台纯文件搬运（不打断输入），手动「同步词库」时才合并并重新部署。支持 Windows 小狼毫与 macOS 鼠须管。",
+                );
+                ui.add_space(6.);
+                ui.label("数据分层：Sync/<ID>/ 为各设备 userdb 快照，Sync/Others/ 为文本词典的公共合并结果。");
+                ui.hyperlink_to(GITHUB_URL, GITHUB_URL);
+                ui.label("许可证：GNU General Public License v3.0");
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    if ui.button("确定").clicked() {
+                        self.show_about = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_about = false;
+        }
+    }
+
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let Some(update) = self.available_update.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("发现新版本")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("当前版本：v{APP_VERSION}"));
+                ui.label(format!("最新版本：v{}", update.version));
+                ui.add_space(8.);
+                ui.label("发现新版本，是否前往 GitHub Release 页面下载？");
+                ui.add_space(8.);
+                ui.horizontal(|ui| {
+                    ui.hyperlink_to("前往下载", &update.url);
+                    if ui.button("稍后").clicked() {
+                        self.available_update = None;
+                    }
+                });
+            });
+        if !open {
+            self.available_update = None;
+        }
+    }
+
+    fn notice_window(&mut self, ctx: &egui::Context) {
         if let Some(text) = self.notice.clone() {
             let mut open = true;
-            egui::Window::new("RIME 用户词库同步工具")
+            egui::Window::new("提示")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
@@ -864,6 +1397,269 @@ impl eframe::App for App {
     }
 }
 
+/// GUI 内建的后台搬运线程（未安装 Windows 服务时的兜底）。
+///
+/// 与服务的调度完全同构：每 [`daemon::TICK`] 醒一次，判断 `DueAt` 是否到期，
+/// 并消费 `.rime-sync/wake` 以响应「立刻搬运一轮」。装了服务就让位。
+fn spawn_background(
+    base: PathBuf,
+    ini: PathBuf,
+    tx: Sender<Event>,
+    busy: Arc<AtomicBool>,
+    service_running: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut due = daemon::DueAt::now();
+        let mut last_error = String::new();
+        loop {
+            std::thread::sleep(daemon::TICK);
+            let settings = match Settings::load(&ini) {
+                Ok(settings) => settings,
+                Err(_) => continue,
+            };
+            if busy.load(Ordering::Relaxed) || service_running.load(Ordering::Relaxed) {
+                continue;
+            }
+            let schedule = daemon::Schedule::from_settings(&settings);
+            let wake = daemon::take_wake_for_settings(&settings);
+            if !wake && (!schedule.enabled || !due.is_due()) {
+                continue;
+            }
+            due.reschedule(schedule.interval);
+            let reporter = ChannelReporter { tx: tx.clone() };
+            let cancel = AtomicBool::new(false);
+            let result = match build_context(&base, &ini) {
+                Ok(context) => transport::round(&context, &cancel, &reporter)
+                    .map(|outcome| {
+                        format!(
+                            "后台搬运完成：下载 {} 项，上传 {} 项。",
+                            outcome.downloaded, outcome.uploaded
+                        )
+                    })
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            match result {
+                Ok(message) => {
+                    last_error.clear();
+                    let _ = tx.send(Event::Round(Ok(message)));
+                }
+                Err(error) => {
+                    // 同一错误只打印一次，避免每轮刷屏。
+                    if error != last_error {
+                        last_error = error.clone();
+                        let _ = tx.send(Event::Round(Err(error)));
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn build_context(base: &Path, ini: &Path) -> Result<Context> {
+    let mut settings = Settings::load(ini)?;
+    Context::build(base, ini, &mut settings)
+}
+
+/// 设备设置的全部网络动作都在后台线程执行。
+fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
+    let mut settings = Settings::load(ini)?;
+    if !settings.webdav_ready() {
+        bail!("请先在「WebDAV 设置」中填写地址与用户名并测试连接。");
+    }
+    let rime_dir = context::resolve_rime_dir(&settings);
+    let installation = rime_dir.join("installation.yaml");
+    if !installation.is_file() {
+        bail!("请先点击「指定 RIME 用户词库」选择包含 installation.yaml 的目录。");
+    }
+    let dav = webdav::WebDav::new(
+        settings.webdav_url.trim(),
+        settings.username.trim(),
+        &settings.password,
+    )?;
+    let snapshot_dir = rime_dir.join(paths::SYNC_DIR_NAME);
+    let mut device = load_device_file(&rime_dir).unwrap_or_default();
+    let seed = DeviceSeed::from_device(&device, snapshot_dir.to_string_lossy().into_owned());
+
+    match action {
+        DeviceAction::Claim {
+            id,
+            password,
+            skip_password,
+            confirm,
+        } => {
+            if id.is_empty() {
+                bail!("请先填写设备 ID。");
+            }
+            let password = password.filter(|value| !value.is_empty());
+            if password.is_none() && !skip_password {
+                bail!("请填写 ID 密码，或显式勾选「跳过设置密码」。");
+            }
+            match device::claim(&dav, &id, password.as_deref(), &seed)? {
+                Claim::Claimed(claimed) => {
+                    let mut claimed = *claimed;
+                    claimed.sync_dir = seed.sync_dir.clone();
+                    persist(&rime_dir, &mut settings, ini, &claimed)?;
+                    Ok(format!(
+                        "已在远端抢占 ID「{id}」并写入 owner.json（{}）。",
+                        if password.is_some() {
+                            "已设置密码"
+                        } else {
+                            "未设置密码"
+                        }
+                    ))
+                }
+                Claim::Occupied(owner) => {
+                    let owner = *owner;
+                    let info = describe_owner(&owner, &dav, &id);
+                    if !confirm {
+                        bail!(
+                            "远端已存在此 ID，且不会自动占用它。\n{info}\n\
+                             若确认这是你自己的设备：填写密码并勾选确认框后重试「注册 / 验证并接管」；\
+                             忘记密码则使用「强制接管」。"
+                        );
+                    }
+                    let Some(password) = password else {
+                        bail!("验证接管需要密码；忘记密码请使用「强制接管」。\n{info}");
+                    };
+                    let owner = owner.context(
+                        "远端存在此 ID 的目录，但没有 owner.json（老版本或手工创建）；请使用「强制接管」。",
+                    )?;
+                    let layout = Layout::new(&rime_dir, &id);
+                    layout.ensure_dirs()?;
+                    let (mut taken, notices) =
+                        device::takeover_verified(&dav, &id, &owner, &password, &seed, &layout)?;
+                    taken.sync_dir = seed.sync_dir.clone();
+                    persist(&rime_dir, &mut settings, ini, &taken)?;
+                    Ok(format!(
+                        "已接管 ID「{id}」（密码验证通过）。\n{}",
+                        notices.join("\n")
+                    ))
+                }
+            }
+        }
+        DeviceAction::TakeoverForced {
+            id,
+            new_password,
+            confirm,
+        } => {
+            if id.is_empty() {
+                bail!("请先填写设备 ID。");
+            }
+            identity::validate_password_input(&new_password)?;
+            if !confirm {
+                bail!("强制接管会让该 ID 的旧设备立即停止同步，请先勾选确认框。");
+            }
+            let owner = identity::Owner::load(&dav, &id)?.unwrap_or_default();
+            let layout = Layout::new(&rime_dir, &id);
+            layout.ensure_dirs()?;
+            let (mut taken, notices) =
+                device::takeover_forced(&dav, &id, &owner, &new_password, &seed, &layout)?;
+            taken.sync_dir = seed.sync_dir.clone();
+            persist(&rime_dir, &mut settings, ini, &taken)?;
+            Ok(format!(
+                "已强制接管 ID「{id}」并重设密码。\n{}",
+                notices.join("\n")
+            ))
+        }
+        DeviceAction::ChangePassword {
+            old_password,
+            new_password,
+        } => {
+            let id = current_id(&device)?;
+            device::change_password(&dav, &id, &old_password, &new_password, &mut device)?;
+            persist(&rime_dir, &mut settings, ini, &device)?;
+            Ok(format!("已更新 ID「{id}」的密码（session_token 未轮换）。"))
+        }
+        DeviceAction::Retire { password } => {
+            let id = current_id(&device)?;
+            let layout = Layout::new(&rime_dir, &id);
+            let notices = device::retire(&dav, &id, &password, &layout)?;
+            // 本地设备配置也一并清掉，避免下次启动还指向已注销的 ID。
+            let _ = fs::remove_file(layout.device_file());
+            device.session_token.clear();
+            Ok(notices.join("\n"))
+        }
+        DeviceAction::Export => {
+            let id = current_id(&device)?;
+            let layout = Layout::new(&rime_dir, &id);
+            let list = SyncList::load(&layout.list_file())?;
+            let exported = device::export(&device, settings.webdav_url.trim(), &list);
+            Ok(format!(
+                "已生成设备配置，请复制保存到网盘或 U 盘：\n{}",
+                exported.to_text()?
+            ))
+        }
+        DeviceAction::Import { text } => {
+            if text.trim().is_empty() {
+                bail!("请先把导出的设备配置粘贴到文本框里。");
+            }
+            let exported = identity::ExportedDevice::from_text(&text)?;
+            let layout = Layout::new(&rime_dir, &exported.id);
+            layout.ensure_dirs()?;
+            if !device.installation_id.is_empty()
+                && !device.installation_id.eq_ignore_ascii_case(&exported.id)
+            {
+                let _ =
+                    fs::remove_file(Layout::new(&rime_dir, &device.installation_id).device_file());
+            }
+            let notices = device::import(&exported, &mut device, &mut settings, &layout)?;
+            persist(&rime_dir, &mut settings, ini, &device)?;
+            Ok(format!(
+                "{}\n导入后请直接点「同步词库」，ID 与 token 一致，无需接管。",
+                notices.join("\n")
+            ))
+        }
+    }
+}
+
+fn current_id(device: &DeviceFile) -> Result<String> {
+    if device.installation_id.trim().is_empty() {
+        bail!("本机还没有设备 ID，请先注册或导入设备配置。");
+    }
+    Ok(device.installation_id.clone())
+}
+
+fn load_device_file(rime_dir: &Path) -> Option<DeviceFile> {
+    DeviceFile::load(&rime_dir.join(paths::META_DIR_NAME).join(paths::DEVICE_FILE)).ok()
+}
+
+fn persist(
+    rime_dir: &Path,
+    settings: &mut Settings,
+    ini: &Path,
+    device: &DeviceFile,
+) -> Result<()> {
+    let notices = context::persist_device(rime_dir, device)?;
+    for notice in notices {
+        let _ = notice;
+    }
+    settings.legacy_sync_files.clear();
+    settings.save(ini)?;
+    Ok(())
+}
+
+fn describe_owner(owner: &Option<identity::Owner>, dav: &webdav::WebDav, id: &str) -> String {
+    let count = device::count_remote_snapshots(dav, id);
+    match owner {
+        Some(owner) => {
+            let mut text = owner.describe();
+            text.push_str(&format!("快照文件数：{count}\n"));
+            if let Some(minutes) = device::minutes_since_last_sync(owner)
+                && (0..24 * 60).contains(&minutes)
+            {
+                text.push_str(&format!(
+                    "⚠ 该 ID 的设备似乎仍在使用（最后同步 {minutes} 分钟前），接管会使其立即停止同步。请确认这是你重装后的同一台机器。\n"
+                ));
+            }
+            text
+        }
+        None => format!(
+            "该 ID 在远端已存在目录，但没有 owner.json（老版本创建或手工建目录）。快照文件数：{count}\n"
+        ),
+    }
+}
+
 fn check_for_update(tx: Sender<Event>) {
     std::thread::spawn(move || {
         let update = fetch_latest_release().ok().flatten();
@@ -871,9 +1667,9 @@ fn check_for_update(tx: Sender<Event>) {
     });
 }
 
-fn fetch_latest_release() -> anyhow::Result<Option<UpdateInfo>> {
+fn fetch_latest_release() -> Result<Option<UpdateInfo>> {
     let response = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(Duration::from_secs(10))
         .user_agent(concat!("RimeUserDictSync/", env!("CARGO_PKG_VERSION")))
         .build()?
         .get(LATEST_RELEASE_API)
@@ -882,14 +1678,14 @@ fn fetch_latest_release() -> anyhow::Result<Option<UpdateInfo>> {
     let json: serde_json::Value = serde_json::from_str(&response.text()?)?;
     let tag = json["tag_name"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("GitHub Release 缺少 tag_name"))?;
+        .context("GitHub Release 缺少 tag_name")?;
     let url = json["html_url"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("GitHub Release 缺少 html_url"))?;
+        .context("GitHub Release 缺少 html_url")?;
     available_release(tag, url, APP_VERSION)
 }
 
-fn available_release(tag: &str, url: &str, current: &str) -> anyhow::Result<Option<UpdateInfo>> {
+fn available_release(tag: &str, url: &str, current: &str) -> Result<Option<UpdateInfo>> {
     let version_text = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
     let latest = semver::Version::parse(version_text)?;
     let current = semver::Version::parse(current)?;
@@ -899,26 +1695,53 @@ fn available_release(tag: &str, url: &str, current: &str) -> anyhow::Result<Opti
     }))
 }
 
+/// `test_webdav` 之外的地方只需要一个只读的 WebDAV 探测入口，这里给出统一构造点。
+fn build_webdav(settings: &Settings) -> Result<Option<webdav::WebDav>> {
+    if !settings.webdav_ready() {
+        return Ok(None);
+    }
+    Ok(Some(webdav::WebDav::new(
+        settings.webdav_url.trim(),
+        settings.username.trim(),
+        &settings.password,
+    )?))
+}
+
 #[cfg(test)]
-mod update_tests {
+mod tests {
     use super::*;
 
     #[test]
     fn only_newer_stable_release_is_available() {
         assert!(
-            available_release("v0.2.3", "https://example.test", "0.2.2")
+            available_release("v0.3.1", "https://example.test", "0.3.0")
                 .unwrap()
                 .is_some()
         );
         assert!(
-            available_release("v0.2.2", "https://example.test", "0.2.2")
+            available_release("v0.3.0", "https://example.test", "0.3.0")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            available_release("v0.2.1", "https://example.test", "0.2.2")
+            available_release("v0.2.9", "https://example.test", "0.3.0")
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn owner_description_mentions_recent_activity() {
+        let owner = identity::Owner {
+            host: "mac".into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            last_sync: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            machine_fp: "abcd1234".into(),
+            ..Default::default()
+        };
+        let text = owner.describe();
+        assert!(text.contains("mac"));
+        assert!(text.contains("密码状态：未设置（老版本创建或手工建目录）"));
+        assert!(device::minutes_since_last_sync(&owner).unwrap() <= 1);
     }
 }

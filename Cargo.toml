@@ -1,6 +1,6 @@
 [package]
 name = "rime-user-dict-sync"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 description = "Cross-platform RIME user dictionary WebDAV synchronizer"
 license = "GPL-3.0-only"
@@ -14,23 +14,35 @@ anyhow = "1"
 base64 = "0.22"
 chrono = "0.4"
 eframe = "0.31"
-image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 filetime = "0.2"
+fs2 = "0.4"
+hmac = "0.12"
 httpdate = "1"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+pbkdf2 = "0.12"
 percent-encoding = "2"
+rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rfd = "0.15"
 roxmltree = "0.20"
 semver = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-time = "0.3"
+sha2 = "0.10"
 url = "2"
 walkdir = "2"
-zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+mslnk = "0.1"
+windows-service = "0.7"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winres = "0.1"

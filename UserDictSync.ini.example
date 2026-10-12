@@ -1,5 +1,5 @@
 [rime]
-; 由“指定RIME用户词库”按钮保存
+; 由「指定 RIME 用户词库」按钮保存；sync_dir 会被写成该目录下的 Sync
 user_data_dir=
 ; Windows 留空时查找程序目录和 Windows RIME 前端注册表；macOS 留空时使用鼠须管默认路径
 deployer_path=
@@ -10,3 +10,16 @@ username=your_name
 password=your_password
 ; 界面保存后将删除上面的 password，并使用 Base64 字段
 password_base64=
+
+[background]
+; 是否启用后台纯搬运（每 N 分钟一轮，不打断输入）
+enabled=1
+; 间隔分钟数；服务端有请求频率限制时不要低于 10
+minutes=10
+
+; 说明：设备 ID、密码派生串与目录布局的权威副本保存在
+; <RIME 用户目录>/.rime-sync/device.json，同步文件列表保存在
+; <RIME 用户目录>/.rime-sync/sync-list.json，
+; 两者都不在 INI 中，也不在 Sync/ 目录内。
+;
+; 旧版本的 [sync_files] 段只用于一次性迁移，迁移完成后程序会自动删除它。

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use regex::Regex;
 use std::{
@@ -7,27 +7,39 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SyncFileMode {
-    Union,
-    Newest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SyncFile {
-    pub path: String,
-    pub mode: SyncFileMode,
-    pub writeback: bool,
-}
-
-#[derive(Clone, Default)]
+/// 应用程序级设置（`RimeUserDictSync.ini`）。
+///
+/// 这里只放"每台设备各自的连接信息"，与同步内容无关：
+/// 设备 ID / 密码派生串 / 目录布局的权威副本在 `RIME/.rime-sync/device.json`，
+/// 同步文件列表在 `RIME/.rime-sync/sync-list.json`。
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub user_data_dir: String,
     pub deployer_path: String,
     pub webdav_url: String,
     pub username: String,
     pub password: String,
-    pub sync_files: Vec<SyncFile>,
+    /// 后台纯搬运是否开启（§3）。
+    pub background_enabled: bool,
+    /// 后台轮次间隔，分钟；§10 风险 10 建议不低于 10 分钟。
+    pub background_minutes: u32,
+    /// v0.2.5 的 INI 同步列表，仅用于一次性迁移进 `sync-list.json`。
+    pub legacy_sync_files: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            user_data_dir: String::new(),
+            deployer_path: String::new(),
+            webdav_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            background_enabled: true,
+            background_minutes: 10,
+            legacy_sync_files: Vec::new(),
+        }
+    }
 }
 
 impl Settings {
@@ -37,7 +49,7 @@ impl Settings {
         }
         let map = parse_ini(&fs::read_to_string(path).context("读取配置文件失败")?);
         let get = |section: &str, key: &str| {
-            map.get(&(section.into(), key.into()))
+            map.get(&(section.to_owned(), key.to_owned()))
                 .cloned()
                 .unwrap_or_default()
         };
@@ -52,110 +64,83 @@ impl Settings {
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_default()
         };
-        let mut sync_files = parse_sync_file_entries(&get("sync_files", "file"));
-        if sync_files.is_empty() {
-            sync_files = parse_legacy_sync_files(&get);
-        }
+        let minutes = get("background", "minutes")
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(10)
+            .clamp(1, 24 * 60);
         Ok(Self {
-            user_data_dir: get("rime", "user_data_dir")
-                .or_else_nonempty(get("weasel", "user_data_dir")),
-            deployer_path: get("rime", "deployer_path")
-                .or_else_nonempty(get("weasel", "deployer_path")),
+            user_data_dir: nonempty(get("rime", "user_data_dir"))
+                .or_else(|| nonempty(get("weasel", "user_data_dir")))
+                .unwrap_or_default(),
+            deployer_path: nonempty(get("rime", "deployer_path"))
+                .or_else(|| nonempty(get("weasel", "deployer_path")))
+                .unwrap_or_default(),
             webdav_url: get("webdav", "url"),
             username: get("webdav", "username"),
             password,
-            sync_files,
+            background_enabled: !matches!(
+                get("background", "enabled")
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            background_minutes: minutes,
+            legacy_sync_files: parse_legacy_sync_files(&get),
         })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let files = join_sync_file_entries(&self.sync_files);
-        let text = format!(
-            "[rime]\nuser_data_dir={}\ndeployer_path={}\n\n[webdav]\nurl={}\nusername={}\npassword_base64={}\n\n[sync_files]\nfile={}\n",
+        let mut text = format!(
+            "[rime]\nuser_data_dir={}\ndeployer_path={}\n\n[webdav]\nurl={}\nusername={}\npassword_base64={}\n\n[background]\nenabled={}\nminutes={}\n",
             self.user_data_dir,
             self.deployer_path,
             self.webdav_url,
             self.username,
             STANDARD.encode(self.password.as_bytes()),
-            files,
+            if self.background_enabled { "1" } else { "0" },
+            self.background_minutes,
         );
+        if !self.legacy_sync_files.is_empty() {
+            text.push_str("\n[sync_files]\nfile=");
+            text.push_str(&self.legacy_sync_files.join(";"));
+            text.push('\n');
+        }
         fs::write(path, text).context("保存配置文件失败")
     }
-}
 
-fn parse_sync_file_entries(value: &str) -> Vec<SyncFile> {
-    value
-        .split(';')
-        .map(str::trim)
-        .filter_map(|entry| {
-            let (path, mode, writeback) =
-                if let Some((path, writeback)) = entry.rsplit_once("/union/") {
-                    (path, SyncFileMode::Union, writeback)
-                } else if let Some((path, writeback)) = entry.rsplit_once("/newest/") {
-                    (path, SyncFileMode::Newest, writeback)
-                } else {
-                    return None;
-                };
-            if path.is_empty() {
-                return None;
-            }
-            Some(SyncFile {
-                path: path.to_owned(),
-                mode,
-                // 兼容曾短暂使用“回写目录”的测试版：非 N 参数均视为回写。
-                writeback: !writeback.eq_ignore_ascii_case("N"),
-            })
-        })
-        .collect()
-}
-
-fn join_sync_file_entries(files: &[SyncFile]) -> String {
-    files
-        .iter()
-        .map(|file| {
-            let mode = match file.mode {
-                SyncFileMode::Union => "union",
-                SyncFileMode::Newest => "newest",
-            };
-            let writeback = if file.writeback { "Y" } else { "N" };
-            format!("{}/{mode}/{writeback}", file.path)
-        })
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
-fn parse_legacy_sync_files(get: &impl Fn(&str, &str) -> String) -> Vec<SyncFile> {
-    let mut files = parse_legacy_file_list(&get("sync_files", "union"), SyncFileMode::Union);
-    let newest = parse_legacy_file_list(&get("sync_files", "newest"), SyncFileMode::Newest);
-    files.retain(|union| {
-        !newest
-            .iter()
-            .any(|item| item.path.eq_ignore_ascii_case(&union.path))
-    });
-    files.extend(newest);
-    files
-}
-
-fn parse_legacy_file_list(value: &str, mode: SyncFileMode) -> Vec<SyncFile> {
-    value
-        .split(';')
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(|path| SyncFile {
-            path: path.to_owned(),
-            mode,
-            writeback: false,
-        })
-        .collect()
-}
-
-trait NonEmpty {
-    fn or_else_nonempty(self, other: String) -> String;
-}
-impl NonEmpty for String {
-    fn or_else_nonempty(self, other: String) -> String {
-        if self.is_empty() { other } else { self }
+    pub fn webdav_ready(&self) -> bool {
+        !self.webdav_url.trim().is_empty() && !self.username.trim().is_empty()
     }
+}
+
+fn nonempty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 兼容 v0.2.5 的 `file=路径/union/Y;...` 与更早的 `union=`/`newest=` 两个键。
+fn parse_legacy_sync_files(get: &impl Fn(&str, &str) -> String) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for value in [
+        get("sync_files", "file"),
+        get("sync_files", "union"),
+        get("sync_files", "newest"),
+    ] {
+        for entry in value
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            entries.push(entry.to_owned());
+        }
+    }
+    entries.dedup();
+    entries
 }
 
 fn parse_ini(text: &str) -> BTreeMap<(String, String), String> {
@@ -179,16 +164,16 @@ fn parse_ini(text: &str) -> BTreeMap<(String, String), String> {
     result
 }
 
-pub fn yaml_scalar(path: &Path, key: &str) -> Result<String> {
-    let text = fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))?;
-    let rx = Regex::new(&format!(r"(?m)^\s*{}\s*:\s*(.*?)\s*$", regex::escape(key)))?;
+/// 读一个可缺失的 YAML 标量（`installation.yaml` 的 `installation_id` / `sync_dir` / `Password`）。
+pub fn yaml_scalar_opt(path: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let rx = Regex::new(&format!(r"(?m)^\s*{}\s*:\s*(.*?)\s*$", regex::escape(key))).ok()?;
     let mut value = rx
         .captures(&text)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_owned())
-        .with_context(|| format!("installation.yaml 缺少 {key}"))?;
-    if let Some(i) = value.find(" #") {
-        value.truncate(i);
+        .and_then(|captures| captures.get(1))
+        .map(|matched| matched.as_str().trim().to_owned())?;
+    if let Some(index) = value.find(" #") {
+        value.truncate(index);
         value = value.trim().to_owned();
     }
     if value.len() >= 2
@@ -197,18 +182,16 @@ pub fn yaml_scalar(path: &Path, key: &str) -> Result<String> {
     {
         value = value[1..value.len() - 1].to_owned();
     }
-    if value.is_empty() {
-        bail!("installation.yaml 的 {key} 为空");
-    }
-    Ok(value)
+    if value.is_empty() { None } else { Some(value) }
 }
 
+/// 写回 YAML 标量：只替换第一处匹配，值统一用单引号包裹。
 pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
     let text = fs::read_to_string(path)?;
     let escaped = value.replace('\'', "''");
     let rx = Regex::new(&format!(r"(?m)^(\s*{}\s*:\s*).*$", regex::escape(key)))?;
     let updated = if let Some(captures) = rx.captures(&text) {
-        // 手动拼接：只替换第一处匹配，且避免值中的 $ 被当作捕获组引用。
+        // 手动拼接：避免值中的 $ 被当作捕获组引用。
         let whole = captures.get(0).context("正则匹配结果缺少整体")?;
         let prefix = captures.get(1).context("正则匹配结果缺少键前缀")?;
         let mut updated = String::with_capacity(text.len() + escaped.len() + 2);
@@ -226,34 +209,7 @@ pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_installation_id(value: &str) -> Result<()> {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || matches!(trimmed, "." | "..")
-        || trimmed.eq_ignore_ascii_case("WebDAV")
-        || trimmed.contains(['/', '\\'])
-        || trimmed.ends_with(['.', ' '])
-        || trimmed.contains(|c: char| {
-            matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control()
-        })
-        || is_windows_reserved_name(trimmed)
-    {
-        bail!("installation_id 不能安全地用作同步文件夹名称: {value}");
-    }
-    Ok(())
-}
-
-/// Windows 保留设备名不能用作文件夹名（按首个扩展名前的主干比较）。
-fn is_windows_reserved_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name);
-    matches!(
-        stem.to_ascii_uppercase().as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
-    )
-}
-
+/// 配置/日志所在目录：Windows 为 EXE 所在目录，macOS 默认用户资料库。
 pub fn app_dir() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -286,7 +242,7 @@ pub fn default_app_dir() -> Result<PathBuf> {
 #[cfg(target_os = "macos")]
 pub fn set_app_dir(path: &Path) -> Result<()> {
     if !path.is_absolute() {
-        bail!("配置目录必须是绝对路径");
+        anyhow::bail!("配置目录必须是绝对路径");
     }
     let default = default_app_dir()?;
     fs::create_dir_all(&default)?;
@@ -303,34 +259,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_files_round_trip_as_semicolon_lists() {
+    fn settings_round_trip_keeps_webdav_and_background() {
         let dir = tempfile::tempdir().unwrap();
         let ini = dir.path().join("RimeUserDictSync.ini");
         let settings = Settings {
-            sync_files: vec![
-                SyncFile {
-                    path: "custom/a.dict.yaml".into(),
-                    mode: SyncFileMode::Union,
-                    writeback: true,
-                },
-                SyncFile {
-                    path: "wanxiang-lts-zh-hans.gram".into(),
-                    mode: SyncFileMode::Newest,
-                    writeback: false,
-                },
-            ],
+            user_data_dir: r"C:\Users\x\AppData\Roaming\Rime".into(),
+            webdav_url: "https://dav.example.com/rime/".into(),
+            username: "user".into(),
+            password: "p@ss".into(),
+            background_enabled: false,
+            background_minutes: 15,
             ..Default::default()
         };
-
         settings.save(&ini).unwrap();
-        let text = fs::read_to_string(&ini).unwrap();
-        assert!(
-            text.contains("file=custom/a.dict.yaml/union/Y;wanxiang-lts-zh-hans.gram/newest/N")
-        );
-        assert_eq!(
-            Settings::load(&ini).unwrap().sync_files,
-            settings.sync_files
-        );
+        let loaded = Settings::load(&ini).unwrap();
+        assert_eq!(loaded.user_data_dir, settings.user_data_dir);
+        assert_eq!(loaded.webdav_url, settings.webdav_url);
+        assert_eq!(loaded.username, "user");
+        assert_eq!(loaded.password, "p@ss");
+        assert!(!loaded.background_enabled);
+        assert_eq!(loaded.background_minutes, 15);
+    }
+
+    #[test]
+    fn legacy_sync_file_entries_are_read_for_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("RimeUserDictSync.ini");
+        fs::write(
+            &ini,
+            "[sync_files]\nfile=default.custom.yaml/newest/N;custom/a.dict.yaml/union/Y\n",
+        )
+        .unwrap();
+        assert_eq!(Settings::load(&ini).unwrap().legacy_sync_files.len(), 2);
     }
 
     #[test]
@@ -346,11 +306,27 @@ mod tests {
     }
 
     #[test]
-    fn installation_id_rejects_windows_reserved_and_invalid_chars() {
-        assert!(validate_installation_id("con").is_err());
-        assert!(validate_installation_id("COM1.txt").is_err());
-        assert!(validate_installation_id("a<b").is_err());
-        assert!(validate_installation_id("name.").is_err());
-        assert!(validate_installation_id("my-laptop").is_ok());
+    fn optional_scalar_reports_missing_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("installation.yaml");
+        fs::write(&yaml, "installation_id: pc01\nPassword: 'a$b'\n").unwrap();
+        assert_eq!(
+            yaml_scalar_opt(&yaml, "installation_id").as_deref(),
+            Some("pc01")
+        );
+        assert_eq!(yaml_scalar_opt(&yaml, "Password").as_deref(), Some("a$b"));
+        assert_eq!(yaml_scalar_opt(&yaml, "sync_dir"), None);
+    }
+
+    #[test]
+    fn optional_scalar_strips_trailing_comments_and_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("installation.yaml");
+        fs::write(&yaml, "sync_dir: /tmp/Sync # 说明\nother: \"quoted\"\n").unwrap();
+        assert_eq!(
+            yaml_scalar_opt(&yaml, "sync_dir").as_deref(),
+            Some("/tmp/Sync")
+        );
+        assert_eq!(yaml_scalar_opt(&yaml, "other").as_deref(), Some("quoted"));
     }
 }
