@@ -205,7 +205,6 @@ struct App {
     exported_text: String,
 
     sync_files_draft: Vec<String>,
-    sync_files_selected: Vec<bool>,
 
     cancel: Arc<AtomicBool>,
     tx: Sender<Event>,
@@ -292,7 +291,6 @@ impl App {
             device_info_text: String::new(),
             exported_text: String::new(),
             sync_files_draft: Vec::new(),
-            sync_files_selected: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
@@ -538,8 +536,9 @@ impl App {
                 self.notice = Some(
                     "请在管理员权限提示（UAC）中确认；完成后本窗口会自动刷新服务状态。".to_owned(),
                 );
-                // 缩短下一次轮询，让状态尽快反映出来（提权进程还在跑时可能仍是旧状态）。
-                self.service_checked_at = Instant::now();
+                // 把检查时间拨回一个周期之前，下一次刷新才会立刻发生
+                // （refresh_service_state 在 elapsed() < SERVICE_POLL_INTERVAL 时直接返回）。
+                self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
@@ -656,7 +655,8 @@ impl App {
         let start = if self.settings.user_data_dir.trim().is_empty() {
             platform::default_user_dir()
         } else {
-            PathBuf::from(&self.settings.user_data_dir)
+            // 用户可能填 %APPDATA%\Rime 这类环境变量写法，与 resolve_rime_dir 保持一致。
+            PathBuf::from(platform::expand_env(&self.settings.user_data_dir))
         };
         let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() else {
             return;
@@ -696,7 +696,6 @@ impl App {
         match context.load_list() {
             Ok(list) => {
                 self.sync_files_draft = list.files.iter().map(|file| file.path.clone()).collect();
-                self.sync_files_selected = vec![false; self.sync_files_draft.len()];
                 self.show_sync_files = true;
             }
             Err(error) => self.notice = Some(error.to_string()),
@@ -727,7 +726,6 @@ impl App {
                     }
                     if !self.sync_files_draft.iter().any(|item| item == &relative) {
                         self.sync_files_draft.push(relative);
-                        self.sync_files_selected.push(false);
                     }
                 }
                 Err(error) => self.notice = Some(error.to_string()),
@@ -893,7 +891,11 @@ impl eframe::App for App {
                         .changed()
                     {
                         self.settings.background_enabled = enabled;
-                        let _ = self.settings.save(&self.ini);
+                        if self.config_broken {
+                            self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+                        } else {
+                            let _ = self.settings.save(&self.ini);
+                        }
                     }
                     ui.add_enabled(
                         !self.busy && self.settings.background_enabled,
@@ -901,8 +903,12 @@ impl eframe::App for App {
                             .text("分钟"),
                     );
                     if ui.button("保存间隔").clicked() {
-                        let _ = self.settings.save(&self.ini);
-                        self.request_background_round();
+                        if self.config_broken {
+                            self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+                        } else {
+                            let _ = self.settings.save(&self.ini);
+                            self.request_background_round();
+                        }
                     }
                     if ui.button("立刻搬运一轮").clicked() {
                         self.request_background_round();
@@ -1213,7 +1219,6 @@ impl App {
                             .striped(true)
                             .show(ui, |ui| {
                                 for (index, path) in self.sync_files_draft.iter().enumerate() {
-                                    ui.checkbox(&mut self.sync_files_selected[index], "选择");
                                     ui.add_sized(
                                         [320., 22.],
                                         egui::Label::new(path).truncate(),
@@ -1231,7 +1236,6 @@ impl App {
                     });
                 if let Some(index) = remove {
                     self.sync_files_draft.remove(index);
-                    self.sync_files_selected.remove(index);
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.horizontal(|ui| {
@@ -1597,12 +1601,8 @@ fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
             let exported = identity::ExportedDevice::from_text(&text)?;
             let layout = Layout::new(&rime_dir, &exported.id);
             layout.ensure_dirs()?;
-            if !device.installation_id.is_empty()
-                && !device.installation_id.eq_ignore_ascii_case(&exported.id)
-            {
-                let _ =
-                    fs::remove_file(Layout::new(&rime_dir, &device.installation_id).device_file());
-            }
+            // 不要先删 device.json：它与 ID 无关（固定为 .rime-sync/device.json），
+            // persist 随后会整体覆盖；一旦 import 校验失败，反而会把旧设备身份也一起弄丢。
             let notices = device::import(&exported, &mut device, &mut settings, &layout)?;
             persist(&rime_dir, &mut settings, ini, &device)?;
             Ok(format!(

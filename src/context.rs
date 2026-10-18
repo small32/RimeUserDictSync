@@ -363,6 +363,10 @@ pub fn migrate_legacy_layout(
     }
 
     // 远端：更早版本留在根目录的散文件 → Sync/Others/
+    // 解包可能刚往 Others/ 写过内容，重新判定一次，避免与刚解包的文件互相覆盖。
+    let others_empty = fs::read_dir(&layout.others)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true);
     if others_empty {
         let loose: Vec<_> = dav
             .list("")?

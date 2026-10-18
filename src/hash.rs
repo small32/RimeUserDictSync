@@ -75,9 +75,12 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// 日志里展示用的短哈希。
+/// 日志里展示用的短哈希（按字符取前 8 个，避免非 ASCII 内容被按字节切断而 panic）。
 pub fn short(hash: &str) -> &str {
-    &hash[..hash.len().min(8)]
+    match hash.char_indices().nth(8) {
+        Some((index, _)) => &hash[..index],
+        None => hash,
+    }
 }
 
 #[cfg(test)]

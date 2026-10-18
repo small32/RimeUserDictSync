@@ -20,6 +20,14 @@ pub fn extract(archive: &Path, root: &Path) -> Result<Vec<String>> {
             continue;
         }
         let name = entry.name().to_owned();
+        // installation.yaml 是 RIME 的设备安装记录，不属于共享词库内容；
+        // 本地 copy_tree 与远端散文件迁移都会剔除它，这里保持一致。
+        if Path::new(&name)
+            .file_name()
+            .is_some_and(|file| file == "installation.yaml")
+        {
+            continue;
+        }
         let target = safe_local(root, &name)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
@@ -61,6 +69,8 @@ mod tests {
             std::io::Write::write_all(&mut writer, b"hello").unwrap();
             writer.start_file("../evil.txt", options).unwrap();
             std::io::Write::write_all(&mut writer, b"nope").unwrap();
+            writer.start_file("installation.yaml", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"placeholder").unwrap();
             writer.finish().unwrap();
         }
         let root = dir.path().join("out");
@@ -69,6 +79,8 @@ mod tests {
             fs::read_to_string(root.join("custom_phrase.txt")).unwrap(),
             "hello"
         );
+        // installation.yaml 属于设备安装记录，迁移时应被剔除，不能落进 Others/。
+        assert!(!root.join("installation.yaml").exists());
     }
 
     #[test]

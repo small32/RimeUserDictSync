@@ -2,7 +2,10 @@ use crate::{
     context::Context,
     hash,
     identity::{self, Owner},
-    paths::{OTHERS_DIR_NAME, OWNER_FILE, SNAPSHOT_INDEX_FILE, is_forbidden_in_others},
+    paths::{
+        OTHERS_DIR_NAME, OWNER_FILE, SNAPSHOT_INDEX_FILE, is_forbidden_in_others,
+        validate_installation_id,
+    },
     report::Reporter,
     state::{IndexEntry, LocalLock, RemoteMark, SnapshotEntry, SnapshotIndex, SyncIndex},
     webdav::{PutOutcome, RemoteEntry, UploadTier},
@@ -265,10 +268,7 @@ fn upload(
         }
         UploadTier::MetadataOnly => {
             if capabilities.move_supported {
-                let temp = format!(
-                    "{remote_relative}.tmp-{}",
-                    &identity::new_session_token()[..8]
-                );
+                let temp = format!("{remote_relative}.tmp-{}", identity::new_path_token(8));
                 match dav.put(&temp, local, None)? {
                     PutOutcome::Uploaded { .. } => {}
                     PutOutcome::PreconditionFailed => {
@@ -321,12 +321,25 @@ fn pull_snapshots(
         {
             continue;
         }
+        if validate_installation_id(&name).is_err() {
+            report.log(&format!(
+                "远端目录 {name} 不是合法的设备 ID，已跳过（防止越界路径）。"
+            ));
+            continue;
+        }
         seen_devices.push(name.clone());
-        let remote_index = match dav.try_get_bytes(&format!("{name}/{SNAPSHOT_INDEX_FILE}"))? {
-            Some(bytes) => serde_json::from_slice::<SnapshotIndex>(&bytes).unwrap_or_default(),
-            None => {
+        let Some(bytes) = dav.try_get_bytes(&format!("{name}/{SNAPSHOT_INDEX_FILE}"))? else {
+            report.log(&format!(
+                "远端设备目录 {name}/ 没有 .index.json，本轮跳过（无法判断增量）。"
+            ));
+            continue;
+        };
+        // 清单解析失败**不能**当成空清单：那会顺着「远端已删除」逻辑删光该设备本地镜像。
+        let remote_index = match serde_json::from_slice::<SnapshotIndex>(&bytes) {
+            Ok(index) => index,
+            Err(error) => {
                 report.log(&format!(
-                    "远端设备目录 {name}/ 没有 .index.json，本轮跳过（无法判断增量）。"
+                    "远端设备目录 {name}/ 的 .index.json 无法解析（{error}），本轮跳过。"
                 ));
                 continue;
             }
@@ -445,8 +458,19 @@ pub fn push_own_snapshot(
             continue;
         }
         check(cancel)?;
-        let seen_etag = None;
-        match upload(context, &remote_relative, &file_path, seen_etag, report)? {
+        // B 档要求「本轮开始时的 ETag」作基准；本机快照目录只有本机写，
+        // 上传前先取一次即可，传 None 会被当成"远端不存在"而永远拒绝更新（§11 P0）。
+        let seen_etag = context
+            .dav
+            .stat(&remote_relative)?
+            .and_then(|entry| entry.etag);
+        match upload(
+            context,
+            &remote_relative,
+            &file_path,
+            seen_etag.as_deref(),
+            report,
+        )? {
             UploadOutcome::Uploaded { .. } => {
                 snapshot_index.files.insert(
                     name.clone(),

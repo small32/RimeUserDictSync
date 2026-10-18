@@ -97,8 +97,9 @@ mod imp {
     }
 
     fn forget_app_dir() {
+        // delete_value 需要写权限；open_subkey 拿的是只读句柄，必须显式要 KEY_SET_VALUE。
         if let Ok(hklm) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-            .open_subkey(r"SOFTWARE\RimeUserDictSync")
+            .open_subkey_with_flags(r"SOFTWARE\RimeUserDictSync", winreg::enums::KEY_SET_VALUE)
         {
             let _ = hklm.delete_value("AppDir");
         }

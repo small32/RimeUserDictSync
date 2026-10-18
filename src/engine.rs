@@ -307,7 +307,6 @@ fn newest_file(
             layout,
             index,
             relative,
-            local,
             others,
             &others_state.sha256,
             report,
@@ -321,7 +320,6 @@ fn resolve_conflict(
     layout: &Layout,
     index: &mut SyncIndex,
     relative: &str,
-    local: &Path,
     others: &Path,
     remote_hash: &str,
     report: &dyn Reporter,
@@ -341,8 +339,9 @@ fn resolve_conflict(
     index
         .conflicts
         .insert(relative.to_owned(), remote_hash.to_owned());
-    // 基线保持在"本地已改动"的状态，下一次同步会重新判断，但不会静默覆盖。
-    record(index, relative, local)?;
+    // 刻意**不**更新基线：若把基线改成"本地当前内容"，下一轮本地会被判成"未改动"、
+    // 远端"已改动"，从而走进 (true, false, true) 分支用远端静默覆盖本地（§5.1）。
+    // 保留旧基线，本地下一轮仍判为已改动，会再次命中这里做去重提示而不是覆盖。
     report.log(&format!(
         "{relative}：检测到双端修改冲突。已保留本地版本，远端版本另存为 {copy_relative}，请手动比较后决定保留哪一份。"
     ));
@@ -558,6 +557,9 @@ mod tests {
         // 同一份远端内容不会每轮都生成新副本。
         merge_registered(&layout, &mut index, "lua/date.lua", &NullReporter).unwrap();
         assert_eq!(conflict_copies(&layout).len(), 1);
+        // 关键：第二轮的再判定不能把本地版本静默覆盖成远端内容。
+        assert_eq!(read(&local), "local-edit");
+        assert_eq!(read(&others), "remote-edit");
     }
 
     #[test]

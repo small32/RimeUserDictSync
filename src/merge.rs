@@ -58,19 +58,16 @@ pub fn dict_union(local: &str, remote: &str) -> String {
     let remote_lines: Vec<&str> = remote.lines().collect();
     let local_header = header_end(&local_lines);
     let remote_header = header_end(&remote_lines);
-    let (header, local_body, remote_body) = if local_header.is_some() || !local_lines.is_empty() {
-        (
-            local_lines[..local_header.unwrap_or(0)].to_vec(),
-            &local_lines[local_header.unwrap_or(0)..],
-            &remote_lines[remote_header.unwrap_or(0)..],
-        )
-    } else {
-        (
-            remote_lines[..remote_header.unwrap_or(0)].to_vec(),
-            &local_lines[0..0],
-            &remote_lines[remote_header.unwrap_or(0)..],
-        )
+    // 表头取本地的；本地没有 front matter 时退回远端，否则远端 dict 的
+    // name/version/columns 会被丢掉，产出一份 librime 无法加载的 *.dict.yaml。
+    let header: Vec<&str> = match (local_header, remote_header) {
+        (Some(end), _) => local_lines[..end].to_vec(),
+        (None, Some(end)) => remote_lines[..end].to_vec(),
+        (None, None) => Vec::new(),
     };
+    // 没有 front matter 时整份内容都是词条体，直接从头开始。
+    let local_body = &local_lines[local_header.unwrap_or(0)..];
+    let remote_body = &remote_lines[remote_header.unwrap_or(0)..];
 
     let mut out: Vec<String> = header.iter().map(|line| (*line).to_owned()).collect();
     let mut exact: HashSet<String> = HashSet::new();
@@ -221,6 +218,20 @@ mod tests {
         assert!(merged.contains("丙\tbing\t5"));
         // 幂等：再合并一次结果不变。
         assert_eq!(dict_union(&merged, &merged), merged);
+    }
+
+    #[test]
+    fn dict_union_falls_back_to_the_remote_header() {
+        // 本地 dict 缺 front matter、远端有：不能把远端表头丢掉。
+        let local = "甲\tjia\t10\n";
+        let remote = "---\nname: test\n...\n乙\tyi\t3\n";
+        let merged = dict_union(local, remote);
+        assert!(
+            merged.starts_with("---\nname: test\n...\n"),
+            "远端表头被丢了：{merged}"
+        );
+        assert!(merged.contains("甲\tjia\t10"));
+        assert!(merged.contains("乙\tyi\t3"));
     }
 
     #[test]

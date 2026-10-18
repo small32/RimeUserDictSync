@@ -103,15 +103,17 @@ impl Layout {
     }
 }
 
-/// 把 `/` 分隔的相对路径拼到根目录上，拒绝 `..` 与绝对路径。
+/// 把 `/` 分隔的相对路径拼到根目录上，只接受普通路径分量。
+///
+/// 用 `Path::components` 解析，`..`（父目录）与根/盘符分量一律丢弃：远端返回的 href
+/// 可借 `%2e%2e%2f` 绕过 `Url::join` 的点段规范化，照搬就会逃出同步根（§10 风险 3）。
+/// 需要报错而非静默丢弃的场合（解压、远端散文件迁移），改用 `webdav::safe_local`。
 pub fn join_relative(root: &Path, relative: &str) -> PathBuf {
     let mut out = root.to_path_buf();
-    for part in relative
-        .replace('\\', "/")
-        .split('/')
-        .filter(|part| !part.is_empty())
-    {
-        out.push(part);
+    for component in Path::new(&relative.replace('\\', "/")).components() {
+        if let Component::Normal(part) = component {
+            out.push(part);
+        }
     }
     out
 }
@@ -335,6 +337,22 @@ fn sync_case_collision(rime: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_cannot_escape_the_root() {
+        let root = Path::new("/tmp/root");
+        assert_eq!(
+            join_relative(root, "Others/a.txt"),
+            root.join("Others/a.txt")
+        );
+        // 远端 href 里的 `%2e%2e%2f` 解码后就是 `..`，必须被吞掉而不是逃出根目录。
+        assert_eq!(join_relative(root, "../../evil.txt"), root.join("evil.txt"));
+        assert_eq!(
+            join_relative(root, "Others/../../../evil.txt"),
+            root.join("Others/evil.txt")
+        );
+        assert_eq!(join_relative(root, "/abs/evil"), root.join("abs/evil"));
+    }
 
     #[test]
     fn installation_id_follows_documented_charset() {

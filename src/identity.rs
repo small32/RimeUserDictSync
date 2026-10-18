@@ -186,6 +186,16 @@ pub fn new_session_token() -> String {
     STANDARD.encode(bytes)
 }
 
+/// 文件名/目录名用途的随机串：小写十六进制。
+///
+/// 不要拿 `new_session_token` 当名字用——它是 STANDARD base64，字母表里的 `/`、`+`
+/// 会把路径拆成多段（§9 探测目录、§4.4 C 档临时文件都中招）。
+pub fn new_path_token(count: usize) -> String {
+    let mut bytes = vec![0u8; count.div_ceil(2)];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    crate::hash::sha256_hex(&bytes)[..count].to_owned()
+}
+
 /// 本机指纹：随机 UUID 一次生成后长期保存，不做硬件探测（换硬件不该导致接管）。
 pub fn new_machine_fp() -> String {
     let mut bytes = [0u8; 16];
@@ -213,7 +223,10 @@ pub fn short_token(token: &str) -> &str {
     if token.is_empty() {
         "(空)"
     } else {
-        &token[..token.len().min(8)]
+        match token.char_indices().nth(8) {
+            Some((index, _)) => &token[..index],
+            None => token,
+        }
     }
 }
 

@@ -475,13 +475,7 @@ impl WebDav {
 
     /// 测试连接必须测写（§7.1）：MKCOL + PUT + GET + DELETE，只测 PROPFIND 会被只读共享骗过去。
     pub fn test_write(&self) -> Result<()> {
-        let probe_dir = format!(
-            "__rime-sync-probe-{}",
-            crate::identity::new_session_token()
-                .chars()
-                .take(12)
-                .collect::<String>()
-        );
+        let probe_dir = format!("__rime-sync-probe-{}", crate::identity::new_path_token(12));
         let probe_file = format!("{probe_dir}/probe.txt");
         let payload = b"rime-user-dict-sync probe".to_vec();
 
@@ -493,7 +487,8 @@ impl WebDav {
         }
         let cleanup = |this: &Self| {
             let _ = this.delete(&probe_file);
-            let _ = this.delete(&probe_dir);
+            // 集合目录要用 delete_collection：部分服务端要求 URL 带结尾斜杠否则删不掉。
+            let _ = this.delete_collection(&probe_dir);
         };
         let result = (|| -> Result<()> {
             match self.put_bytes(&probe_file, payload.clone(), None)? {
@@ -529,13 +524,7 @@ impl WebDav {
             caps.etag = entry.etag.is_some();
         }
 
-        let probe_dir = format!(
-            "__rime-sync-caps-{}",
-            crate::identity::new_session_token()
-                .chars()
-                .take(12)
-                .collect::<String>()
-        );
+        let probe_dir = format!("__rime-sync-caps-{}", crate::identity::new_path_token(12));
         if self.mkcol(&probe_dir).is_ok() {
             caps.mkcol = true;
             let probe_file = format!("{probe_dir}/a.txt");
@@ -546,16 +535,21 @@ impl WebDav {
             {
                 caps.etag = true;
             }
-            caps.delete = self.delete(&probe_file).is_ok();
+            // 先 MOVE 再删：源文件必须先存在，否则 MOVE 恒 404，move_supported 永远是 false。
             caps.move_supported = self.move_entry(&probe_file, &moved).unwrap_or(false);
-            let _ = self.delete(&moved);
+            caps.delete = if caps.move_supported {
+                // MOVE 成功，源文件已改名为 b.txt，删它顺带验证 DELETE。
+                self.delete(&moved).is_ok()
+            } else {
+                self.delete(&probe_file).is_ok()
+            };
             // If-Match 用必然不存在的 ETag 探测：期望 412，返回 200 说明被忽略。
             caps.if_match = matches!(
                 self.put_bytes(&probe_file, b"y".to_vec(), Some("\"does-not-exist\"")),
                 Ok(PutOutcome::PreconditionFailed)
             );
             let _ = self.delete(&probe_file);
-            let _ = self.delete(&probe_dir);
+            let _ = self.delete_collection(&probe_dir);
         }
         caps
     }
