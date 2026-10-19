@@ -17,12 +17,15 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::Duration,
 };
+// macOS 的后台代理状态快照用；其他平台没有这段，导入会变成 unused。
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 // 服务状态轮询：Windows 查 SCM，macOS 查 launchd 是否加载了代理。
 // 不单独 cfg 会让不含该逻辑的平台报 unused。
 #[cfg(any(target_os = "windows", target_os = "macos"))]
