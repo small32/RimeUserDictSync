@@ -6,8 +6,6 @@ APP_NAME=RimeUserDictSync
 DIST="$ROOT/dist"
 ARM_APP="$DIST/arm64/$APP_NAME.app"
 X86_APP="$DIST/x86_64/$APP_NAME.app"
-UNIVERSAL_APP="$DIST/universal/$APP_NAME.app"
-UNIVERSAL_BIN="$ROOT/target/universal/$APP_NAME"
 MENUBAR_BIN="$DIST/tools/RimeMenuBar"
 
 make_app() {
@@ -59,24 +57,19 @@ lipo -create \
     "$DIST/tools/RimeMenuBar-x86_64" \
     -output "$MENUBAR_BIN"
 
-mkdir -p "$DIST/arm64" "$DIST/x86_64" "$DIST/universal" "$(dirname "$UNIVERSAL_BIN")"
-lipo -create \
-    "$ROOT/target/aarch64-apple-darwin/release/$APP_NAME" \
-    "$ROOT/target/x86_64-apple-darwin/release/$APP_NAME" \
-    -output "$UNIVERSAL_BIN"
+mkdir -p "$DIST/arm64" "$DIST/x86_64"
 
+# 只出 arm64 与 x86_64 两个包：两边分别下载即可，Universal 2 与它们内容等价，
+# 却要多占 ~9MB、多跑一次 lipo + 打包 + 签名。需要的话手工
+# `lipo -create` 两个 Mach-O 就行。
 make_app "$ROOT/target/aarch64-apple-darwin/release/$APP_NAME" "$ARM_APP"
 make_app "$ROOT/target/x86_64-apple-darwin/release/$APP_NAME" "$X86_APP"
-make_app "$UNIVERSAL_BIN" "$UNIVERSAL_APP"
 
 rm -f \
     "$DIST/$APP_NAME-macOS-arm64.zip" \
-    "$DIST/$APP_NAME-macOS-x86_64.zip" \
-    "$DIST/$APP_NAME-macOS-universal.zip"
+    "$DIST/$APP_NAME-macOS-x86_64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$ARM_APP" "$DIST/$APP_NAME-macOS-arm64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$X86_APP" "$DIST/$APP_NAME-macOS-x86_64.zip"
-ditto -c -k --sequesterRsrc --keepParent "$UNIVERSAL_APP" "$DIST/$APP_NAME-macOS-universal.zip"
 
 echo "Created $DIST/$APP_NAME-macOS-arm64.zip"
 echo "Created $DIST/$APP_NAME-macOS-x86_64.zip"
-echo "Created $DIST/$APP_NAME-macOS-universal.zip"

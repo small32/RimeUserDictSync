@@ -100,7 +100,7 @@ jobs:
           retention-days: 7
 
   macos:
-    name: macOS ARM64, Intel and Universal 2
+    name: macOS ARM64 and Intel
     needs: resolve
     runs-on: macos-latest
     steps:

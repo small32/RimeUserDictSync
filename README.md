@@ -677,7 +677,7 @@ cargo build --release
 ```
 
 Windows 输出 `target/release/RimeUserDictSync.exe`；
-macOS 可运行 `./build-macos.sh` 一次生成 ARM64、x86_64 与 Universal 2 三个 `.app` 压缩包；
+macOS 可运行 `./build-macos.sh` 一次生成 ARM64 与 x86_64 两个 `.app` 压缩包（不再单独出 Universal 2 包）；
 Linux 输出 `target/release/RimeUserDictSync`（编译需要 GTK3 / XKB 的头文件：
 `sudo apt install build-essential libgtk-3-dev libxkbcommon-dev`，运行需要 `librime-bin`）。
 
