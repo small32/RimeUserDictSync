@@ -234,6 +234,15 @@ pub fn is_forbidden_in_others(relative: &str) -> bool {
         .ends_with(FORBIDDEN_OTHERS_SUFFIX)
 }
 
+/// `Others/` 里的「设备私有」文件：旧版迁移残留的 `installation.yaml`。
+///
+/// 它记录的是某台机器的 installation_id / sync_dir，同步给别人毫无意义，
+/// 还会让对方的工具误以为自己换过设备。发现即跳过，不再上传/下载。
+pub fn is_private_in_others(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name.eq_ignore_ascii_case("installation.yaml")
+}
+
 /// 方案自带的二进制资源（万象 `.gram`、模型等）：§8.2 明确不同步。
 ///
 /// librime 的 `/sync` 可能把它们一起复制进快照目录，所以无论调用顺序如何，
@@ -310,6 +319,11 @@ pub fn audit_sync_root(layout: &Layout) -> Vec<String> {
             if is_forbidden_in_others(&name) {
                 warnings.push(format!(
                     "`Others/{name}` 是 userdb 快照，放进共享目录会破坏删除语义，请从同步列表以外的位置移除。"
+                ));
+            }
+            if is_private_in_others(&name) {
+                warnings.push(format!(
+                    "`Others/{name}` 是设备私有记录，不会被同步（旧版迁移残留）；可以直接删除，不影响任何设备。"
                 ));
             }
             if !name.is_ascii() {
@@ -394,6 +408,14 @@ mod tests {
         assert!(layout.index_file().starts_with(&layout.meta));
         assert!(!layout.index_file().starts_with(&layout.sync));
         assert!(layout.device.ends_with("Sync/pc01"));
+    }
+
+    #[test]
+    fn installation_yaml_is_private_in_others() {
+        assert!(is_private_in_others("installation.yaml"));
+        assert!(is_private_in_others("cn/Installation.YAML"));
+        assert!(!is_private_in_others("custom_phrase.txt"));
+        assert!(!is_private_in_others("installation.yaml.bak"));
     }
 
     #[test]

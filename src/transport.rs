@@ -27,6 +27,27 @@ pub struct RoundOutcome {
     pub notes: Vec<String>,
 }
 
+/// 本设备的 ID 已被其他设备接管。
+///
+/// 这不是网络故障：继续同步会往别人的 `<ID>/` 写快照、覆盖对方的 `.index.json`。
+/// 调用方（尤其手动同步）必须据此直接中止，而不是「忽略错误继续跑」。
+#[derive(Clone, Debug)]
+pub struct SessionTakenOver {
+    pub installation_id: String,
+}
+
+impl std::fmt::Display for SessionTakenOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "此 ID（{}）已被其他设备接管，本机已停止同步；请在「设备设置」中改用新的 ID 或重新导入设备配置。",
+            self.installation_id
+        )
+    }
+}
+
+impl std::error::Error for SessionTakenOver {}
+
 /// 后台搬运一轮（取锁）。**只搬运文件，不读写 `RIME/` 根目录下的源文件**（§3）。
 pub fn round(
     context: &Context,
@@ -101,10 +122,9 @@ pub fn check_session(context: &Context, report: &dyn Reporter) -> Result<()> {
         return Ok(());
     }
     if owner.session_token != context.device.session_token {
-        bail!(
-            "此 ID（{}）已被其他设备接管，本机已停止同步；请在「设备设置」中改用新的 ID 或重新导入设备配置。",
-            context.layout.installation_id
-        );
+        return Err(anyhow::Error::new(SessionTakenOver {
+            installation_id: context.layout.installation_id.clone(),
+        }));
     }
     Ok(())
 }
@@ -132,6 +152,9 @@ fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) 
             report.log(&format!(
                 "跳过 Others/{relative}：userdb 快照不能出现在共享目录中。"
             ));
+            continue;
+        }
+        if crate::paths::is_private_in_others(relative) {
             continue;
         }
         let target = context.layout.others_path(relative);
@@ -188,6 +211,9 @@ pub fn push_others(
             report.log(&format!(
                 "跳过 Others/{relative}：userdb 快照不能放进共享目录（§2.2 红线）。"
             ));
+            continue;
+        }
+        if crate::paths::is_private_in_others(&relative) {
             continue;
         }
         if !relative.is_ascii() {
@@ -588,6 +614,12 @@ pub fn walk_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         if !entry.file_type().is_file() {
             continue;
         }
+        // 隐藏文件（.DS_Store）与下载残留（`.<name>.<ts>.tmp`）不属于同步内容：
+        // 一次失败的下载会留下半截临时文件，传上去就变成所有人可见的"词库"。
+        let file_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if file_name.starts_with('.') || file_name.ends_with(".tmp") {
+            continue;
+        }
         let relative = entry
             .path()
             .strip_prefix(root)?
@@ -619,6 +651,31 @@ mod tests {
         assert_eq!(strip_dir("Others/a.txt", "Others"), Some("a.txt"));
         assert_eq!(strip_dir("Others/cn/b.yaml", "Others"), Some("cn/b.yaml"));
         assert_eq!(strip_dir("Other/a.txt", "Others"), None);
+    }
+
+    #[test]
+    fn walk_files_skips_hidden_and_leftover_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("custom_phrase.txt"), b"a\n").unwrap();
+        std::fs::write(dir.path().join(".DS_Store"), b"x").unwrap();
+        // 下载失败残留的临时文件：绝不能当成词库上传。
+        std::fs::write(dir.path().join(".custom_phrase.txt.123456.tmp"), b"half").unwrap();
+        let names: Vec<String> = walk_files(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(relative, _)| relative)
+            .collect();
+        assert_eq!(names, vec!["custom_phrase.txt".to_owned()]);
+    }
+
+    #[test]
+    fn session_taken_over_stays_a_typed_error() {
+        let error = anyhow::Error::new(SessionTakenOver {
+            installation_id: "pc01".into(),
+        });
+        // 手动同步靠这个 downcast 判断“必须中止”，不能被当成普通网络错误吞掉。
+        assert!(error.downcast_ref::<SessionTakenOver>().is_some());
+        assert!(error.to_string().contains("pc01"));
     }
 
     #[test]

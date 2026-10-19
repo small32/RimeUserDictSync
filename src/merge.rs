@@ -37,7 +37,7 @@ impl MergeMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::DictUnion => "词条并集",
-            Self::KeyUnion => "首列并集",
+            Self::KeyUnion => "文本并集（三列含编码）",
             Self::Newest => "按时间(newest)",
         }
     }
@@ -95,8 +95,9 @@ pub fn dict_union(local: &str, remote: &str) -> String {
 
 /// `*.txt` 按首列 key 并集（自定义短语 / opencc 转换表）。
 ///
-/// 同一 key 出现两次时：两侧都有可解析的数字权重就取大的（自定义短语的权重列），
-/// 否则保留先出现的一条 —— 对 `原词\t转换词` 这类两列表，本地内容优先且结果确定。
+/// 去重键见 [`dedupe_key`]：两列按首列，三列及以上按「首列＋次列」。
+/// 同一 key 出现两次时：两侧都有可解析的数字权重就取大的，
+/// 否则保留先出现的一条 —— 结果确定，且绝不丢行（同 key 除外）。
 pub fn key_union(local: &str, remote: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut keys: HashMap<String, usize> = HashMap::new();
@@ -109,12 +110,7 @@ pub fn key_union(local: &str, remote: &str) -> String {
             }
             continue;
         }
-        let key = trimmed
-            .split('\t')
-            .next()
-            .unwrap_or(trimmed)
-            .trim()
-            .to_owned();
+        let key = dedupe_key(trimmed);
         match keys.get(&key).copied() {
             Some(position) => {
                 let existing = out[position].clone();
@@ -132,6 +128,23 @@ pub fn key_union(local: &str, remote: &str) -> String {
         }
     }
     join_lines(out)
+}
+
+/// `.txt` 一行的去重键。
+///
+/// - 两列（opencc 的 `原词<TAB>转换词`）：一列一键，用首列——同一个原词只能有一种转换，
+///   两侧不一致时按权重/先到者取一条。
+/// - 三列及以上（`custom_phrase.txt` 的 `文本<TAB>编码<TAB>权重`）：必须带上编码，
+///   否则「同一个词的不同拼法」会被当成重复项删掉——这是会让用户词库悄悄变少的
+///   数据丢失缺陷（同一个文本 uig / uyig / uyige 三条只能活下来一条）。
+fn dedupe_key(line: &str) -> String {
+    let fields: Vec<&str> = line.split('\t').collect();
+    let text = fields.first().map(|field| field.trim()).unwrap_or(line);
+    if fields.len() >= 3 {
+        format!("{text}\t{}", fields[1].trim())
+    } else {
+        text.to_owned()
+    }
 }
 
 fn join_lines(lines: Vec<String>) -> String {
@@ -242,6 +255,41 @@ mod tests {
         assert!(merged.contains("你好\tni hao\t200"));
         assert!(!merged.contains("你好\tni hao\t100"));
         assert!(merged.contains("世界\tshi jie\t50"));
+    }
+
+    #[test]
+    fn key_union_keeps_every_code_of_the_same_phrase() {
+        // custom_phrase.txt 是 `文本\t编码\t权重`：同一个词的多种拼法都必须留下，
+        // 曾经按首列去重，导致 uig / uyig / uyige 只能活下来一条（P0 数据丢失）。
+        let local = "有一个\tuig\t0\n有一个\tuyig\t0\n有没有\tumeiu\t0\n";
+        let remote = "有一个\tuyige\t0\n有没有\tumu\t0\n世界\tshi jie\t50\n";
+        let merged = key_union(local, remote);
+        assert_eq!(merged.lines().count(), 6, "实际结果:\n{merged}");
+        for expected in [
+            "有一个\tuig\t0",
+            "有一个\tuyig\t0",
+            "有一个\tuyige\t0",
+            "有没有\tumeiu\t0",
+            "有没有\tumu\t0",
+            "世界\tshi jie\t50",
+        ] {
+            assert!(merged.contains(expected), "少了 {expected:?}:\n{merged}");
+        }
+    }
+
+    #[test]
+    fn key_union_never_drops_any_distinct_key() {
+        // 不变量：并集必须覆盖两侧所有不同的去重键（同键取大权重是允许的）。
+        let local = "甲\tjia\t10\n乙\tyi\t3\n有个\tuig\t0\n有个\tuyig\t0\n";
+        let remote = "甲\tjia\t20\n丙\tbing\t5\n有个\tuyige\t0\n";
+        let merged = key_union(local, remote);
+        for line in local.lines().chain(remote.lines()) {
+            let key = dedupe_key(line);
+            assert!(
+                merged.lines().any(|row| dedupe_key(row) == key),
+                "合并后丢了键 {key:?}:\n{merged}"
+            );
+        }
     }
 
     #[test]

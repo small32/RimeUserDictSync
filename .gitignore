@@ -5,3 +5,4 @@ RimeSync.log
 target/
 dist/
 .DS_Store
+.workbuddy/

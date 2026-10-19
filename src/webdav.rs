@@ -322,10 +322,17 @@ impl WebDav {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| httpdate::parse_http_date(value).ok());
         let temp = crate::hash::temp_sibling(target);
-        {
+        // 下载失败必须把半截临时文件删掉：它落在 Others/ 里，下一轮会被
+        // 当成正常文件上传，把残缺内容扩散到所有设备。
+        let written = (|| -> Result<()> {
             let mut file = fs::File::create(&temp)?;
             std::io::copy(&mut response, &mut file)?;
             file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(error.context(format!("下载 {relative} 失败")));
         }
         if let Some(time) = fallback_mtime.or(header_time) {
             let _ = filetime::set_file_mtime(&temp, filetime::FileTime::from_system_time(time));

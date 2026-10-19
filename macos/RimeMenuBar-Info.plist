@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>RimeMenuBar</string>
+    <key>CFBundleDisplayName</key>
+    <string>Rime词库同步</string>
+    <!-- 必须和主程序不同：助手如果共用 com.small32.rime-user-dict-sync，
+         LaunchServices 会认为主程序"已经在运行"，双击 .app 就只剩激活、不出窗口。 -->
+    <key>CFBundleIdentifier</key>
+    <string>com.small32.rime-user-dict-sync.menubar2</string>
+    <key>CFBundleExecutable</key>
+    <string>RimeMenuBar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleVersion</key>
+    <string>0.3.2</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.3.2</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>

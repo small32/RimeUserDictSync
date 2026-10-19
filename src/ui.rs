@@ -17,14 +17,15 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::Duration,
 };
-// 这一项只在 Windows 的服务状态轮询里用到；不单独 cfg 会让 macOS 构建报 unused。
-#[cfg(target_os = "windows")]
+// 服务状态轮询：Windows 查 SCM，macOS 查 launchd 是否加载了代理。
+// 不单独 cfg 会让不含该逻辑的平台报 unused。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Instant;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,9 +35,14 @@ const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/small32/RimeUserDictSync/releases/latest";
 const CONFIG_BROKEN_NOTICE: &str =
     "配置文件读取失败，为避免覆盖原有配置已禁用保存；请手动修复或删除配置文件后重启程序。";
-/// 后台服务状态的轮询间隔：SCM 查询很便宜，这个频率足够跟上提权安装的节奏。
+/// 后台服务/代理状态的轮询间隔。
+///
+/// Windows 查 SCM 很便宜，5 秒足够跟上提权安装的节奏；
+/// macOS 每次要 fork 一个 launchctl，放宽到 30 秒，避免无谓的进程创建。
 #[cfg(target_os = "windows")]
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct UpdateInfo {
@@ -94,6 +100,11 @@ pub fn run() -> eframe::Result {
         },
         Box::new(|cc| {
             set_fonts(&cc.egui_ctx);
+            // 程序刚换过版本时，launchd 里记着的还是旧二进制的签名约束，
+            // 后台任务会被系统按「Launch Constraint Violation」杀掉。
+            // 放进后台线程，别拖慢首帧。
+            #[cfg(target_os = "macos")]
+            std::thread::spawn(crate::agent::heal_after_update);
             Ok(Box::new(App::new()))
         }),
     )
@@ -173,11 +184,17 @@ struct App {
     busy_flag: Arc<AtomicBool>,
     /// 后台服务是否在跑。服务接管搬运后，内建线程就让位，避免重复劳动。
     service_running: Arc<AtomicBool>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     service_text: String,
+    /// macOS：后台线程定期查 launchd，UI 只读快照。
+    ///
+    /// 直接在 UI 线程调 `agent::status()` 会 spawn `id` + 两次 `launchctl print`，
+    /// 每 5 秒卡一下界面。
+    #[cfg(target_os = "macos")]
+    agent_snapshot: Arc<Mutex<AgentSnapshot>>,
     #[cfg(target_os = "windows")]
     shortcut_text: String,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     service_checked_at: Instant,
     config_broken: bool,
 
@@ -211,6 +228,32 @@ struct App {
     rx: Receiver<Event>,
     notice: Option<String>,
     available_update: Option<UpdateInfo>,
+}
+
+/// macOS 后台代理状态快照（由后台线程刷新，UI 只读）。
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct AgentSnapshot {
+    text: String,
+    /// 定时搬运任务是否已被 launchd 加载。
+    loaded: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_agent_poller() -> Arc<Mutex<AgentSnapshot>> {
+    let snapshot = Arc::new(Mutex::new(AgentSnapshot::default()));
+    let shared = snapshot.clone();
+    std::thread::spawn(move || {
+        loop {
+            let (text, loaded) = crate::agent::status();
+            if let Ok(mut guard) = shared.lock() {
+                guard.text = text;
+                guard.loaded = loaded;
+            }
+            std::thread::sleep(SERVICE_POLL_INTERVAL);
+        }
+    });
+    snapshot
 }
 
 impl App {
@@ -249,6 +292,8 @@ impl App {
             busy_flag.clone(),
             service_running.clone(),
         );
+        #[cfg(target_os = "macos")]
+        let agent_snapshot = spawn_agent_poller();
 
         let mut app = Self {
             base,
@@ -266,11 +311,13 @@ impl App {
             busy: false,
             busy_flag,
             service_running,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             service_text: String::new(),
+            #[cfg(target_os = "macos")]
+            agent_snapshot,
             #[cfg(target_os = "windows")]
             shortcut_text: String::new(),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             service_checked_at: Instant::now() - SERVICE_POLL_INTERVAL,
             config_broken,
             show_webdav: false,
@@ -499,7 +546,28 @@ impl App {
         self.service_running.store(running, Ordering::Relaxed);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    /// macOS：读后台线程刷新的快照；加载了就让 GUI 内建线程让位。
+    #[cfg(target_os = "macos")]
+    fn refresh_service_state(&mut self) {
+        if self.service_checked_at.elapsed() < SERVICE_POLL_INTERVAL {
+            return;
+        }
+        self.service_checked_at = Instant::now();
+        let (text, loaded) = match self.agent_snapshot.lock() {
+            Ok(guard) if !guard.text.is_empty() => (guard.text.clone(), guard.loaded),
+            // 后台线程还没跑完第一轮，下一帧再读。
+            _ => return,
+        };
+        if !self.service_text.is_empty() && self.service_text != text {
+            self.append(&crate::report::timestamped(&format!(
+                "后台代理状态变化：{text}"
+            )));
+        }
+        self.service_text = text;
+        self.service_running.store(loaded, Ordering::Relaxed);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn refresh_service_state(&mut self) {
         self.service_running.store(false, Ordering::Relaxed);
     }
@@ -560,6 +628,43 @@ impl App {
             Err(error) => self.notice = Some(error.to_string()),
         }
         self.shortcut_text = crate::shortcut::describe(&self.base);
+    }
+
+    /// macOS：生成/删除 AppleScript applet 形式的「同步词库」。
+    #[cfg(target_os = "macos")]
+    fn run_shortcut_action(&mut self, uninstall: bool) {
+        let result = if uninstall {
+            crate::shortcut_macos::uninstall(&self.base)
+        } else {
+            crate::shortcut_macos::install(&self.base)
+        };
+        match result {
+            Ok(message) => {
+                self.append(&crate::report::timestamped(&message));
+                self.notice = Some(message);
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// macOS：安装/卸载 launchd 后台代理。
+    #[cfg(target_os = "macos")]
+    fn run_agent_action(&mut self, uninstall: bool) {
+        let result = if uninstall {
+            crate::agent::uninstall()
+        } else {
+            crate::agent::install(&self.base, self.settings.background_minutes)
+        };
+        match result {
+            Ok(message) => {
+                self.append(&crate::report::timestamped(&message));
+                self.notice = Some(message);
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        // 立刻刷新状态，下一帧就能看到「已加载 / 未安装」。
+        self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
+        self.refresh_service_state();
     }
 
     fn set_busy(&mut self, value: bool) {
@@ -887,7 +992,10 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     let mut enabled = self.settings.background_enabled;
                     if ui
-                        .add_enabled(!self.busy, egui::Checkbox::new(&mut enabled, "后台搬运"))
+                        .add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(&mut enabled, "Rime词库同步"),
+                        )
                         .changed()
                     {
                         self.settings.background_enabled = enabled;
@@ -895,6 +1003,12 @@ impl eframe::App for App {
                             self.notice = Some(CONFIG_BROKEN_NOTICE.into());
                         } else {
                             let _ = self.settings.save(&self.ini);
+                        }
+                        // 开 → 拉起菜单栏图标；关 → 图标立即消失。
+                        #[cfg(target_os = "macos")]
+                        {
+                            let _ = crate::agent::apply_background_switch(enabled);
+                            self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
                         }
                     }
                     ui.add_enabled(
@@ -907,6 +1021,18 @@ impl eframe::App for App {
                             self.notice = Some(CONFIG_BROKEN_NOTICE.into());
                         } else {
                             let _ = self.settings.save(&self.ini);
+                            // macOS 的代理间隔写在 plist 里，改完设置要同步过去。
+                            #[cfg(target_os = "macos")]
+                            match crate::agent::refresh_interval(
+                                &self.base,
+                                self.settings.background_minutes,
+                            ) {
+                                Ok(true) => self.append(&crate::report::timestamped(
+                                    "已按新的间隔更新后台代理。",
+                                )),
+                                Ok(false) => {}
+                                Err(error) => self.notice = Some(error.to_string()),
+                            }
                             self.request_background_round();
                         }
                     }
@@ -967,6 +1093,51 @@ impl eframe::App for App {
                             !self.busy && crate::shortcut::exists(&self.base),
                             egui::Button::new("删除快捷方式"),
                         )
+                        .clicked()
+                    {
+                        self.run_shortcut_action(true);
+                    }
+                });
+                #[cfg(target_os = "macos")]
+                ui.horizontal(|ui| {
+                    if self.service_text.is_empty() {
+                        self.refresh_service_state();
+                    }
+                    ui.label(&self.service_text);
+                    let installed = crate::agent::installed();
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("开启 / 更新 Rime词库同步"))
+                        .clicked()
+                    {
+                        self.run_agent_action(false);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && installed,
+                            egui::Button::new("关闭 Rime词库同步"),
+                        )
+                        .clicked()
+                    {
+                        self.run_agent_action(true);
+                    }
+                });
+                #[cfg(target_os = "macos")]
+                ui.horizontal(|ui| {
+                    let created = crate::shortcut_macos::exists(&self.base);
+                    ui.label(if created {
+                        "快捷方式：已创建"
+                    } else {
+                        "快捷方式：未创建"
+                    })
+                    .on_hover_text(crate::shortcut_macos::describe(&self.base));
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("创建 / 更新快捷方式"))
+                        .clicked()
+                    {
+                        self.run_shortcut_action(false);
+                    }
+                    if ui
+                        .add_enabled(!self.busy && created, egui::Button::new("删除快捷方式"))
                         .clicked()
                     {
                         self.run_shortcut_action(true);
@@ -1208,7 +1379,7 @@ impl App {
             .fixed_size([860., 420.])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("合并规则按文件类型自动判定：*.dict.yaml 词条并集；*.txt 首列并集；*.yaml/*.json/*.lua 按时间。");
+                ui.label("合并规则按文件类型自动判定：*.dict.yaml 词条并集；*.txt 文本并集（custom_phrase 这类三列表按「文本+编码」，多个拼法都会保留）；*.yaml/*.json/*.lua 按时间。");
                 ui.label("移除某个文件只影响本设备（写进本机排除集），不会删除 Others/ 里的公共副本。");
                 ui.separator();
                 egui::ScrollArea::vertical()

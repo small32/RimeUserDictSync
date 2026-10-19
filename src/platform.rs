@@ -3,8 +3,12 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// RIME 命令的最长执行时间。超时就杀掉：进程卡住会一直占着同步锁，
+/// 而后台轮次没有「停止同步」按钮，只能重启程序才能恢复。
+const RIME_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct RimeCommand {
     pub executable: PathBuf,
@@ -141,6 +145,7 @@ pub fn run(command: &RimeCommand, arg: &str, cancel: &AtomicBool) -> Result<()> 
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("无法启动 {}", command.executable.display()))?;
+    let started = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -151,6 +156,16 @@ pub fn run(command: &RimeCommand, arg: &str, cancel: &AtomicBool) -> Result<()> 
                 return Ok(());
             }
             bail!("RIME 命令执行失败，退出码 {:?}", status.code());
+        }
+        if started.elapsed() >= RIME_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "RIME 命令超过 {} 秒仍未结束，已强制终止：{} {}",
+                RIME_TIMEOUT.as_secs(),
+                command.executable.display(),
+                arg
+            );
         }
         std::thread::sleep(Duration::from_millis(150));
     }
@@ -198,8 +213,8 @@ pub fn quote_windows_argument(argument: &str) -> String {
 
 /// 无界面模式的结果提示。
 ///
-/// 桌面快捷方式双击启动时没有控制台，`println!` 会石沉大海，所以 Windows 用消息框；
-/// 其他平台退化为 stderr。
+/// 桌面快捷方式双击启动时没有控制台，`println!` 会石沉大海：
+/// Windows 用消息框，macOS 用 osascript 原生对话框，其余平台退化为 stderr。
 pub fn notify(title: &str, message: &str, error: bool) {
     #[cfg(target_os = "windows")]
     {
@@ -223,11 +238,35 @@ pub fn notify(title: &str, message: &str, error: bool) {
         // HWND 在 windows-sys 0.52 里是 isize，0 表示无父窗口。
         unsafe { MessageBoxW(0, text.as_ptr(), caption.as_ptr(), style) };
     }
-    #[cfg(not(target_os = "windows"))]
+    // macOS 没有消息框 API，用 osascript 弹一个原生对话框；
+    // 快捷方式（AppleScript applet）双击时没有终端，这是唯一能让用户看到结果的方式。
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display dialog \"{}\" buttons {{\"好\"}} default button 1 with title \"{}\" with icon {}",
+            applescript_escape(message),
+            applescript_escape(title),
+            if error { "stop" } else { "note" }
+        );
+        let _ = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = error;
         eprintln!("{title}: {message}");
     }
+}
+
+/// AppleScript 字符串字面量转义（反斜杠、双引号、换行）。
+#[cfg(target_os = "macos")]
+fn applescript_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\r', '\n'], "\\n")
 }
 
 /// 展开 %VAR% 形式的环境变量（注册表 REG_EXPAND_SZ 与旧版 INI 值可能包含）。

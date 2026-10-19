@@ -178,12 +178,13 @@ macOS:   ~/Library/Rime
 
 ## 后台运行方式
 
-后台搬运有两种运行方式，二者共用同一把锁，永远不会同时动手：
+后台搬运有三种运行方式，三者共用同一把锁，永远不会同时动手：
 
-| 方式 | 何时用 | 说明 |
-| --- | --- | --- |
-| **Windows 服务**（推荐） | 想让它一直生效 | 开机即跑，不用打开本程序；只做搬运 |
-| 程序内建线程（兜底） | 不想装服务 | 只在程序运行期间跑；检测到服务已在运行就自动让位 |
+| 方式 | 平台 | 何时用 | 说明 |
+| --- | --- | --- | --- |
+| **Windows 服务**（推荐） | Windows | 想让它一直生效 | 开机即跑，不用打开本程序；只做搬运 |
+| **launchd LaunchAgent**（轻量） | macOS | 同上 | 登录后由 launchd 每 N 分钟拉起一次 `--scheduled-round`，跑完即退，**没有常驻进程** |
+| 程序内建线程（兜底） | 两端 | 不想装服务/代理 | 只在程序运行期间跑；检测到服务或代理已加载就自动让位 |
 
 ### 为什么服务只做搬运
 
@@ -234,6 +235,46 @@ RimeUserDictSync.exe --service-status
 - 服务以 `LocalSystem` 写入 `Rime/.rime-sync/` 与 `Sync/` 的文件，属主是 `SYSTEM`；
   正常情况下 ACL 继承会让用户仍可读写，若真遇到权限问题请在 issue 里反馈。
 
+### macOS：Rime词库同步（LaunchAgent + 菜单栏图标）
+
+macOS 没有 SCM 服务，用两个用户级 LaunchAgent，都只在**登录后**运行：
+
+| 组件 | Label | 形态 | 作用 |
+| --- | --- | --- | --- |
+| 后台搬运 | `...agent` | `StartInterval` 到点拉起 `--scheduled-round`，跑完即退 | 按间隔搬 `Sync/` 与 WebDAV |
+| 菜单栏图标 | `...menubar` | 常驻 `RimeMenuBar`（`LSUIElement`，不占 Dock） | 点一下 = 同步并部署 |
+
+```sh
+"/Applications/RimeUserDictSync.app/Contents/MacOS/RimeUserDictSync" \
+    --install-agent --app-dir "$HOME/Documents/RimeUserDictSync"
+"/Applications/RimeUserDictSync.app/Contents/MacOS/RimeUserDictSync" --uninstall-agent
+```
+
+菜单栏图标的行为：
+
+- 图标就是 Windows 快捷方式那个齿轮（`macos/sync-gear-template.png`，模板图，随明暗主题着色）；
+- **单击鼠标左键**：依次执行 `Squirrel --sync`、`Squirrel --reload`，等价于输入法菜单里的
+  「同步用户数据」+「重新部署」，只是合成一次点击；**不碰 WebDAV，也不做并集合并**；
+  点击后图标下方弹出进度浮层：`正在同步用户数据…` → `正在重新部署…` → `已触发同步与部署`；
+- **右键**：同步并部署 / 打开 RimeUserDictSync / 隐藏图标；
+- 图标显隐跟随 `[background] enabled`：关掉后台活动后 5 秒内图标消失、助手正常退出；
+  重新开启时 GUI 会 `kickstart` 它；
+- plist 用 `KeepAlive = { SuccessfulExit: false }`：正常退出不重启，崩溃仍会被 launchd 拉起。
+
+| 项 | 值 |
+| --- | --- |
+| 定时搬运 Label | `com.small32.rime-user-dict-sync.agent` |
+| 菜单栏 Label | `com.small32.rime-user-dict-sync.menubar` |
+| plist | `~/Library/LaunchAgents/` 下对应的两个 `.plist` |
+| 调度 | 搬运：`StartInterval` = 间隔（分钟 × 60）；菜单栏：`RunAtLoad` + `KeepAlive` |
+| 会话 | `Aqua`：登录后由 launchd 加载，登录前不跑 |
+| 关掉后台活动 | `--scheduled-round` 跳过；菜单栏助手移除图标并退出 |
+| 改间隔 | GUI 点「保存间隔」会重写搬运 plist 并重新 bootstrap（内容没变则不动） |
+
+与 Windows 服务的差异：LaunchAgent 只在**用户登录后**运行，做不到登录前同步；
+好处是不需要管理员权限。GUI 每 30 秒查一次 launchd，
+定时搬运已加载时内建线程自动让位，不会两边同时搬。
+
 ### 调度细节
 
 不是「睡满 10 分钟」，而是**每 30 秒醒一次，判断「下次到期时刻」到了没有**：
@@ -249,7 +290,7 @@ RimeUserDictSync.exe --service-status
 ### 快捷方式「同步词库」
 
 服务只搬运文件，**`/sync` 与 `/deploy` 必须由你在登录会话里触发**，所以才需要这个入口。
-它建在**程序所在目录**（不往桌面塞东西），需要的话自己拖到桌面、开始菜单或任务栏。
+它建在**程序所在目录**（不往桌面塞东西），需要的话自己拖到桌面、开始菜单、任务栏或 Dock。
 在 GUI 底部点「创建 / 更新快捷方式」，或手动执行：
 
 ```powershell
@@ -257,8 +298,24 @@ RimeUserDictSync.exe --install-shortcut --app-dir "<本程序的配置目录>"
 RimeUserDictSync.exe --uninstall-shortcut
 ```
 
-命令**只在该目录下生成一个文件**：`同步词库.lnk`，**不会**在磁盘上多出一个 `.ico`。
+```sh
+"/Applications/RimeUserDictSync.app/Contents/MacOS/RimeUserDictSync" \
+    --install-shortcut --app-dir "$HOME/Documents/RimeUserDictSync"
+```
+
+Windows 下命令**只在该目录下生成一个文件**：`同步词库.lnk`，**不会**在磁盘上多出一个 `.ico`，
 EXE 自己的图标（weasel）也保持不变。
+
+macOS 下生成的是 `同步词库.app`（AppleScript applet）：
+
+- 双击**不弹终端窗口**，也不占 Dock（`LSUIElement`），跑完弹一个原生对话框告知结果；
+- 图标取自主程序的 `AppIcon.icns`，不是通用的脚本图标；
+- applet 里执行的是主程序的 `--sync-now --notify --app-dir <配置目录>`，
+  与 Windows 快捷方式语义完全一致，**不是**只跑 RIME 自带的 `/sync` + `/reload`；
+- 生成时先在 `$TMPDIR` 里 `osacompile` 并 ad-hoc 签名，再整体 `rename` 到目标目录。
+  直接在 `~/Documents` 这类受 FileProvider / 受管目录里签名会报
+  `replacing existing signature / Operation not permitted`（`-4960`）；
+- 删除时同样先 `rename` 出目标目录再清理，避免删包内可执行文件被拦。
 
 图标信息在 `.lnk` 里分两处存放，缺一不可：
 
@@ -307,9 +364,13 @@ EXE 自己的图标（weasel）也保持不变。
 --sync-now             执行一次完整「同步词库」：拉取 → 并集 → 写回 → 上传
                        → RIME /sync → /deploy（桌面快捷方式用的就是它）
 --round                只执行一轮后台搬运后退出（不合并、不部署）
+--scheduled-round      供 macOS 后台代理调用：后台搬运关闭时跳过，否则跑一轮
 --install-service      安装并启动 Windows 后台服务（需要管理员权限）
 --uninstall-service    停止并卸载 Windows 后台服务（需要管理员权限）
+--install-agent        安装 macOS 后台代理（launchd 定时搬运，不需要程序常开）
+--uninstall-agent      卸载 macOS 后台代理
 --install-shortcut     在程序所在目录创建「同步词库」快捷方式
+                       （Windows 为 .lnk，macOS 为 AppleScript .app）
 --uninstall-shortcut   删除该快捷方式
 --run-service          由服务控制管理器调用，不应手工执行
 --service-status       打印后台服务状态

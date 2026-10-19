@@ -60,6 +60,14 @@ pub fn manual_sync(
         }
         Err(error) => {
             check(cancel)?;
+            // 「ID 已被接管」不是网络问题：继续跑会往别人的 <ID>/ 写快照、
+            // 覆盖对方的 .index.json，必须立刻中止。
+            if error
+                .downcast_ref::<crate::transport::SessionTakenOver>()
+                .is_some()
+            {
+                return Err(error);
+            }
             report.log(&format!(
                 "步骤 1/6：拉取远端失败（{error}）；本轮改用本地已有内容继续合并与生效。"
             ));
