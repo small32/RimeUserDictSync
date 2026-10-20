@@ -82,6 +82,9 @@ pub struct SyncIndex {
     /// 本地源文件基线与 `Others/` 副本基线（三向判断）。
     #[serde(default)]
     pub files: BTreeMap<String, IndexEntry>,
+    /// 手动同步已写入 Others、尚未获远端确认的源文件状态；后台只凭此确认基线。
+    #[serde(default)]
+    pub pending_files: BTreeMap<String, IndexEntry>,
     /// `Others/` 中每个文件的远端观测结果。
     #[serde(default)]
     pub remote: BTreeMap<String, RemoteMark>,
@@ -216,7 +219,43 @@ pub fn migrate_legacy_sync_files(entries: &[String]) -> SyncList {
 
 /// 校验一个快照文件是否允许被搬运（拒绝路径穿越）。
 pub fn safe_snapshot_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
+    let reserved = matches!(
+        name.split('.')
+            .next()
+            .unwrap_or(name)
+            .to_ascii_uppercase()
+            .as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if name.is_empty()
+        || name.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*'])
+        || name.chars().any(char::is_control)
+        || name.ends_with(['.', ' '])
+        || name == "."
+        || name == ".."
+        || reserved
+    {
         bail!("远端返回了非法的快照文件名: {name}");
     }
     Ok(())
@@ -266,5 +305,24 @@ mod tests {
         assert!(LocalLock::acquire(&path).is_err());
         drop(first);
         assert!(LocalLock::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn snapshot_names_reject_windows_prefixes_streams_and_special_files() {
+        for name in [
+            "C:evil",
+            "a.userdb.txt:stream",
+            "NUL",
+            "CON.userdb.txt",
+            "COM1.txt",
+            "a/../b",
+            "a\\b",
+            "bad.",
+            "bad ",
+            "a\0b",
+        ] {
+            assert!(safe_snapshot_name(name).is_err(), "accepted {name:?}");
+        }
+        assert!(safe_snapshot_name("rime_ice.userdb.txt").is_ok());
     }
 }

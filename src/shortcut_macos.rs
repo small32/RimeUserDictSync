@@ -1,12 +1,15 @@
 //! macOS 快捷方式「同步词库」。
 //!
-//! Windows 用 `.lnk` 指向 `RimeUserDictSync.exe --sync-now`；macOS 没有 `.lnk`，
+//! Windows 用 `.lnk` 指向 `RimeUserDictSync.exe --rime-sync`；macOS 没有 `.lnk`，
 //! 这里用 `osacompile` 生成一个 AppleScript applet（`.app`），双击后执行
 //! `RimeUserDictSync --sync-now --notify --app-dir <配置目录>`。
 //!
-//! 与 Windows 版保持同一语义：**完整一轮「同步词库」**——拉取远端 → 并集合并
-//! → 写回本地 → 上传 → RIME `/sync` → `/reload`，而不是只跑 RIME 自带的两条命令。
-//! 这样两端双击后的行为一致，也不会漏掉 Others/ 的合并与上传。
+//! 注意两端目前**故意不一致**：Windows 快捷方式只做 RIME 的 `/sync` + `/deploy`
+//! （文件搬运、合并写回都交给后台服务，见 `shortcut.rs` 的说明）；
+//! macOS 这边仍然跑完整一轮（拉取 → 并集合并 → 写回 → 上传 → `/sync` → `/reload`），
+//! 因为 macOS 的 `--scheduled-round` 同样只搬运文件，若不在这里写回
+//! `Sync/Others/` 就永远到不了 `RIME/`。要换成只做两步，把下面的
+//! `--sync-now` 改成 `--rime-sync` 即可。
 //!
 //! 用 applet 而不是 `.command`：`.command` 双击会拉出一个 Terminal 窗口，
 //! 而 applet 静默运行，更适合做成 Dock / 桌面图标。
@@ -64,8 +67,8 @@ pub fn install(app_dir: &Path) -> Result<String> {
     // 目标目录可能是 iCloud/FileProvider 或受管目录（本工具的配置目录默认就在
     // ~/Documents 下），在那里给 applet 签名会报
     // `replacing existing signature / Operation not permitted`（-4960）。
-    // 先在临时目录完整构建、签名，最后整体 rename 过去——rename 只动目录项，
-    // 不触碰包内可执行文件，不受这条限制。
+    // 先在临时目录完整构建、签名，同卷时整体 rename 过去，只移动目录项；
+    // 配置目录在另一卷时用 ditto 保留签名与扩展属性。
     let staging = std::env::temp_dir().join(format!("rime-sync-shortcut-{}", std::process::id()));
     if staging.exists() {
         let _ = fs::remove_dir_all(&staging);
@@ -144,15 +147,18 @@ pub fn install(app_dir: &Path) -> Result<String> {
         );
     }
 
-    // 发布：旧包先挪进 staging（rename 不删包内文件），再把新包 rename 到位。
-    // 直接 remove_dir_all 在 FileProvider 目录里也可能被拦，所以不这么做。
+    // 发布：先保留旧包，新包发布失败时恢复；同卷优先 rename，跨卷复制回退。
     let retired = staging.join("retired.app");
     if target.exists() {
-        fs::rename(&target, &retired)
+        move_bundle(&target, &retired)
             .with_context(|| format!("移走旧快捷方式 {} 失败", target.display()))?;
     }
-    fs::rename(&staged_app, &target)
-        .with_context(|| format!("把快捷方式移动到 {} 失败", target.display()))?;
+    if let Err(error) = move_bundle(&staged_app, &target) {
+        if retired.exists() {
+            move_bundle(&retired, &target).context("创建新快捷方式失败，恢复旧快捷方式也失败")?;
+        }
+        return Err(error).with_context(|| format!("把快捷方式移动到 {} 失败", target.display()));
+    }
     let _ = fs::remove_dir_all(&retired);
     let _ = fs::remove_dir_all(&staging);
 
@@ -179,10 +185,56 @@ pub fn uninstall(app_dir: &Path) -> Result<String> {
     if staging.exists() {
         let _ = fs::remove_dir_all(&staging);
     }
-    fs::rename(&target, &staging)
-        .with_context(|| format!("删除 {} 失败（无法移出目标目录）", target.display()))?;
+    match fs::rename(&target, &staging) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(18) => {
+            // EXDEV：外接卷不能 rename 到系统临时目录，直接从原卷删除。
+            fs::remove_dir_all(&target)
+                .with_context(|| format!("删除 {} 失败", target.display()))?;
+            return Ok(format!("已删除快捷方式「{SHORTCUT_TITLE}」。"));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("删除 {} 失败（无法移出目标目录）", target.display()));
+        }
+    }
     fs::remove_dir_all(&staging).with_context(|| format!("清理 {} 失败", staging.display()))?;
     Ok(format!("已删除快捷方式「{SHORTCUT_TITLE}」。"))
+}
+
+/// 同卷优先 rename；跨卷用 ditto 保留 applet 的链接、扩展属性和签名。
+fn move_bundle(source: &Path, target: &Path) -> Result<()> {
+    match fs::rename(source, target) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(18) => {}
+        Err(error) => return Err(error.into()),
+    }
+    copy_bundle(source, target)?;
+    if let Err(error) = fs::remove_dir_all(source) {
+        return Err(error).with_context(|| {
+            format!(
+                "跨卷复制后清理原快捷方式失败，副本保留在 {}",
+                target.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn copy_bundle(source: &Path, target: &Path) -> Result<()> {
+    let output = Command::new("/usr/bin/ditto")
+        .arg(source)
+        .arg(target)
+        .output()
+        .context("跨卷复制快捷方式时调用 ditto 失败")?;
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(target);
+        bail!(
+            "跨卷复制快捷方式失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn is_ours(bundle: &Path) -> bool {
@@ -271,5 +323,27 @@ mod tests {
     fn applescript_literals_escape_quotes_and_backslashes() {
         assert_eq!(applescript_literal(r#"a"b"#), r#"a\"b"#);
         assert_eq!(applescript_literal(r"a\b"), r"a\\b");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cross_volume_copy_preserves_bundle_contents_and_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.app");
+        let target = temp.path().join("target.app");
+        let resources = source.join("Contents/Resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(resources.join("main.scpt"), b"signed script").unwrap();
+        std::os::unix::fs::symlink("main.scpt", resources.join("alias.scpt")).unwrap();
+        copy_bundle(&source, &target).unwrap();
+        assert_eq!(
+            fs::read(target.join("Contents/Resources/main.scpt")).unwrap(),
+            b"signed script"
+        );
+        assert_eq!(
+            fs::read_link(target.join("Contents/Resources/alias.scpt")).unwrap(),
+            PathBuf::from("main.scpt")
+        );
+        assert!(source.exists());
     }
 }

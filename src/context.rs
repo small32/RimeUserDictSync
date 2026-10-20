@@ -39,6 +39,9 @@ pub struct DeviceFile {
     /// 服务端能力探测结果（§9）。
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// 能力探测所对应的连接配置摘要，不包含可还原的凭据。
+    #[serde(default)]
+    pub capabilities_key: String,
 }
 
 impl DeviceFile {
@@ -53,7 +56,15 @@ impl DeviceFile {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        fs::write(path, text).with_context(|| format!("写入 {} 失败", path.display()))
+        let temp = crate::hash::temp_sibling(path);
+        let result = (|| {
+            fs::write(&temp, text)?;
+            fs::rename(&temp, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result.with_context(|| format!("写入 {} 失败", path.display()))
     }
 
     pub fn password_hash(&self) -> Option<PasswordHash> {
@@ -104,6 +115,10 @@ impl Context {
 
         let sync_dir = rime_dir.join(SYNC_DIR_NAME);
         let device_path = rime_dir.join(paths::META_DIR_NAME).join(paths::DEVICE_FILE);
+        // 构建期间也会回写身份与清单，必须与设备设置、同步轮次使用同一把锁。
+        let _lock = crate::state::LocalLock::acquire(
+            &rime_dir.join(paths::META_DIR_NAME).join(paths::LOCK_FILE),
+        )?;
         let mut notices = Vec::new();
 
         let mut device = if device_path.is_file() {
@@ -111,6 +126,10 @@ impl Context {
         } else {
             DeviceFile::default()
         };
+        if device.capabilities_key != capabilities_key(settings) {
+            device.capabilities = Capabilities::default();
+            device.capabilities_key.clear();
+        }
 
         // 设备 ID：以 device.json 为准；首次运行时从 installation.yaml 继承。
         if device.installation_id.trim().is_empty() {
@@ -236,6 +255,19 @@ pub fn resolve_rime_dir(settings: &Settings) -> PathBuf {
     }
 }
 
+/// 能力缓存必须绑定到实际连接，手工修改 INI 后也不能沿用旧服务端语义。
+pub fn capabilities_key(settings: &Settings) -> String {
+    crate::hash::sha256_hex(
+        format!(
+            "{}\0{}\0{}",
+            settings.webdav_url.trim(),
+            settings.username.trim(),
+            settings.password
+        )
+        .as_bytes(),
+    )
+}
+
 /// 双向校验 `installation.yaml` 与 `device.json`，不一致以 `device.json` 为准回写（§2）。
 pub fn reconcile_installation_yaml(
     installation: &Path,
@@ -323,51 +355,68 @@ pub fn migrate_legacy_layout(
     // 本地：Sync/WebDAV/ → Sync/Others/
     let local_legacy = layout.sync.join("WebDAV");
     if local_legacy.is_dir() {
+        // 先完整保存镜像，不能因 userdb 不允许进入 Others 而删掉唯一快照。
+        let backup = layout
+            .meta
+            .join("legacy-backup")
+            .join(format!("WebDAV-{}", identity::new_path_token(12)));
+        copy_tree(&local_legacy, &backup, false)?;
         let copied = copy_tree(&local_legacy, &layout.others, true)?;
         if copied > 0 {
             notices.push(format!(
                 "已把旧版 Sync/WebDAV/ 中的 {copied} 个文件迁移到 Sync/Others/。"
             ));
         }
-        fs::remove_dir_all(&local_legacy).ok();
-        notices.push("已删除旧版 Sync/WebDAV/，避免 librime 把它当成一台设备参与合并。".to_owned());
+        fs::remove_dir_all(&local_legacy)?;
+        notices.push(format!(
+            "旧版 Sync/WebDAV/ 已迁移，完整备份保存在 {}。",
+            backup.display()
+        ));
     }
     let local_archive = layout.sync.join(crate::archive::ARCHIVE_NAME);
     if local_archive.is_file() {
-        fs::remove_file(&local_archive).ok();
-        notices.push("已删除旧版 Sync/webdav-sync.zip 临时压缩包。".to_owned());
+        let bytes = fs::read(&local_archive)?;
+        backup_legacy_bytes(layout, crate::archive::ARCHIVE_NAME, &bytes)?;
+        fs::remove_file(&local_archive)?;
+        notices.push("旧版 Sync/webdav-sync.zip 已保存在 .rime-sync/legacy-backup/。".to_owned());
     }
 
     // 远端：webdav-sync.zip → Sync/Others/
     let Some(dav) = dav else {
         return Ok(notices);
     };
-    let others_empty = fs::read_dir(&layout.others)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(true);
-    if others_empty && let Some(bytes) = dav.try_get_bytes(crate::archive::ARCHIVE_NAME)? {
-        let temp = layout.meta.join(crate::archive::ARCHIVE_NAME);
-        fs::create_dir_all(&layout.meta)?;
-        fs::write(&temp, &bytes)?;
-        let extracted = crate::archive::extract(&temp, &layout.others)?;
-        let _ = fs::remove_file(&temp);
-        let kept = extracted
-            .iter()
-            .filter(|name| !name.ends_with("installation.yaml"))
-            .count();
-        notices.push(format!(
-            "已从远端旧版压缩包迁移 {kept} 个文件到 Sync/Others/。"
-        ));
-        dav.delete(crate::archive::ARCHIVE_NAME)?;
-        notices.push("已删除远端旧版 webdav-sync.zip。".to_owned());
+    if let MkcolOutcome::Created = dav.mkcol(OTHERS_DIR_NAME)? {
+        notices.push("已在远端创建 Others/ 共享目录。".to_owned());
+    }
+    if let Some(bytes) = dav.try_get_bytes(crate::archive::ARCHIVE_NAME)? {
+        let backup = backup_legacy_bytes(layout, crate::archive::ARCHIVE_NAME, &bytes)?;
+        let staging = backup
+            .parent()
+            .context("迁移备份缺少父目录")?
+            .join("extracted");
+        let extracted = crate::archive::extract(&backup, &staging)?;
+        let mut all_published = true;
+        for relative in &extracted {
+            let source = crate::webdav::safe_local(&staging, relative)?;
+            all_published &= publish_legacy_file(dav, layout, relative, &fs::read(source)?, log)?;
+        }
+        if all_published {
+            dav.delete(crate::archive::ARCHIVE_NAME)?;
+            notices.push(format!(
+                "旧版压缩包的 {} 个文件已发布并校验远端 Others/，已删除远端旧包。",
+                extracted.len()
+            ));
+        } else {
+            notices.push(
+                "旧版压缩包包含 userdb 快照或有冲突的文件，已保留远端原包和本地完整备份。"
+                    .to_owned(),
+            );
+        }
     }
 
     // 远端：更早版本留在根目录的散文件 → Sync/Others/
-    // 解包可能刚往 Others/ 写过内容，重新判定一次，避免与刚解包的文件互相覆盖。
-    let others_empty = fs::read_dir(&layout.others)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(true);
-    if others_empty {
+    // 逐项发布，失败后原文件仍存在，下次启动可以继续；不能靠 Others 为空判断是否迁移过。
+    {
         let loose: Vec<_> = dav
             .list("")?
             .into_iter()
@@ -379,21 +428,11 @@ pub fn migrate_legacy_layout(
             let Some(bytes) = dav.try_get_bytes(&entry.relative)? else {
                 continue;
             };
-            if entry.relative.ends_with("installation.yaml") {
-                let _ = dav.delete(&entry.relative);
-                continue;
+            backup_legacy_bytes(layout, &entry.relative, &bytes)?;
+            if publish_legacy_file(dav, layout, &entry.relative, &bytes, log)? {
+                dav.delete(&entry.relative)?;
+                migrated += 1;
             }
-            let target = crate::webdav::safe_local(&layout.others, &entry.relative)?;
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&target, &bytes)?;
-            log(&format!(
-                "迁移远端旧文件 {} → Sync/Others/{}",
-                entry.relative, entry.relative
-            ));
-            dav.delete(&entry.relative)?;
-            migrated += 1;
         }
         if migrated > 0 {
             notices.push(format!(
@@ -402,11 +441,85 @@ pub fn migrate_legacy_layout(
         }
     }
 
-    // 确保远端 Others/ 存在。
-    if let MkcolOutcome::Created = dav.mkcol(OTHERS_DIR_NAME)? {
-        notices.push("已在远端创建 Others/ 共享目录。".to_owned());
-    }
     Ok(notices)
+}
+
+fn backup_legacy_bytes(layout: &Layout, relative: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let root = layout
+        .meta
+        .join("legacy-backup")
+        .join(crate::hash::sha256_hex(bytes));
+    let target = crate::webdav::safe_local(&root, relative)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&target, bytes)?;
+    Ok(target)
+}
+
+/// true 表示旧来源可以删除；无法合并的配置或 userdb 继续保留原来源。
+fn publish_legacy_file(
+    dav: &WebDav,
+    layout: &Layout,
+    relative: &str,
+    bytes: &[u8],
+    log: &dyn Fn(&str),
+) -> Result<bool> {
+    let relative = paths::validate_sync_file_path(relative)?;
+    if paths::is_private_in_others(&relative) {
+        return Ok(true);
+    }
+    if paths::is_forbidden_in_others(&relative) || paths::is_binary_scheme_resource(&relative) {
+        log(&format!(
+            "保留旧远端 {relative}：快照或二进制资源不迁入 Others/，本地已有完整备份。"
+        ));
+        return Ok(false);
+    }
+    let target = crate::webdav::safe_local(&layout.others, &relative)?;
+    let remote = format!("{OTHERS_DIR_NAME}/{relative}");
+    let existing = dav.try_get_bytes_with_etag(&remote)?;
+    let mut merged = bytes.to_vec();
+    let mode = crate::merge::MergeMode::for_path(&relative)?;
+    for other in [
+        target.is_file().then(|| fs::read(&target)).transpose()?,
+        existing.as_ref().map(|(bytes, _)| bytes.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if merged == other {
+            continue;
+        }
+        let Some(text) = crate::merge::merge_text_for_path(
+            &relative,
+            mode,
+            std::str::from_utf8(&merged)?,
+            std::str::from_utf8(&other)?,
+        ) else {
+            log(&format!(
+                "保留旧远端 {relative}：Others/ 已有不同配置，请手动确认后再移除旧来源。"
+            ));
+            return Ok(false);
+        };
+        merged = text.into_bytes();
+    }
+    let outcome = if let Some((_, etag)) = &existing {
+        dav.put_bytes(&remote, merged.clone(), etag.as_deref())?
+    } else {
+        dav.put_bytes_if_absent(&remote, merged.clone())?
+    };
+    if matches!(outcome, crate::webdav::PutOutcome::PreconditionFailed) {
+        bail!("迁移期间 {remote} 已被其它设备更新，旧来源已保留，下次启动重试");
+    }
+    if dav.get_bytes(&remote)? != merged {
+        bail!("迁移后的 {remote} 校验不一致，旧来源已保留");
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(target, merged)?;
+    log(&format!("已发布并校验旧文件 {relative} → 远端 {remote}。"));
+    Ok(true)
 }
 
 /// 把设备配置落到磁盘：`device.json`（权威）+ `installation.yaml`（可见副本）。
@@ -507,12 +620,307 @@ mod tests {
         )
         .unwrap();
         fs::write(legacy.join("custom_phrase.txt"), "你好\tni hao\t1\n").unwrap();
+        fs::write(legacy.join("only.userdb.txt"), "唯一快照").unwrap();
 
         let notices = migrate_legacy_layout(&layout, None, &|_| {}).unwrap();
 
         assert!(!legacy.exists());
         assert!(layout.others.join("custom_phrase.txt").is_file());
         assert!(!layout.others.join("installation.yaml").exists());
+        assert!(!layout.others.join("only.userdb.txt").exists());
+        assert!(
+            walkdir::WalkDir::new(layout.meta.join("legacy-backup"))
+                .into_iter()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name() == "only.userdb.txt")
+        );
         assert!(notices.iter().any(|notice| notice.contains("Sync/WebDAV/")));
+    }
+
+    struct LegacyServer {
+        dav: WebDav,
+        files: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        address: std::net::SocketAddr,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LegacyServer {
+        fn new(name: &str, bytes: Vec<u8>, fail_put: bool) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let files = Arc::new(Mutex::new(std::collections::BTreeMap::from([(
+                format!("/sync/{name}"),
+                bytes,
+            )])));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (server_files, server_requests, server_stop) =
+                (files.clone(), requests.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                let mut directories = std::collections::HashSet::new();
+                for stream in listener.incoming() {
+                    if server_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut stream = stream.unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut header = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !header.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    let mut request = header.lines().next().unwrap().split_whitespace();
+                    let (method, path) = (request.next().unwrap(), request.next().unwrap());
+                    server_requests
+                        .lock()
+                        .unwrap()
+                        .push(format!("{method} {path}"));
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).unwrap();
+                    let mut files = server_files.lock().unwrap();
+                    let (status, bytes) = match method {
+                        "MKCOL" => (
+                            if directories.insert(path.to_owned()) {
+                                201
+                            } else {
+                                405
+                            },
+                            Vec::new(),
+                        ),
+                        "GET" => files
+                            .get(path)
+                            .map(|value| (200, value.clone()))
+                            .unwrap_or((404, Vec::new())),
+                        "PUT" if fail_put => (500, Vec::new()),
+                        "PUT" => {
+                            files.insert(path.to_owned(), body);
+                            (201, Vec::new())
+                        }
+                        "DELETE" => {
+                            files.remove(path);
+                            directories.remove(path);
+                            (204, Vec::new())
+                        }
+                        "PROPFIND" => {
+                            let entries = files.keys().filter(|name| name.strip_prefix("/sync/").is_some_and(|name| !name.contains('/'))).map(|name| format!("<d:response><d:href>{name}</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>")).collect::<String>();
+                            (
+                                207,
+                                format!(
+                                    "<d:multistatus xmlns:d=\"DAV:\">{entries}</d:multistatus>"
+                                )
+                                .into_bytes(),
+                            )
+                        }
+                        _ => (500, Vec::new()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(&bytes).unwrap();
+                }
+            });
+            Self {
+                dav: WebDav::new(&format!("http://{address}/sync/"), "user", "pass").unwrap(),
+                files,
+                requests,
+                stop,
+                address,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for LegacyServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.address);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_source_is_deleted_only_after_remote_publication_is_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        let server = LegacyServer::new("custom_phrase.txt", b"hello\tcode\n".to_vec(), false);
+        migrate_legacy_layout(&layout, Some(&server.dav), &|_| {}).unwrap();
+        let files = server.files.lock().unwrap();
+        assert!(!files.contains_key("/sync/custom_phrase.txt"));
+        assert_eq!(
+            files.get("/sync/Others/custom_phrase.txt").unwrap(),
+            b"hello\tcode\n"
+        );
+        drop(files);
+        let requests = server.requests.lock().unwrap();
+        let verified = requests
+            .iter()
+            .rposition(|request| request == "GET /sync/Others/custom_phrase.txt")
+            .unwrap();
+        let deleted = requests
+            .iter()
+            .position(|request| request == "DELETE /sync/custom_phrase.txt")
+            .unwrap();
+        assert!(verified < deleted);
+    }
+
+    #[test]
+    fn failed_legacy_publication_keeps_the_remote_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        let server = LegacyServer::new("custom_phrase.txt", b"hello\tcode\n".to_vec(), true);
+        assert!(migrate_legacy_layout(&layout, Some(&server.dav), &|_| {}).is_err());
+        assert!(
+            server
+                .files
+                .lock()
+                .unwrap()
+                .contains_key("/sync/custom_phrase.txt")
+        );
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request == "DELETE /sync/custom_phrase.txt")
+        );
+    }
+
+    #[test]
+    fn legacy_remote_snapshot_is_backed_up_and_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        let server = LegacyServer::new("only.userdb.txt", b"snapshot".to_vec(), false);
+        migrate_legacy_layout(&layout, Some(&server.dav), &|_| {}).unwrap();
+        assert!(
+            server
+                .files
+                .lock()
+                .unwrap()
+                .contains_key("/sync/only.userdb.txt")
+        );
+        assert!(!layout.others.join("only.userdb.txt").exists());
+    }
+
+    #[test]
+    fn owner_lock_is_exclusive_and_released_on_drop() {
+        let server = LegacyServer::new("custom_phrase.txt", Vec::new(), false);
+        let lock = identity::OwnerLock::acquire(&server.dav, "pc01").unwrap();
+        assert!(identity::OwnerLock::acquire(&server.dav, "pc01").is_err());
+        drop(lock);
+        assert!(identity::OwnerLock::acquire(&server.dav, "pc01").is_ok());
+    }
+
+    #[test]
+    fn archive_migration_publishes_shared_files_but_retains_unique_snapshot_source() {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("custom_phrase.txt", options).unwrap();
+        archive.write_all(b"hello\tcode\n").unwrap();
+        archive.start_file("only.userdb.txt", options).unwrap();
+        archive.write_all(b"unique snapshot").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let server = LegacyServer::new(crate::archive::ARCHIVE_NAME, bytes, false);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        migrate_legacy_layout(&layout, Some(&server.dav), &|_| {}).unwrap();
+        let files = server.files.lock().unwrap();
+        assert!(files.contains_key("/sync/webdav-sync.zip"));
+        assert_eq!(
+            files.get("/sync/Others/custom_phrase.txt").unwrap(),
+            b"hello\tcode\n"
+        );
+        assert!(!files.contains_key("/sync/Others/only.userdb.txt"));
+    }
+
+    #[test]
+    fn context_build_respects_device_settings_lock_without_rewriting_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        fs::write(layout.installation_file(), "installation_id: pc01\n").unwrap();
+        let device = DeviceFile {
+            installation_id: "pc01".into(),
+            session_token: "original".into(),
+            ..Default::default()
+        };
+        device.save(&layout.device_file()).unwrap();
+        let before = fs::read(layout.device_file()).unwrap();
+        let _lock = crate::state::LocalLock::acquire(&layout.lock_file()).unwrap();
+        let mut settings = Settings {
+            user_data_dir: dir.path().to_string_lossy().into(),
+            webdav_url: "https://example.invalid/".into(),
+            username: "user".into(),
+            ..Default::default()
+        };
+        assert!(
+            Context::build(dir.path(), &dir.path().join("settings.ini"), &mut settings).is_err()
+        );
+        assert_eq!(fs::read(layout.device_file()).unwrap(), before);
+    }
+
+    #[test]
+    fn capabilities_cache_is_invalidated_after_direct_connection_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        fs::write(layout.installation_file(), "installation_id: pc01\n").unwrap();
+        let mut settings = Settings {
+            user_data_dir: dir.path().to_string_lossy().into(),
+            webdav_url: "https://example.invalid/".into(),
+            username: "user".into(),
+            ..Default::default()
+        };
+        let capabilities = Capabilities {
+            if_match: true,
+            etag: true,
+            ..Default::default()
+        };
+        let device = DeviceFile {
+            installation_id: "pc01".into(),
+            session_token: "token".into(),
+            capabilities,
+            capabilities_key: capabilities_key(&settings),
+            ..Default::default()
+        };
+        device.save(&layout.device_file()).unwrap();
+        let ini = dir.path().join("settings.ini");
+        assert_eq!(
+            Context::build(dir.path(), &ini, &mut settings)
+                .unwrap()
+                .device
+                .capabilities,
+            capabilities
+        );
+        settings.password = "changed credentials".into();
+        let rebuilt = Context::build(dir.path(), &ini, &mut settings).unwrap();
+        assert_eq!(rebuilt.device.capabilities, Capabilities::default());
+        assert!(rebuilt.device.capabilities_key.is_empty());
     }
 }

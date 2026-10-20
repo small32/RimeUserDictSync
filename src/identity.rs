@@ -1,4 +1,4 @@
-use crate::webdav::WebDav;
+use crate::webdav::{MkcolOutcome, PutOutcome, WebDav};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::Hmac;
@@ -126,22 +126,97 @@ pub struct Owner {
     pub taken_over_from: Option<Takeover>,
 }
 
+/// 设备用户动作的远端互斥锁；心跳独立保存，不参与 owner 的读改写。
+pub struct OwnerLock<'a> {
+    dav: &'a WebDav,
+    relative: String,
+}
+
+impl<'a> OwnerLock<'a> {
+    pub fn acquire(dav: &'a WebDav, id: &str) -> Result<Self> {
+        crate::paths::validate_installation_id(id)?;
+        let relative = format!("__rime-owner-lock-{}", id.to_ascii_lowercase());
+        match dav.mkcol(&relative)? {
+            MkcolOutcome::Created => Ok(Self { dav, relative }),
+            MkcolOutcome::AlreadyExists => bail!(
+                "该设备的设置正在另一端修改，请稍后重试；若上次操作异常中断，请确认没有其它设置操作后清理远端 {relative}/"
+            ),
+        }
+    }
+}
+
+impl Drop for OwnerLock<'_> {
+    fn drop(&mut self) {
+        let _ = self.dav.delete_collection(&self.relative);
+    }
+}
+
 impl Owner {
+    /// owner 与 ETag 必须来自同一个 GET 响应，才能执行条件更新。
+    pub fn load_versioned(dav: &WebDav, id: &str) -> Result<Option<(Self, Option<String>)>> {
+        let relative = format!("{id}/{}", crate::paths::OWNER_FILE);
+        dav.try_get_bytes_with_etag(&relative)?
+            .map(|(bytes, etag)| {
+                let owner = serde_json::from_slice(&bytes)
+                    .context("远端 owner.json 无法解析，未覆盖原文件")?;
+                Ok((owner, etag))
+            })
+            .transpose()
+    }
+
+    pub fn save_if_match(&self, dav: &WebDav, id: &str, etag: &str) -> Result<()> {
+        let relative = format!("{id}/{}", crate::paths::OWNER_FILE);
+        match dav.put_bytes(&relative, serde_json::to_vec_pretty(self)?, Some(etag))? {
+            PutOutcome::Uploaded { .. } => Ok(()),
+            PutOutcome::PreconditionFailed => bail!("设备身份在操作期间已变化，请重新读取后重试"),
+        }
+    }
+
+    pub fn save_if_absent(&self, dav: &WebDav, id: &str) -> Result<()> {
+        let relative = format!("{id}/{}", crate::paths::OWNER_FILE);
+        match dav.put_bytes_if_absent(&relative, serde_json::to_vec_pretty(self)?)? {
+            PutOutcome::Uploaded { .. } => Ok(()),
+            PutOutcome::PreconditionFailed => bail!("设备身份已被另一台设备建立，请重新读取后重试"),
+        }
+    }
     /// 读取远端 `owner.json`；不存在或无法解析时返回 `None`。
     pub fn load(dav: &WebDav, id: &str) -> Result<Option<Self>> {
         let relative = format!("{id}/{}", crate::paths::OWNER_FILE);
         match dav.try_get_bytes(&relative)? {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            Some(bytes) => {
+                let Some(mut owner): Option<Self> = serde_json::from_slice(&bytes).ok() else {
+                    return Ok(None);
+                };
+                // 心跳失败不应阻止读取身份；旧 token 的心跳不会影响新持有者。
+                if let Ok(Some(bytes)) = dav.try_get_bytes(&owner.heartbeat_relative(id))
+                    && let Ok(heartbeat) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && let Some(last_sync) =
+                        heartbeat.get("last_sync").and_then(|value| value.as_str())
+                    && last_sync > owner.last_sync.as_str()
+                {
+                    owner.last_sync = last_sync.to_owned();
+                }
+                Ok(Some(owner))
+            }
             None => Ok(None),
         }
+    }
+
+    pub fn heartbeat_relative(&self, id: &str) -> String {
+        format!(
+            "{id}/.last-sync-{}.json",
+            crate::hash::sha256_hex(self.session_token.as_bytes())
+        )
     }
 
     /// 写入远端 `owner.json`（该 ID 的持有设备独占写入）。
     pub fn save(&self, dav: &WebDav, id: &str) -> Result<()> {
         let relative = format!("{id}/{}", crate::paths::OWNER_FILE);
         let bytes = serde_json::to_vec_pretty(self)?;
-        dav.put_bytes(&relative, bytes, None)?;
-        Ok(())
+        match dav.put_bytes(&relative, bytes, None)? {
+            PutOutcome::Uploaded { .. } => Ok(()),
+            PutOutcome::PreconditionFailed => bail!("远端拒绝更新设备身份，未保存 owner.json"),
+        }
     }
 
     pub fn has_password(&self) -> bool {

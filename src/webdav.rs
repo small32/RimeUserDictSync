@@ -351,18 +351,27 @@ impl WebDav {
 
     /// 取文件内容；404 时返回 `None`。
     pub fn try_get_bytes(&self, relative: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .try_get_bytes_with_etag(relative)?
+            .map(|(bytes, _)| bytes))
+    }
+
+    /// 内容与 ETag 必须来自同一个 GET 响应，不能再用独立的 STAT 配对。
+    pub fn try_get_bytes_with_etag(
+        &self,
+        relative: &str,
+    ) -> Result<Option<(Vec<u8>, Option<String>)>> {
         let response = self.request("GET", self.uri(relative, false)?)?.send()?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
         let response = Self::ok(response, "下载 WebDAV 文件")?;
-        Ok(Some(response.bytes()?.to_vec()))
-    }
-
-    pub fn put(&self, relative: &str, source: &Path, if_match: Option<&str>) -> Result<PutOutcome> {
-        let bytes = fs::read(source)
-            .with_context(|| format!("读取待上传文件 {} 失败", source.display()))?;
-        self.put_bytes(relative, bytes, if_match)
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok(Some((response.bytes()?.to_vec(), etag)))
     }
 
     /// 上传字节内容；`if_match` 为 `None` 时不带条件头。
@@ -371,6 +380,21 @@ impl WebDav {
         relative: &str,
         bytes: Vec<u8>,
         if_match: Option<&str>,
+    ) -> Result<PutOutcome> {
+        self.put_bytes_precondition(relative, bytes, if_match, false)
+    }
+
+    /// 只允许创建不存在的文件，防止两台设备首次同步时相互覆盖。
+    pub fn put_bytes_if_absent(&self, relative: &str, bytes: Vec<u8>) -> Result<PutOutcome> {
+        self.put_bytes_precondition(relative, bytes, None, true)
+    }
+
+    fn put_bytes_precondition(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        if_match: Option<&str>,
+        if_absent: bool,
     ) -> Result<PutOutcome> {
         if let Some((dir, _)) = relative.rsplit_once('/')
             && !dir.is_empty()
@@ -384,6 +408,9 @@ impl WebDav {
             .body(bytes);
         if let Some(etag) = if_match {
             request = request.header(header::IF_MATCH, etag);
+        }
+        if if_absent {
+            request = request.header(header::IF_NONE_MATCH, "*");
         }
         let response = request.send()?;
         if response.status() == StatusCode::PRECONDITION_FAILED {
@@ -575,6 +602,148 @@ pub fn safe_local(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::{self, JoinHandle},
+    };
+
+    #[derive(Clone, Debug)]
+    pub struct Request {
+        pub method: String,
+        pub path: String,
+        pub headers: BTreeMap<String, String>,
+        pub body: Vec<u8>,
+    }
+
+    pub struct Reply {
+        pub status: u16,
+        pub body: Vec<u8>,
+        pub etag: Option<String>,
+    }
+
+    impl Reply {
+        pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status,
+                body: body.into(),
+                etag: None,
+            }
+        }
+
+        pub fn versioned(body: Vec<u8>) -> Self {
+            let etag = format!("\"{}\"", crate::hash::sha256_hex(&body));
+            Self {
+                status: 200,
+                body,
+                etag: Some(etag),
+            }
+        }
+    }
+
+    pub struct Server {
+        pub url: String,
+        pub requests: Arc<Mutex<Vec<Request>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ =
+                TcpStream::connect(self.url.trim_start_matches("http://").trim_end_matches('/'));
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    pub fn serve(mut handler: impl FnMut(&Request) -> Reply + Send + 'static) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let thread = thread::spawn(move || {
+            for socket in listener.incoming() {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut socket = socket.unwrap();
+                let mut raw = Vec::new();
+                let mut buffer = [0; 4096];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buffer[..count]);
+                    if let Some(pos) = raw.windows(4).position(|value| value == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let text = String::from_utf8_lossy(&raw[..header_end]);
+                let mut lines = text.lines();
+                let mut first = lines.next().unwrap().split_whitespace();
+                let method = first.next().unwrap().to_owned();
+                let path = first.next().unwrap().to_owned();
+                let headers: BTreeMap<String, String> = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                    .collect();
+                let size = headers
+                    .get("content-length")
+                    .map(|size| size.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                while raw.len() < header_end + size {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    raw.extend_from_slice(&buffer[..count]);
+                }
+                let request = Request {
+                    method,
+                    path,
+                    headers,
+                    body: raw[header_end..header_end + size].to_vec(),
+                };
+                recorded.lock().unwrap().push(request.clone());
+                let reply = if request.method == "MKCOL" {
+                    Reply::new(405, Vec::new())
+                } else {
+                    handler(&request)
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    reply.status,
+                    reply.body.len()
+                )
+                .unwrap();
+                if let Some(etag) = reply.etag {
+                    write!(socket, "ETag: {etag}\r\n").unwrap();
+                }
+                socket.write_all(b"\r\n").unwrap();
+                socket.write_all(&reply.body).unwrap();
+            }
+        });
+        Server {
+            url,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -601,5 +770,35 @@ mod tests {
         assert_eq!(caps.tier(), UploadTier::EtagOnly);
         caps.if_match = true;
         assert_eq!(caps.tier(), UploadTier::Conditional);
+    }
+
+    #[test]
+    fn conditional_creation_cannot_overwrite_an_existing_file() {
+        use super::test_support::{Reply, serve};
+        let mut exists = false;
+        let server = serve(move |request| {
+            if request.method == "PUT" {
+                assert_eq!(
+                    request.headers.get("if-none-match").map(String::as_str),
+                    Some("*")
+                );
+                let status = if exists { 412 } else { 201 };
+                exists = true;
+                Reply::new(status, Vec::new())
+            } else {
+                Reply::new(404, Vec::new())
+            }
+        });
+        let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+        assert!(matches!(
+            dav.put_bytes_if_absent("Others/a.txt", b"first".to_vec())
+                .unwrap(),
+            PutOutcome::Uploaded { .. }
+        ));
+        assert!(matches!(
+            dav.put_bytes_if_absent("Others/a.txt", b"second".to_vec())
+                .unwrap(),
+            PutOutcome::PreconditionFailed
+        ));
     }
 }

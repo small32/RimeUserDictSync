@@ -16,12 +16,13 @@
 - **后台搬运**：比对远端 `Others/` 与各设备 `<ID>/.index.json`，按需增量下载/上传。
   可由 **Windows 服务**常驻执行（开机即跑、不必打开本程序），未安装服务时由程序内建线程兜底。
 - **手动同步**：严格按 拉取 → 并集 → 写回 → 上传 → `/sync` → `/deploy` 执行。
-- **按类型合并**：`*.dict.yaml` 词条并集取大权重；`*.txt` 按首列 key 并集；
+- **按类型合并**：`*.dict.yaml` 词条并集取大权重；短语文本按「文本 + 编码」并集（权重可省略），`opencc/*.txt` 按首列 key 并集；
   `*.yaml`（非 dict）/`*.json`/`*.lua` 走 newest。
 - **三向判断**：newest 型文件双端同时修改时保留冲突副本并提示，绝不静默覆盖。
 - **设备 ID / 密码**：PBKDF2 派生串、原子抢占、密码验证接管、强制接管、注销、导出/导入。
 - **`session_token` 每轮校验**：同一 ID 被两台设备使用时，旧设备下一轮自动停止同步。
 - **WebDAV 能力探测**：自动选择 `If-Match` / ETag / size+mtime 三档上传校验。
+  探测结果会保存并绑定当前连接；更换地址或凭据后重新探测，避免沿用旧服务器的能力。
 - 提供后台开关与间隔、进度条、实时日志、停止同步、连接与写入测试。
 - 启动后自动检查 GitHub 最新 Release；同一套源码可在 Windows、macOS 原生编译。
 
@@ -46,7 +47,7 @@
 │  ├─ sync.lock                      本地互斥锁
 │  └─ wake                           「立刻搬运一轮」的标记，服务跑完即删
 └─ Sync/                             ★ 唯一与 WebDAV 同步的目录
-   ├─ <ID_A>/                        A 的 userdb 快照 + .index.json + owner.json
+   ├─ <ID_A>/                        A 的快照 + .index.json + owner.json + 独立会话心跳
    ├─ <ID_B>/                        B 的快照（本机下载，供 /sync 合并）
    └─ Others/                        ★ 单一共享目录
       ├─ custom_phrase.txt
@@ -109,6 +110,11 @@ macOS:   ~/Library/Rime
 
 设备 ID 规则：`^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$`，并额外禁止 Windows 保留设备名与
 `Others`/`WebDAV` 等保留目录名；查重大小写不敏感。
+
+接管和导入后的首轮会恢复远端快照，不会用本地空目录清空远端清单。
+恢复副本暂存于 `Sync/__rime_restore_<ID>/`，供 RIME 合并，成功后清理。
+设备设置通过远端 `__rime-owner-lock-<id>/` 互斥；若设置进程异常退出留下锁，
+确认所有设备均未执行设备设置后，可手动删除提示中的锁目录再重试。
 
 > **密码不是安全边界，是防误操作。** WebDAV 是纯存储、没有服务端鉴权，
 > 任何持有 WebDAV 凭据的人都能拿到 `owner.json`。密码真正挡住的是你自己在另一台
@@ -212,7 +218,7 @@ RimeUserDictSync.exe --service-status
 | 运行账号 | `LocalSystem`（不保存用户密码，改密码也不会让服务起不来） |
 | 启动方式 | 自动（**延迟启动**，不拖慢开机） |
 | 失败恢复 | 60 秒后重启，仍失败则 300 秒后重启，24 小时无故障后重置计数 |
-| 程序位置 | `%ProgramData%\RimeUserDictSync\RimeUserDictSync.exe`（安装时自动复制） |
+| 程序位置 | `%ProgramData%\RimeUserDictSyncService\RimeUserDictSync.exe`（安装时自动复制） |
 | 调度 | 每 30 秒醒一次判断是否到期；到期或收到唤醒标记就跑一轮 |
 | 配置来源 | 安装时用 `--app-dir` 记下的那个目录里的同一个 INI 与同一份 `device.json` |
 
@@ -223,7 +229,7 @@ RimeUserDictSync.exe --service-status
 
 1. 启动参数（用 `StartService` 参数启动时有效）；
 2. `HKLM\SOFTWARE\RimeUserDictSync\AppDir`（安装时写入，开机自启走的就是这条）；
-3. `%ProgramData%\RimeUserDictSync\app-dir.txt`（安装时写入，注册表读不到时的兜底）；
+3. `%ProgramData%\RimeUserDictSyncService\app-dir.txt`（安装时写入，注册表读不到时的兜底）；
 4. 都没有 → 退回服务自身目录，并写一条明确的告警。
 
 几个实际影响：
@@ -231,7 +237,9 @@ RimeUserDictSync.exe --service-status
 - **服务从固定位置启动**，所以你把便携版程序挪走、删掉，都不会把服务弄坏。
 - **复制到 ProgramData** 意味着升级程序后要重新点一次「安装 / 更新后台服务」，
   让它把新版本复制过去（按钮对已安装的服务是原地改配置，不会报错）。
-- **改了配置目录**（macOS 才有该功能）或换了 Rime 用户目录后，重新点一次安装按钮即可改指向。
+- 安装前会在当前用户会话里固定 RIME 的绝对路径；服务目录只允许管理员和 SYSTEM 写入。
+  更新旧版服务时改用新的受保护目录，旧目录不再作为服务启动位置；预先存在且权限不安全的新目录会被拒绝。
+- macOS 切换配置目录会同时更新内建后台线程和已安装代理；Windows 换了 Rime 用户目录后，重新点一次安装按钮即可改指向。
 - 服务以 `LocalSystem` 写入 `Rime/.rime-sync/` 与 `Sync/` 的文件，属主是 `SYSTEM`；
   正常情况下 ACL 继承会让用户仍可读写，若真遇到权限问题请在 issue 里反馈。
 
@@ -311,7 +319,11 @@ macOS 下生成的是 `同步词库.app`（AppleScript applet）：
 - 双击**不弹终端窗口**，也不占 Dock（`LSUIElement`），跑完弹一个原生对话框告知结果；
 - 图标取自主程序的 `AppIcon.icns`，不是通用的脚本图标；
 - applet 里执行的是主程序的 `--sync-now --notify --app-dir <配置目录>`，
-  与 Windows 快捷方式语义完全一致，**不是**只跑 RIME 自带的 `/sync` + `/reload`；
+  也就是**完整一轮**（拉取 → 合并写回 → 上传 → `/sync` → `/reload`）；
+- 这一点与 Windows 快捷方式**故意不一致**：Windows 那边只做 `/sync` + `/deploy`。
+  原因是 macOS 的 `--scheduled-round` 同样只搬运文件，若不在这里写回，
+  `Sync/Others/` 就永远到不了 `RIME/`。想让两端一致，把 `shortcut_macos.rs`
+  里的 `--sync-now` 换成 `--rime-sync` 即可；
 - 生成时先在 `$TMPDIR` 里 `osacompile` 并 ad-hoc 签名，再整体 `rename` 到目标目录。
   直接在 `~/Documents` 这类受 FileProvider / 受管目录里签名会报
   `replacing existing signature / Operation not permitted`（`-4960`）；
@@ -338,20 +350,22 @@ macOS 下生成的是 `同步词库.app`（AppleScript applet）：
 > 想核对就跑 `tools\verify-shortcut-icon.ps1`：它直接按 MS-SHLLINK 结构解析 `.lnk` 字节，
 > 校验上面两处，并用 `SHDefExtractIconW` 把索引 0 和索引 -101 各导出成 PNG 供肉眼比对。
 
-双击它即执行 `--sync-now --notify`，也就是完整的手动同步：
+双击它**只做两步**，与 macOS 菜单栏图标（`Squirrel --sync` → `--reload`）同一策略：
 
 ```
-拉取远端 → 并集合并 → 写回本地源文件 → 上传 → RIME /sync → /deploy
+RIME /sync  →  /deploy
 ```
 
-为什么不是"只跑 RIME 的 /sync + /deploy"：`Sync/Others/` 里的自定义短语、词典
-**必须先回写**到 `RIME/` 目录，`/deploy` 才编译得到它们；少了这一步，
-"多机合并"能生效而"并集后的其他同步文件"不会生效。
+文件的拉取与上传由后台服务完成，文本配置的合并写回仍由 GUI 完整同步负责。快捷方式只补齐服务在
+session 0 里做不到的那两步（读用户配置、让输入法重载），所以双击**不等网络**。
 
-容错原则：**网络问题不阻止本机生效，本机生效失败才算失败。**
-所有与 WebDAV 有关的步骤都是尽力而为（失败只写警告日志），
-合并、写回、`/sync`、`/deploy` 仍然严格报错。
-所以离线时双击快捷方式也能把已经拉到本地的内容合并并生效。
+容错：`/sync` 失败直接报错（消息框 + 日志）；`/deploy` 失败同样报错 ——
+它本来就是"让词库生效"的最后一步，静默失败等于什么都没做。
+
+> **已知取舍**：`Sync/Others/` 里的自定义短语、词典不再由快捷方式写回 `RIME/`。
+> 另一台机器改了 `*.custom.yaml` 这类"其他同步文件"时，本机要靠 GUI 的
+> 「同步词库」按钮（走完整的 `--sync-now`）才会落到 `RIME/` 目录。
+> 词库本身不受影响：`*.userdb.txt` 的合并发生在 RIME 的 `/sync` 内部。
 
 `--notify` 只在结束时弹一个结果消息框（双击启动没有控制台，`println!` 会石沉大海）；
 从命令行调用可以省略。
@@ -362,7 +376,9 @@ macOS 下生成的是 `同步词库.app`（AppleScript applet）：
 
 ```
 --sync-now             执行一次完整「同步词库」：拉取 → 并集 → 写回 → 上传
-                       → RIME /sync → /deploy（桌面快捷方式用的就是它）
+                       → RIME /sync → /deploy（GUI 按钮走的就是这条）
+--rime-sync            只做 RIME 自带的用户资料同步 + 重新部署
+                       （桌面快捷方式用的就是它；文件搬运由后台服务负责）
 --round                只执行一轮后台搬运后退出（不合并、不部署）
 --scheduled-round      供 macOS 后台代理调用：后台搬运关闭时跳过，否则跑一轮
 --install-service      安装并启动 Windows 后台服务（需要管理员权限）

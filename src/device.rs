@@ -3,7 +3,7 @@ use crate::{
     identity::{self, Owner, PasswordHash, Takeover},
     paths::{self, Layout, SNAPSHOT_INDEX_FILE},
     state::{SnapshotIndex, SyncList},
-    webdav::{MkcolOutcome, WebDav},
+    webdav::{Capabilities, MkcolOutcome, WebDav},
 };
 use anyhow::{Context as _, Result, bail};
 use std::{fs, path::PathBuf};
@@ -45,11 +45,15 @@ pub struct DeviceSeed {
     pub host: String,
     pub app_ver: String,
     pub created_at: String,
+    pub capabilities: Capabilities,
+    pub capabilities_key: String,
 }
 
 impl DeviceSeed {
     pub fn from_device(device: &DeviceFile, sync_dir: impl Into<String>) -> Self {
         Self {
+            capabilities: device.capabilities,
+            capabilities_key: device.capabilities_key.clone(),
             sync_dir: sync_dir.into(),
             machine_fp: if device.machine_fp.trim().is_empty() {
                 identity::new_machine_fp()
@@ -81,14 +85,16 @@ pub enum Claim {
 
 /// 首次设置：抢占 + 设密码（§7.1）。`password` 为 `None` 表示显式跳过设密码。
 pub fn claim(dav: &WebDav, id: &str, password: Option<&str>, seed: &DeviceSeed) -> Result<Claim> {
-    paths::validate_installation_id(id)?;
-    reject_case_insensitive_duplicate(dav, id)?;
+    validate_remote_id(dav, id)?;
+    let _owner_lock = identity::OwnerLock::acquire(dav, id)?;
     match dav.mkcol(id)? {
         MkcolOutcome::AlreadyExists => Ok(Claim::Occupied(Box::new(Owner::load(dav, id)?))),
         MkcolOutcome::Created => {
             // Others/ 若不存在则幂等创建。
             let _ = dav.mkcol(paths::OTHERS_DIR_NAME)?;
             let mut device = DeviceFile {
+                capabilities: seed.capabilities,
+                capabilities_key: seed.capabilities_key.clone(),
                 installation_id: id.to_owned(),
                 sync_dir: seed.sync_dir.clone(),
                 machine_fp: seed.machine_fp.clone(),
@@ -103,10 +109,16 @@ pub fn claim(dav: &WebDav, id: &str, password: Option<&str>, seed: &DeviceSeed) 
                 device.password = derived.to_storage();
             }
             let owner = owner_from_device(&device, password.is_some());
-            owner.save(dav, id)?;
+            owner.save_if_absent(dav, id)?;
             Ok(Claim::Claimed(Box::new(device)))
         }
     }
+}
+
+/// 必须在把 ID 用于本地路径或远端请求之前调用。
+pub fn validate_remote_id(dav: &WebDav, id: &str) -> Result<()> {
+    paths::validate_installation_id(id)?;
+    reject_case_insensitive_duplicate(dav, id)
 }
 
 /// §7.1 第 1 步：查重大小写不敏感（Win/macOS 文件系统不敏感，Linux 敏感）。
@@ -171,7 +183,17 @@ pub fn rewrite_owner(
     seed: &DeviceSeed,
     new_password: Option<&str>,
 ) -> Result<DeviceFile> {
+    paths::validate_installation_id(id)?;
+    let _owner_lock = identity::OwnerLock::acquire(dav, id)?;
+    let current = Owner::load_versioned(dav, id)?;
+    if let Some((current, _)) = &current
+        && (current.session_token != owner.session_token || current.pwd != owner.pwd)
+    {
+        bail!("设备身份或密码已变化，请重新读取后重试接管");
+    }
     let mut device = DeviceFile {
+        capabilities: seed.capabilities,
+        capabilities_key: seed.capabilities_key.clone(),
         installation_id: id.to_owned(),
         sync_dir: seed.sync_dir.clone(),
         machine_fp: seed.machine_fp.clone(),
@@ -188,7 +210,6 @@ pub fn rewrite_owner(
             .as_ref()
             .map(PasswordHash::to_storage)
             .unwrap_or_default(),
-        ..Default::default()
     };
     if let Some(password) = new_password {
         device.password = PasswordHash::derive(password).to_storage();
@@ -211,7 +232,18 @@ pub fn rewrite_owner(
         old_machine_fp: owner.machine_fp.clone(),
         at: identity::now_stamp(),
     });
-    updated.save(dav, id)?;
+    match current {
+        Some((_, etag)) => {
+            if let Some(etag) =
+                etag.filter(|tag| seed.capabilities.if_match && !tag.starts_with("W/"))
+            {
+                updated.save_if_match(dav, id, &etag)?;
+            } else {
+                updated.save(dav, id)?;
+            }
+        }
+        None => updated.save_if_absent(dav, id)?,
+    }
     Ok(device)
 }
 
@@ -265,6 +297,7 @@ pub fn takeover_forced(
     seed: &DeviceSeed,
     layout: &Layout,
 ) -> Result<(DeviceFile, Vec<String>)> {
+    validate_remote_id(dav, id)?;
     identity::validate_password_input(new_password)?;
     takeover_common(dav, id, owner, seed, layout, Some(new_password))
 }
@@ -277,12 +310,18 @@ fn takeover_common(
     layout: &Layout,
     new_password: Option<&str>,
 ) -> Result<(DeviceFile, Vec<String>)> {
+    paths::validate_installation_id(id)?;
     let mut notices = Vec::new();
     // 第 1 步：远端 Sync/<ID>/ 的 userdb 快照原样保留（接管唯一的价值）。
     notices.push("已保留远端 Sync/<ID>/ 的 userdb 快照。".to_owned());
     // 第 2 步：本地 Others/ 先备份。
     if let Some(backup) = backup_others(layout)? {
         notices.push(format!("已把本地 Others/ 备份到 {}。", backup.display()));
+    }
+    // 先补齐快照；下载失败时保留原身份，重试不会丢失刚签发的 token。
+    let restored = crate::transport::restore_own_snapshots(dav, layout)?;
+    if restored > 0 {
+        notices.push(format!("已恢复远端设备快照 {restored} 项。"));
     }
     // 第 3 步：覆盖 owner.json（新 machine_fp、新 session_token、接管留痕）。
     let device = rewrite_owner(dav, id, owner, seed, new_password)?;
@@ -292,6 +331,7 @@ fn takeover_common(
 
 /// §7.6 注销此设备：验证密码后删除远端 `<ID>/` 与本地 `Sync/<ID>/`。
 pub fn retire(dav: &WebDav, id: &str, password: &str, layout: &Layout) -> Result<Vec<String>> {
+    let _owner_lock = identity::OwnerLock::acquire(dav, id)?;
     let owner = Owner::load(dav, id)?.unwrap_or_default();
     if owner.has_password() {
         verify(&owner, password)?;
@@ -315,8 +355,10 @@ pub fn change_password(
     new_password: &str,
     device: &mut DeviceFile,
 ) -> Result<()> {
+    paths::validate_installation_id(id)?;
+    let _owner_lock = identity::OwnerLock::acquire(dav, id)?;
     identity::validate_password_input(new_password)?;
-    let mut owner = Owner::load(dav, id)?
+    let (mut owner, etag) = Owner::load_versioned(dav, id)?
         .with_context(|| format!("远端找不到 {id}/owner.json，无法修改密码"))?;
     if owner.has_password() {
         verify(&owner, old_password)?;
@@ -324,7 +366,11 @@ pub fn change_password(
     let derived = PasswordHash::derive(new_password);
     owner.pwd = Some(derived.clone());
     owner.pwd_set_at = Some(identity::now_stamp());
-    owner.save(dav, id)?;
+    if let Some(etag) = etag.filter(|tag| device.capabilities.if_match && !tag.starts_with("W/")) {
+        owner.save_if_match(dav, id, &etag)?;
+    } else {
+        owner.save(dav, id)?;
+    }
     device.password = derived.to_storage();
     Ok(())
 }
@@ -410,6 +456,21 @@ mod tests {
     fn verify_rejects_ids_without_password() {
         let owner = Owner::default();
         assert!(verify(&owner, "anything").is_err());
+    }
+
+    #[test]
+    fn forced_takeover_rejects_invalid_ids_before_any_network_or_file_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let dav = WebDav::new("https://example.invalid/", "user", "password").unwrap();
+        let seed = DeviceSeed::from_device(&DeviceFile::default(), "Sync");
+        for id in ["../escape", "Others", "WebDAV", "CON"] {
+            let layout = Layout::new(dir.path(), id);
+            assert!(
+                takeover_forced(&dav, id, &Owner::default(), "new-password", &seed, &layout)
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

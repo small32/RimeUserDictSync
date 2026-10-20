@@ -167,7 +167,11 @@ fn parse_ini(text: &str) -> BTreeMap<(String, String), String> {
 /// 读一个可缺失的 YAML 标量（`installation.yaml` 的 `installation_id` / `sync_dir` / `Password`）。
 pub fn yaml_scalar_opt(path: &Path, key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
-    let rx = Regex::new(&format!(r"(?m)^\s*{}\s*:\s*(.*?)\s*$", regex::escape(key))).ok()?;
+    let rx = Regex::new(&format!(
+        r"(?m)^[\t ]*{}[\t ]*:[\t ]*([^\r\n]*)",
+        regex::escape(key)
+    ))
+    .ok()?;
     let mut value = rx
         .captures(&text)
         .and_then(|captures| captures.get(1))
@@ -180,7 +184,7 @@ pub fn yaml_scalar_opt(path: &Path, key: &str) -> Option<String> {
         && ((value.starts_with('\'') && value.ends_with('\''))
             || (value.starts_with('"') && value.ends_with('"')))
     {
-        value = value[1..value.len() - 1].to_owned();
+        value = value[1..value.len() - 1].replace("''", "'");
     }
     if value.is_empty() { None } else { Some(value) }
 }
@@ -189,7 +193,10 @@ pub fn yaml_scalar_opt(path: &Path, key: &str) -> Option<String> {
 pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
     let text = fs::read_to_string(path)?;
     let escaped = value.replace('\'', "''");
-    let rx = Regex::new(&format!(r"(?m)^(\s*{}\s*:\s*).*$", regex::escape(key)))?;
+    let rx = Regex::new(&format!(
+        r"(?m)^([\t ]*{}[\t ]*:[\t ]*)[^\r\n]*",
+        regex::escape(key)
+    ))?;
     let updated = if let Some(captures) = rx.captures(&text) {
         // 手动拼接：避免值中的 $ 被当作捕获组引用。
         let whole = captures.get(0).context("正则匹配结果缺少整体")?;
@@ -197,6 +204,9 @@ pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
         let mut updated = String::with_capacity(text.len() + escaped.len() + 2);
         updated.push_str(&text[..whole.start()]);
         updated.push_str(prefix.as_str());
+        if prefix.as_str().ends_with(':') {
+            updated.push(' ');
+        }
         updated.push('\'');
         updated.push_str(&escaped);
         updated.push('\'');
@@ -328,5 +338,22 @@ mod tests {
             Some("/tmp/Sync")
         );
         assert_eq!(yaml_scalar_opt(&yaml, "other").as_deref(), Some("quoted"));
+    }
+
+    #[test]
+    fn empty_yaml_scalar_never_consumes_the_next_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("installation.yaml");
+        fs::write(&yaml, "sync_dir:\r\ninstallation_id: pc01\r\n").unwrap();
+        assert_eq!(yaml_scalar_opt(&yaml, "sync_dir"), None);
+        set_yaml_scalar(&yaml, "sync_dir", "C:/Rime/Sync").unwrap();
+        assert_eq!(
+            fs::read_to_string(&yaml).unwrap(),
+            "sync_dir: 'C:/Rime/Sync'\r\ninstallation_id: pc01\r\n"
+        );
+        assert_eq!(
+            yaml_scalar_opt(&yaml, "installation_id").as_deref(),
+            Some("pc01")
+        );
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     hash,
     identity::{self, Owner},
     paths::{
-        OTHERS_DIR_NAME, OWNER_FILE, SNAPSHOT_INDEX_FILE, is_forbidden_in_others,
+        Layout, OTHERS_DIR_NAME, OWNER_FILE, SNAPSHOT_INDEX_FILE, is_forbidden_in_others,
         validate_installation_id,
     },
     report::Reporter,
@@ -17,8 +17,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use walkdir::WalkDir;
-
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, Default)]
 pub struct RoundOutcome {
@@ -65,6 +63,7 @@ pub fn round_locked(
     report: &dyn Reporter,
 ) -> Result<RoundOutcome> {
     let mut outcome = RoundOutcome::default();
+    check_local_identity(context)?;
     report.progress(5);
 
     check_session(context, report)?;
@@ -108,18 +107,30 @@ pub fn round_locked(
     Ok(outcome)
 }
 
+/// Context 构建与取得同步锁之间，设备设置可能已切换；不能使用旧身份写同一份私有索引。
+pub fn check_local_identity(context: &Context) -> Result<()> {
+    let path = context.layout.device_file();
+    if path.is_file() {
+        let current = crate::context::DeviceFile::load(&path)?;
+        if current.installation_id != context.device.installation_id
+            || current.session_token != context.device.session_token
+        {
+            bail!("设备设置已发生变化，请重新加载后再同步");
+        }
+    }
+    Ok(())
+}
+
 /// §7.5：每轮开始前校验 `session_token`，不匹配说明此 ID 已被其他设备接管。
-pub fn check_session(context: &Context, report: &dyn Reporter) -> Result<()> {
+pub fn check_session(context: &Context, _report: &dyn Reporter) -> Result<()> {
     let Some(owner) = Owner::load(&context.dav, &context.layout.installation_id)? else {
-        return Ok(());
+        bail!("远端 owner.json 缺失或损坏，无法校验设备身份；本轮禁止上传，请检查设备设置");
     };
     if owner.session_token.trim().is_empty() {
-        return Ok(());
+        bail!("远端 owner.json 缺少 session_token，无法校验设备身份，请重新完成设备设置");
     }
     if !context.device.has_session() {
-        // 本机还没有令牌（例如刚导入配置前）：接受远端令牌，避免误判。
-        report.log("提示：本地缺少 session_token，已按远端 owner.json 记录。");
-        return Ok(());
+        bail!("本地缺少 session_token，请重新完成设备设置");
     }
     if owner.session_token != context.device.session_token {
         return Err(anyhow::Error::new(SessionTakenOver {
@@ -145,7 +156,7 @@ fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) 
         let Some(relative) = strip_dir(&entry.relative, OTHERS_DIR_NAME) else {
             continue;
         };
-        if relative.is_empty() {
+        if relative.is_empty() || is_transfer_temp(relative) {
             continue;
         }
         if is_forbidden_in_others(relative) {
@@ -235,6 +246,15 @@ pub fn push_others(
             report,
         )? {
             UploadOutcome::Uploaded { etag, sha256 } => {
+                // 只有远端已确认的本地源文件才能成为三向判断基线。
+                // 上传失败/412 时保留原基线，下一轮才能识别双端修改。
+                if let Some(source) = index.pending_files.get(&relative).cloned()
+                    && source.sha256 == sha256
+                {
+                    index.files.insert(relative.clone(), source);
+                    index.pending_files.remove(&relative);
+                    index.conflicts.remove(&relative);
+                }
                 index.remote.insert(
                     relative.clone(),
                     RemoteMark {
@@ -275,50 +295,70 @@ fn upload(
 ) -> Result<UploadOutcome> {
     let dav = &context.dav;
     let capabilities = context.device.capabilities;
-    let sha256 = hash::sha256_file(local)?;
-    match capabilities.tier() {
-        UploadTier::Conditional => match dav.put(remote_relative, local, seen_etag)? {
-            PutOutcome::PreconditionFailed => return Ok(UploadOutcome::PreconditionFailed),
-            PutOutcome::Uploaded { .. } => {}
-        },
+    // hash 与请求体使用同一次读取，避免 RIME 同时生成快照时清单与上传内容错配。
+    let bytes = fs::read(local)?;
+    let sha256 = hash::sha256_hex(&bytes);
+    let etag = match capabilities.tier() {
+        UploadTier::Conditional => {
+            let result = match seen_etag {
+                Some(etag) => dav.put_bytes(remote_relative, bytes, Some(etag))?,
+                None => dav.put_bytes_if_absent(remote_relative, bytes)?,
+            };
+            match result {
+                PutOutcome::PreconditionFailed => return Ok(UploadOutcome::PreconditionFailed),
+                PutOutcome::Uploaded { etag } => etag,
+            }
+        }
         UploadTier::EtagOnly => {
             // 上传前重取一次 ETag，与本轮开始时读到的不同就不传（§4.4 B 档）。
             let current = dav.stat(remote_relative)?.and_then(|entry| entry.etag);
             if current.as_deref() != seen_etag {
                 return Ok(UploadOutcome::PreconditionFailed);
             }
-            match dav.put(remote_relative, local, None)? {
-                PutOutcome::Uploaded { .. } => {}
+            match dav.put_bytes(remote_relative, bytes, None)? {
+                PutOutcome::Uploaded { etag } => etag,
                 PutOutcome::PreconditionFailed => return Ok(UploadOutcome::PreconditionFailed),
             }
         }
         UploadTier::MetadataOnly => {
             if capabilities.move_supported {
                 let temp = format!("{remote_relative}.tmp-{}", identity::new_path_token(8));
-                match dav.put(&temp, local, None)? {
-                    PutOutcome::Uploaded { .. } => {}
-                    PutOutcome::PreconditionFailed => {
-                        return Ok(UploadOutcome::PreconditionFailed);
+                let result = (|| -> Result<PutOutcome> {
+                    if matches!(
+                        dav.put_bytes(&temp, bytes.clone(), None)?,
+                        PutOutcome::PreconditionFailed
+                    ) {
+                        return Ok(PutOutcome::PreconditionFailed);
                     }
-                }
-                if !dav.move_entry(&temp, remote_relative)? {
-                    // 没有 MOVE 就退化为 PUT + 校验 hash（§10 风险 9）。
-                    dav.put(remote_relative, local, None)?;
-                    let _ = dav.delete(&temp);
+                    if !dav.move_entry(&temp, remote_relative)? {
+                        return dav.put_bytes(remote_relative, bytes, None);
+                    }
+                    Ok(PutOutcome::Uploaded { etag: None })
+                })();
+                // MOVE、PUT 或响应失败时同样清理，避免每次重试留下一份完整词库。
+                let _ = dav.delete(&temp);
+                if matches!(result?, PutOutcome::PreconditionFailed) {
+                    return Ok(UploadOutcome::PreconditionFailed);
                 }
             } else {
-                dav.put(remote_relative, local, None)?;
-                let bytes = dav.get_bytes(remote_relative)?;
-                if hash::sha256_hex(&bytes) != sha256 {
-                    bail!("{remote_relative} 上传后校验失败（服务端内容与本地不一致）");
+                if matches!(
+                    dav.put_bytes(remote_relative, bytes, None)?,
+                    PutOutcome::PreconditionFailed
+                ) {
+                    return Ok(UploadOutcome::PreconditionFailed);
                 }
-                report.log(&format!("{remote_relative} 上传后已按 hash 校验通过。"));
             }
+            let Some((remote_bytes, etag)) = dav.try_get_bytes_with_etag(remote_relative)? else {
+                bail!("{remote_relative} 上传后无法读取");
+            };
+            if hash::sha256_hex(&remote_bytes) != sha256 {
+                bail!("{remote_relative} 上传后校验失败（服务端内容与本地不一致）");
+            }
+            report.log(&format!("{remote_relative} 上传后已按 hash 校验通过。"));
+            etag
         }
-    }
-    // 统一用 PROPFIND 读回的 ETag 作为下次粗筛依据：PUT 响应里的 ETag 可能与
-    // PROPFIND 的写法不同（是否带引号、强弱标记），混用会导致反复重传。
-    let etag = dav.stat(remote_relative)?.and_then(|entry| entry.etag);
+    };
+    // 只能记录与本次 PUT（或校验 GET）同一响应的 ETag；独立 STAT 可能已读到他机版本。
     Ok(UploadOutcome::Uploaded { etag, sha256 })
 }
 
@@ -381,11 +421,7 @@ fn pull_snapshots(
                 continue;
             }
             let remote_relative = format!("{name}/{file}");
-            // 远端清单里已经有 mtime，直接用它可以省掉每个文件一次 PROPFIND。
-            let modified = (snapshot.mtime > 0).then(|| {
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(snapshot.mtime as u64)
-            });
-            dav.get(&remote_relative, &target, modified)?;
+            download_snapshot(dav, &remote_relative, &target, snapshot)?;
             marks.insert(file.clone(), snapshot.sha256.clone());
             report.log(&format!("已下载其他设备快照 {name}/{file}。"));
             downloaded += 1;
@@ -397,6 +433,11 @@ fn pull_snapshots(
             .cloned()
             .collect();
         for file in removed {
+            // 旧版本可能已把非法名称写进私有索引，升级后的清理也必须校验。
+            if crate::state::safe_snapshot_name(&file).is_err() {
+                marks.remove(&file);
+                continue;
+            }
             let target = target_dir.join(&file);
             if target.is_file() {
                 fs::remove_file(&target)?;
@@ -411,14 +452,18 @@ fn pull_snapshots(
         .snapshots
         .keys()
         .filter(|name| {
-            !seen_devices
-                .iter()
-                .any(|seen| seen.eq_ignore_ascii_case(name))
+            !name.eq_ignore_ascii_case(&own)
+                && !seen_devices
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(name))
         })
         .cloned()
         .collect();
     for name in retired {
         index.snapshots.remove(&name);
+        if validate_installation_id(&name).is_err() {
+            continue;
+        }
         let dir = context.layout.sync.join(&name);
         if dir.is_dir() {
             fs::remove_dir_all(&dir)?;
@@ -429,6 +474,89 @@ fn pull_snapshots(
 }
 
 // --------------------------------------------------------------- 本机快照
+
+fn restored_snapshot_dir(layout: &Layout) -> PathBuf {
+    // 该目录名不可能被注册为设备 ID，且独立于本 ID，避免 /sync 导出时覆盖待恢复快照。
+    layout
+        .sync
+        .join(format!("__rime_restore_{}", layout.installation_id))
+}
+
+pub fn clear_restored_snapshots(layout: &Layout) -> Result<()> {
+    let dir = restored_snapshot_dir(layout);
+    if dir.is_dir() {
+        fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+/// 接管/导入后保留两台设备的快照；已有本机快照不覆盖，远端版本供下一次 /sync 合并。
+pub fn restore_own_snapshots(dav: &crate::webdav::WebDav, layout: &Layout) -> Result<usize> {
+    let Some(bytes) = dav.try_get_bytes(&format!(
+        "{}/{}",
+        layout.installation_id, SNAPSHOT_INDEX_FILE
+    ))?
+    else {
+        return Ok(0);
+    };
+    let remote_index: SnapshotIndex = serde_json::from_slice(&bytes)?;
+    restore_own_from_index(dav, layout, &remote_index, false)
+}
+
+fn restore_own_from_index(
+    dav: &crate::webdav::WebDav,
+    layout: &Layout,
+    remote_index: &SnapshotIndex,
+    only_missing: bool,
+) -> Result<usize> {
+    let mut restored = 0;
+    for (name, entry) in &remote_index.files {
+        crate::state::safe_snapshot_name(name)?;
+        if !name.to_ascii_lowercase().ends_with(".userdb.txt") {
+            continue;
+        }
+        let own = layout.device.join(name);
+        if only_missing && own.is_file() {
+            continue;
+        }
+        let peer = restored_snapshot_dir(layout).join(name);
+        download_snapshot(
+            dav,
+            &format!("{}/{name}", layout.installation_id),
+            &peer,
+            entry,
+        )?;
+        if !own.is_file() {
+            fs::create_dir_all(&layout.device)?;
+            fs::copy(&peer, &own)?;
+        }
+        restored += 1;
+    }
+    Ok(restored)
+}
+
+fn download_snapshot(
+    dav: &crate::webdav::WebDav,
+    relative: &str,
+    target: &Path,
+    entry: &SnapshotEntry,
+) -> Result<()> {
+    let temp = hash::temp_sibling(target);
+    let modified = (entry.mtime > 0)
+        .then(|| std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime as u64));
+    let result = (|| -> Result<()> {
+        dav.get(relative, &temp, modified)?;
+        if hash::sha256_file(&temp)? != entry.sha256 {
+            bail!("{relative} 与快照清单的 hash 不一致，本轮停止并保留现有快照");
+        }
+        fs::rename(&temp, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
 
 /// 上传本设备 `Sync/<ID>/` 下的 userdb 快照与 `.index.json`（§3 步骤 ④、§11 P0）。
 pub fn push_own_snapshot(
@@ -443,10 +571,14 @@ pub fn push_own_snapshot(
     snapshot_index.installation_id = context.layout.installation_id.clone();
     // 远端清单只花一次 GET，就能判断本机全部快照是否需要上传（§10 风险 10）。
     let remote_relative_index = format!("{}/{SNAPSHOT_INDEX_FILE}", context.layout.installation_id);
-    let remote_index: SnapshotIndex = match context.dav.try_get_bytes(&remote_relative_index)? {
-        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        None => SnapshotIndex::default(),
+    let (remote_index, remote_index_etag): (SnapshotIndex, _) = match context
+        .dav
+        .try_get_bytes_with_etag(&remote_relative_index)?
+    {
+        Some((bytes, etag)) => (serde_json::from_slice(&bytes)?, etag),
+        None => (SnapshotIndex::default(), None),
     };
+    restore_own_from_index(&context.dav, &context.layout, &remote_index, true)?;
     let mut uploaded = 0;
     let mut skipped: Vec<String> = Vec::new();
 
@@ -471,16 +603,20 @@ pub fn push_own_snapshot(
         let file_path = entry.path();
         let sha256 = hash::sha256_file(&file_path)?;
         // 本地清单与远端清单都认为没变，且远端确实还有这条记录时才跳过。
-        let unchanged = snapshot_index
+        let unchanged = remote_index
             .files
             .get(&name)
-            .is_some_and(|entry| entry.sha256 == sha256)
-            && remote_index
-                .files
-                .get(&name)
-                .is_some_and(|entry| entry.sha256 == sha256);
+            .is_some_and(|entry| entry.sha256 == sha256);
         let remote_relative = format!("{}/{name}", context.layout.installation_id);
         if unchanged {
+            snapshot_index.files.insert(
+                name.clone(),
+                SnapshotEntry {
+                    sha256,
+                    size: hash::file_size(&file_path),
+                    mtime: hash::mtime_secs(&file_path),
+                },
+            );
             continue;
         }
         check(cancel)?;
@@ -497,7 +633,7 @@ pub fn push_own_snapshot(
             seen_etag.as_deref(),
             report,
         )? {
-            UploadOutcome::Uploaded { .. } => {
+            UploadOutcome::Uploaded { sha256, .. } => {
                 snapshot_index.files.insert(
                     name.clone(),
                     SnapshotEntry {
@@ -510,9 +646,7 @@ pub fn push_own_snapshot(
                 uploaded += 1;
             }
             UploadOutcome::PreconditionFailed => {
-                report.log(&format!(
-                    "{remote_relative} 上传前 ETag 变化，本轮跳过（下轮重试）。"
-                ));
+                bail!("{remote_relative} 上传前 ETag 变化，本轮保留远端清单，下轮重试");
             }
         }
     }
@@ -522,7 +656,24 @@ pub fn push_own_snapshot(
     snapshot_index.generated_at = identity::now_stamp();
     snapshot_index.save(&path)?;
     // 清单本身最后上传，保证别人读到的清单一定有对应的文件。
-    context.dav.put(&remote_relative_index, &path, None)?;
+    let manifest = fs::read(&path)?;
+    let result = if context.device.capabilities.if_match {
+        match remote_index_etag.as_deref() {
+            Some(etag) => context
+                .dav
+                .put_bytes(&remote_relative_index, manifest, Some(etag))?,
+            None => context
+                .dav
+                .put_bytes_if_absent(&remote_relative_index, manifest)?,
+        }
+    } else {
+        context
+            .dav
+            .put_bytes(&remote_relative_index, manifest, None)?
+    };
+    if matches!(result, PutOutcome::PreconditionFailed) {
+        bail!("本设备快照清单已被其他同步更新，本轮不再覆盖，下轮重新比对");
+    }
 
     // 远端 <ID>/ 里若还留着非 userdb 的文件（旧版本把配置/方案文件也当快照传上去了），
     // 顺手清掉，否则别人会一直看到这些不该同步的东西。
@@ -536,6 +687,7 @@ pub fn push_own_snapshot(
             };
             if name == OWNER_FILE
                 || name == SNAPSHOT_INDEX_FILE
+                || name.starts_with(".last-sync-")
                 || name.to_ascii_lowercase().ends_with(".userdb.txt")
                 || snapshot_index.files.contains_key(name)
             {
@@ -569,31 +721,23 @@ pub fn push_own_snapshot(
     Ok(uploaded)
 }
 
-/// 更新远端 `owner.json` 的 `last_sync` 等字段（§7.1）。
+/// 心跳与 owner 分开写，旧设备的在途请求不能回滚密码或接管令牌。
 fn touch_owner(context: &Context, report: &dyn Reporter) -> Result<()> {
+    check_session(context, report)?;
     let id = &context.layout.installation_id;
-    let mut owner = Owner::load(&context.dav, id)?.unwrap_or_default();
-    if owner.id.is_empty() {
-        owner.id = id.clone();
+    let stamp = identity::now_stamp();
+    let relative = format!(
+        "{id}/.last-sync-{}.json",
+        hash::sha256_hex(context.device.session_token.as_bytes())
+    );
+    let bytes = serde_json::to_vec(&serde_json::json!({ "last_sync": stamp }))?;
+    if matches!(
+        context.dav.put_bytes(&relative, bytes, None)?,
+        PutOutcome::PreconditionFailed
+    ) {
+        bail!("服务端拒绝更新同步心跳");
     }
-    owner.host = context.device.host.clone();
-    owner.app_ver = APP_VERSION.to_owned();
-    owner.machine_fp = context.device.machine_fp.clone();
-    if owner.created_at.trim().is_empty() {
-        owner.created_at = context.device.created_at.clone();
-    }
-    if owner.session_token.trim().is_empty() && context.device.has_session() {
-        owner.session_token = context.device.session_token.clone();
-    }
-    if owner.pwd.is_none() {
-        owner.pwd = context.device.password_hash();
-    }
-    owner.last_sync = identity::now_stamp();
-    owner.save(&context.dav, id)?;
-    report.log(&format!(
-        "已更新远端 owner.json（last_sync: {}）。",
-        owner.last_sync
-    ));
+    report.log(&format!("已更新设备同步心跳（last_sync: {stamp}）。"));
     Ok(())
 }
 
@@ -602,6 +746,15 @@ fn touch_owner(context: &Context, report: &dyn Reporter) -> Result<()> {
 fn strip_dir<'a>(relative: &'a str, dir: &str) -> Option<&'a str> {
     let prefix = format!("{dir}/");
     relative.strip_prefix(&prefix)
+}
+
+fn is_transfer_temp(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name.starts_with('.')
+        || name.ends_with(".tmp")
+        || name.rsplit_once(".tmp-").is_some_and(|(_, token)| {
+            token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// 列出目录下的全部文件，返回 `/` 分隔的相对路径。
@@ -617,7 +770,7 @@ pub fn walk_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         // 隐藏文件（.DS_Store）与下载残留（`.<name>.<ts>.tmp`）不属于同步内容：
         // 一次失败的下载会留下半截临时文件，传上去就变成所有人可见的"词库"。
         let file_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if file_name.starts_with('.') || file_name.ends_with(".tmp") {
+        if is_transfer_temp(&file_name) {
             continue;
         }
         let relative = entry
@@ -645,6 +798,133 @@ pub fn state_of(path: &Path) -> Result<Option<IndexEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webdav::test_support::{Reply, Server, serve};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Default)]
+    struct MemoryDav {
+        files: BTreeMap<String, Vec<u8>>,
+        fail_move: bool,
+        reject_manifest: bool,
+        concurrent_write: bool,
+    }
+
+    fn memory_server(state: Arc<Mutex<MemoryDav>>) -> Server {
+        serve(move |request| {
+            let mut state = state.lock().unwrap();
+            let etag = state
+                .files
+                .get(&request.path)
+                .map(|bytes| format!("\"{}\"", hash::sha256_hex(bytes)));
+            match request.method.as_str() {
+                "GET" => state
+                    .files
+                    .get(&request.path)
+                    .cloned()
+                    .map(Reply::versioned)
+                    .unwrap_or_else(|| Reply::new(404, Vec::new())),
+                "PUT" => {
+                    if request
+                        .headers
+                        .get("if-none-match")
+                        .is_some_and(|value| value == "*")
+                        && etag.is_some()
+                        || request
+                            .headers
+                            .get("if-match")
+                            .is_some_and(|value| Some(value) != etag.as_ref())
+                        || state.reject_manifest && request.path.ends_with("/.index.json")
+                    {
+                        return Reply::new(412, Vec::new());
+                    }
+                    state
+                        .files
+                        .insert(request.path.clone(), request.body.clone());
+                    let mut reply = Reply::versioned(request.body.clone());
+                    reply.status = 201;
+                    if state.concurrent_write && request.path == "/Others/a.custom.yaml" {
+                        state
+                            .files
+                            .insert(request.path.clone(), b"remote-v3".to_vec());
+                    }
+                    reply
+                }
+                "DELETE" => {
+                    state.files.remove(&request.path);
+                    Reply::new(204, Vec::new())
+                }
+                "MOVE" => {
+                    if state.fail_move {
+                        return Reply::new(500, Vec::new());
+                    }
+                    let destination = url::Url::parse(&request.headers["destination"]).unwrap();
+                    if let Some(bytes) = state.files.remove(&request.path) {
+                        state.files.insert(destination.path().to_owned(), bytes);
+                    }
+                    Reply::new(201, Vec::new())
+                }
+                "PROPFIND" => {
+                    let mut xml = String::from("<d:multistatus xmlns:d=\"DAV:\">");
+                    let mut dirs = BTreeSet::new();
+                    for (path, bytes) in &state.files {
+                        if request.path.ends_with('/') {
+                            let Some(rest) = path.strip_prefix(&request.path) else {
+                                continue;
+                            };
+                            if let Some((dir, _)) = rest.split_once('/') {
+                                dirs.insert(format!("{}{dir}/", request.path));
+                                continue;
+                            }
+                        } else if path != &request.path {
+                            continue;
+                        }
+                        xml.push_str(&format!("<d:response><d:href>{path}</d:href><d:propstat><d:prop><d:getetag>\"{}\"</d:getetag><d:getcontentlength>{}</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>", hash::sha256_hex(bytes), bytes.len()));
+                    }
+                    for dir in dirs {
+                        xml.push_str(&format!("<d:response><d:href>{dir}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                    }
+                    xml.push_str("</d:multistatus>");
+                    Reply::new(207, xml.into_bytes())
+                }
+                _ => Reply::new(404, Vec::new()),
+            }
+        })
+    }
+
+    fn test_context(url: &str) -> (tempfile::TempDir, Context) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = Context::for_test(dir.path(), "pc01");
+        context.layout.ensure_dirs().unwrap();
+        context.dav = crate::webdav::WebDav::new(url, "user", "pass").unwrap();
+        (dir, context)
+    }
+
+    fn remote_snapshot(bytes: &[u8]) -> Arc<Mutex<MemoryDav>> {
+        let index = SnapshotIndex {
+            files: BTreeMap::from([(
+                "words.userdb.txt".into(),
+                SnapshotEntry {
+                    sha256: hash::sha256_hex(bytes),
+                    size: bytes.len() as u64,
+                    mtime: 0,
+                },
+            )]),
+            ..Default::default()
+        };
+        Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([
+                ("/pc01/words.userdb.txt".into(), bytes.to_vec()),
+                (
+                    "/pc01/.index.json".into(),
+                    serde_json::to_vec(&index).unwrap(),
+                ),
+            ]),
+            ..Default::default()
+        }))
+    }
 
     #[test]
     fn strip_dir_removes_only_the_requested_prefix() {
@@ -725,5 +1005,219 @@ mod tests {
             ..Default::default()
         };
         assert!(!mark_matches_entry(&changed, &entry));
+    }
+
+    #[test]
+    fn switching_identity_does_not_retire_its_existing_snapshot_dir() {
+        let state = remote_snapshot(b"saved words");
+        let server = memory_server(state);
+        let (_dir, context) = test_context(&server.url);
+        let snapshot = context.layout.device.join("words.userdb.txt");
+        fs::write(&snapshot, b"saved words").unwrap();
+        let mut index = SyncIndex::default();
+        index.snapshots.insert("pc01".into(), BTreeMap::new());
+        pull_snapshots(&context, &mut index, &crate::report::NullReporter).unwrap();
+        assert!(snapshot.is_file());
+    }
+
+    #[test]
+    fn cleanup_does_not_follow_unsafe_names_cached_by_older_versions() {
+        let state = remote_snapshot(b"saved words");
+        state.lock().unwrap().files.insert(
+            "/pc02/.index.json".into(),
+            serde_json::to_vec(&SnapshotIndex::default()).unwrap(),
+        );
+        let server = memory_server(state);
+        let (_dir, context) = test_context(&server.url);
+        fs::create_dir_all(context.layout.sync.join("pc02")).unwrap();
+        let outside = context.layout.sync.join("outside.userdb.txt");
+        fs::write(&outside, b"keep this file").unwrap();
+        let unsafe_dir = context.layout.rime.join("keep-directory");
+        fs::create_dir_all(&unsafe_dir).unwrap();
+        let mut index = SyncIndex::default();
+        index.snapshots.insert(
+            "pc02".into(),
+            BTreeMap::from([("../outside.userdb.txt".into(), "old".into())]),
+        );
+        index
+            .snapshots
+            .insert("../keep-directory".into(), BTreeMap::new());
+        pull_snapshots(&context, &mut index, &crate::report::NullReporter).unwrap();
+        assert!(outside.is_file());
+        assert!(unsafe_dir.is_dir());
+        assert!(!index.snapshots["pc02"].contains_key("../outside.userdb.txt"));
+    }
+
+    #[test]
+    fn empty_local_snapshot_dir_restores_remote_manifest_and_merge_peer() {
+        let state = remote_snapshot(b"old device words");
+        let server = memory_server(state.clone());
+        let (_dir, context) = test_context(&server.url);
+        push_own_snapshot(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(context.layout.device.join("words.userdb.txt")).unwrap(),
+            b"old device words"
+        );
+        assert_eq!(
+            fs::read(restored_snapshot_dir(&context.layout).join("words.userdb.txt")).unwrap(),
+            b"old device words"
+        );
+        let index: SnapshotIndex =
+            serde_json::from_slice(&state.lock().unwrap().files["/pc01/.index.json"]).unwrap();
+        assert!(index.files.contains_key("words.userdb.txt"));
+    }
+
+    #[test]
+    fn takeover_restoration_keeps_both_local_and_remote_versions() {
+        let state = remote_snapshot(b"remote words");
+        let server = memory_server(state);
+        let (_dir, context) = test_context(&server.url);
+        let own = context.layout.device.join("words.userdb.txt");
+        fs::write(&own, b"local words").unwrap();
+        restore_own_snapshots(&context.dav, &context.layout).unwrap();
+        assert_eq!(fs::read(&own).unwrap(), b"local words");
+        assert_eq!(
+            fs::read(restored_snapshot_dir(&context.layout).join("words.userdb.txt")).unwrap(),
+            b"remote words"
+        );
+    }
+
+    #[test]
+    fn failed_manifest_publication_retries_without_losing_snapshot_entries() {
+        let state = remote_snapshot(b"old words");
+        state.lock().unwrap().reject_manifest = true;
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities.if_match = true;
+        fs::write(context.layout.device.join("words.userdb.txt"), b"new words").unwrap();
+        assert!(
+            push_own_snapshot(
+                &context,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .is_err()
+        );
+        state.lock().unwrap().reject_manifest = false;
+        push_own_snapshot(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+        let state = state.lock().unwrap();
+        let index: SnapshotIndex =
+            serde_json::from_slice(&state.files["/pc01/.index.json"]).unwrap();
+        assert_eq!(
+            index.files["words.userdb.txt"].sha256,
+            hash::sha256_hex(&state.files["/pc01/words.userdb.txt"])
+        );
+    }
+
+    #[test]
+    fn upload_keeps_its_response_etag_and_pulls_a_later_writer() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/a.custom.yaml".into(), b"base-v1".to_vec())]),
+            concurrent_write: true,
+            ..Default::default()
+        }));
+        let server = memory_server(state);
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities.if_match = true;
+        let other = context.layout.others.join("a.custom.yaml");
+        fs::write(&other, b"local-v2").unwrap();
+        let mut index = SyncIndex::default();
+        index.remote.insert(
+            "a.custom.yaml".into(),
+            RemoteMark {
+                etag: Some(format!("\"{}\"", hash::sha256_hex(b"base-v1"))),
+                sha256: Some(hash::sha256_hex(b"base-v1")),
+                ..Default::default()
+            },
+        );
+        push_others(
+            &context,
+            &mut index,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+        assert_eq!(
+            index.remote["a.custom.yaml"].etag,
+            Some(format!("\"{}\"", hash::sha256_hex(b"local-v2")))
+        );
+        pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+        assert_eq!(fs::read(&other).unwrap(), b"remote-v3");
+    }
+
+    #[test]
+    fn move_errors_clean_temporary_objects_and_leftovers_are_ignored() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            fail_move: true,
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities.move_supported = true;
+        fs::write(context.layout.others.join("words.dict.yaml"), b"dictionary").unwrap();
+        let mut index = SyncIndex::default();
+        assert!(
+            push_others(
+                &context,
+                &mut index,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .is_err()
+        );
+        assert!(state.lock().unwrap().files.is_empty());
+        state.lock().unwrap().files.insert(
+            "/Others/words.dict.yaml.tmp-1234abcd".into(),
+            b"leftover".to_vec(),
+        );
+        pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+        assert!(
+            !context
+                .layout
+                .others
+                .join("words.dict.yaml.tmp-1234abcd")
+                .exists()
+        );
+        fs::write(
+            context.layout.others.join("local.txt.tmp-1234abcd"),
+            b"leftover",
+        )
+        .unwrap();
+        assert_eq!(walk_files(&context.layout.others).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_never_rewrites_password_or_session_owner() {
+        let owner = serde_json::to_vec(
+            &serde_json::json!({"id":"pc01","session_token":"test-token","host":"new host"}),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/pc01/owner.json".into(), owner.clone())]),
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, context) = test_context(&server.url);
+        touch_owner(&context, &crate::report::NullReporter).unwrap();
+        assert_eq!(state.lock().unwrap().files["/pc01/owner.json"], owner);
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .all(|request| request.path.contains("/.last-sync-"))
+        );
     }
 }

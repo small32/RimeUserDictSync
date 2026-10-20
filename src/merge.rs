@@ -52,6 +52,24 @@ pub fn merge_text(mode: MergeMode, local: &str, remote: &str) -> Option<String> 
     }
 }
 
+/// 文件路径决定两列文本的语义：OpenCC 用首列作键，自定义短语包含编码列。
+pub fn merge_text_for_path(
+    relative: &str,
+    mode: MergeMode,
+    local: &str,
+    remote: &str,
+) -> Option<String> {
+    if mode == MergeMode::KeyUnion {
+        let opencc = relative
+            .replace('\\', "/")
+            .split('/')
+            .any(|part| part.eq_ignore_ascii_case("opencc"));
+        Some(key_union_with_kind(local, remote, Some(!opencc)))
+    } else {
+        merge_text(mode, local, remote)
+    }
+}
+
 /// `*.dict.yaml` 词条级并集：表头取本地（缺失则取远端），词条按 key 去重取大权重。
 pub fn dict_union(local: &str, remote: &str) -> String {
     let local_lines: Vec<&str> = local.lines().collect();
@@ -71,26 +89,65 @@ pub fn dict_union(local: &str, remote: &str) -> String {
 
     let mut out: Vec<String> = header.iter().map(|line| (*line).to_owned()).collect();
     let mut exact: HashSet<String> = HashSet::new();
-    let mut weighted: HashMap<String, (f64, usize)> = HashMap::new();
-    for line in local_body.iter().chain(remote_body.iter()) {
-        if let Some((key, weight)) = parse_weight(line) {
+    let mut weighted: HashMap<String, (Option<f64>, usize)> = HashMap::new();
+    let local_columns = dict_columns(&local_lines[..local_header.unwrap_or(0)]);
+    let remote_columns = dict_columns(&remote_lines[..remote_header.unwrap_or(0)]);
+    let output_columns = if local_header.is_none() && remote_header.is_some() {
+        &remote_columns
+    } else {
+        &local_columns
+    };
+    for (line, columns) in local_body
+        .iter()
+        .map(|line| (*line, &local_columns))
+        .chain(remote_body.iter().map(|line| (*line, &remote_columns)))
+    {
+        let line = align_dict_row(line, columns, output_columns);
+        if let Some((key, weight)) = parse_dict_row(&line, output_columns) {
             match weighted.get(&key).copied() {
                 Some((old_weight, position)) if weight > old_weight => {
-                    out[position] = (*line).to_owned();
+                    out[position] = line;
                     weighted.insert(key, (weight, position));
                 }
                 Some(_) => {}
                 None => {
                     let position = out.len();
-                    out.push((*line).to_owned());
+                    out.push(line);
                     weighted.insert(key, (weight, position));
                 }
             }
-        } else if exact.insert((*line).to_owned()) {
-            out.push((*line).to_owned());
+        } else if exact.insert(line.clone()) {
+            out.push(line);
         }
     }
     join_lines(out)
+}
+
+/// 两端声明相同字段但顺序不同，输出仍必须遵守所保留表头的列顺序。
+fn align_dict_row(line: &str, source: &[String], target: &[String]) -> String {
+    if source == target
+        || line.trim_start().starts_with('#')
+        || !line.contains('\t')
+        || source.len() != target.len()
+        || !target.iter().all(|name| source.contains(name))
+    {
+        return line.to_owned();
+    }
+    let fields: Vec<_> = line.split('\t').collect();
+    if fields.len() > source.len() {
+        return line.to_owned();
+    }
+    let mut reordered: Vec<_> = target
+        .iter()
+        .map(|name| {
+            let position = source.iter().position(|field| field == name).unwrap();
+            fields.get(position).copied().unwrap_or("")
+        })
+        .collect();
+    while reordered.last() == Some(&"") {
+        reordered.pop();
+    }
+    reordered.join("\t")
 }
 
 /// `*.txt` 按首列 key 并集（自定义短语 / opencc 转换表）。
@@ -99,6 +156,10 @@ pub fn dict_union(local: &str, remote: &str) -> String {
 /// 同一 key 出现两次时：两侧都有可解析的数字权重就取大的，
 /// 否则保留先出现的一条 —— 结果确定，且绝不丢行（同 key 除外）。
 pub fn key_union(local: &str, remote: &str) -> String {
+    key_union_with_kind(local, remote, None)
+}
+
+fn key_union_with_kind(local: &str, remote: &str, phrase: Option<bool>) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut keys: HashMap<String, usize> = HashMap::new();
     let mut seen_plain: HashSet<String> = HashSet::new();
@@ -110,12 +171,27 @@ pub fn key_union(local: &str, remote: &str) -> String {
             }
             continue;
         }
-        let key = dedupe_key(trimmed);
+        let key = match phrase {
+            Some(true) => trimmed
+                .split('\t')
+                .take(2)
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("\t"),
+            Some(false) => trimmed
+                .split('\t')
+                .next()
+                .unwrap_or(trimmed)
+                .trim()
+                .to_owned(),
+            None => dedupe_key(trimmed),
+        };
         match keys.get(&key).copied() {
             Some(position) => {
                 let existing = out[position].clone();
-                if let (Some(new_weight), Some(old_weight)) =
-                    (weight_of(trimmed), weight_of(&existing))
+                if phrase != Some(false)
+                    && let (Some(new_weight), Some(old_weight)) =
+                        (weight_of(trimmed), weight_of(&existing))
                     && new_weight > old_weight
                 {
                     out[position] = trimmed.to_owned();
@@ -167,26 +243,88 @@ pub fn read_utf8(path: &Path) -> Result<String> {
 
 /// 表头 `---` … `...` 的结束位置；没有表头时返回 0。
 fn header_end(lines: &[&str]) -> Option<usize> {
-    if lines.first().map(|line| line.trim()) != Some("---") {
+    let start = lines
+        .iter()
+        .position(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))?;
+    if lines[start].trim() != "---" {
         return None;
     }
     lines
         .iter()
-        .position(|line| line.trim() == "...")
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| line.trim() == "...")
+        .map(|(i, _)| i)
         .map(|i| i + 1)
 }
 
-/// dict 行：`key<TAB>...<TAB>weight`，key 为最后一个 Tab 之前的全部内容。
-fn parse_weight(line: &str) -> Option<(String, f64)> {
-    let (key, number) = line.rsplit_once('\t')?;
-    Some((key.to_owned(), number.trim().parse().ok()?))
+fn dict_columns(header: &[&str]) -> Vec<String> {
+    let Some(start) = header
+        .iter()
+        .position(|line| line.trim_start().starts_with("columns:"))
+    else {
+        return vec!["text".into(), "code".into(), "weight".into()];
+    };
+    let inline = header[start]
+        .trim()
+        .strip_prefix("columns:")
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap()
+        .trim();
+    let names: Vec<&str> = if inline.starts_with('[') && inline.ends_with(']') {
+        inline[1..inline.len() - 1].split(',').collect()
+    } else {
+        header[start + 1..]
+            .iter()
+            .map(|line| line.trim())
+            .take_while(|line| line.starts_with('-'))
+            .map(|line| line[1..].trim())
+            .collect()
+    };
+    names
+        .into_iter()
+        .map(|name| name.trim().trim_matches(['\'', '"']).to_owned())
+        .collect()
+}
+
+fn parse_dict_row(line: &str, columns: &[String]) -> Option<(String, Option<f64>)> {
+    if line.trim_start().starts_with('#') || !line.contains('\t') {
+        return None;
+    }
+    let fields: Vec<&str> = line.split('\t').collect();
+    let weight_column = columns.iter().position(|name| name == "weight");
+    let weight = weight_column
+        .and_then(|i| fields.get(i))
+        .and_then(|number| parse_number(number));
+    let key = fields
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != weight_column)
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>()
+        .join("\t");
+    Some((key, weight))
+}
+
+fn parse_number(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
 }
 
 /// `*.txt` 行的末尾数字权重（没有则 `None`）。
 fn weight_of(line: &str) -> Option<f64> {
+    if line.split('\t').count() < 3 {
+        return None;
+    }
     let mut fields = line.split('\t');
     let last = fields.next_back()?;
-    last.trim().parse().ok()
+    parse_number(last)
 }
 
 #[cfg(test)]
@@ -300,5 +438,66 @@ mod tests {
         assert!(merged.contains("裏\t里"));
         assert!(!merged.contains("裏\t裡"));
         assert!(merged.contains("後\t后"));
+    }
+
+    #[test]
+    fn two_column_phrases_keep_codes_but_opencc_keeps_one_mapping() {
+        let phrase = merge_text_for_path(
+            "custom_phrase.txt",
+            MergeMode::KeyUnion,
+            "有一个\tuig\n",
+            "有一个\tuyig\n",
+        )
+        .unwrap();
+        assert_eq!(phrase.lines().count(), 2);
+        let opencc = merge_text_for_path(
+            "opencc/custom.txt",
+            MergeMode::KeyUnion,
+            "裏\t里\n",
+            "裏\t裡\n",
+        )
+        .unwrap();
+        assert_eq!(opencc, "裏\t里\n");
+    }
+
+    #[test]
+    fn dict_comments_numeric_codes_and_percent_weights_are_preserved() {
+        let header = "# Rime dictionary\n# encoding: utf-8\n\n---\nname: example\n...\n";
+        let merged = dict_union(
+            &format!("{header}甲\t1\n甲\tjia\t10%\n"),
+            &format!("{header}甲\t2\n甲\tjia\t20%\n"),
+        );
+        assert!(merged.starts_with(header));
+        assert!(merged.contains("甲\t1\n"));
+        assert!(merged.contains("甲\t2\n"));
+        assert!(merged.contains("甲\tjia\t20%\n"));
+        assert!(!merged.contains("甲\tjia\t10%\n"));
+        assert_eq!(dict_union(&merged, &merged), merged);
+    }
+
+    #[test]
+    fn dict_weight_column_is_taken_from_declared_columns() {
+        for columns in [
+            "columns: [text, weight, code]",
+            "columns:\n  - text\n  - weight\n  - code",
+        ] {
+            let header = format!("---\nname: example\n{columns}\n...\n");
+            let merged = dict_union(
+                &format!("{header}甲\t10%\tj\n"),
+                &format!("{header}甲\t20%\tj\n"),
+            );
+            assert!(merged.contains("甲\t20%\tj\n"));
+            assert!(!merged.contains("甲\t10%\tj\n"));
+        }
+    }
+
+    #[test]
+    fn dictionary_rows_follow_the_retained_header_when_column_order_differs() {
+        let local = "---\nname: words\ncolumns: [text, code, weight]\n...\n甲\tjia\t10\n";
+        let remote = "---\nname: words\ncolumns: [text, weight, code]\n...\n甲\t20\tjia\n";
+        let merged = dict_union(local, remote);
+        assert!(merged.starts_with("---\nname: words\ncolumns: [text, code, weight]\n...\n"));
+        assert!(merged.ends_with("甲\tjia\t20\n"));
+        assert_eq!(merged.matches("甲\t").count(), 1);
     }
 }

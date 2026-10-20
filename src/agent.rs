@@ -66,6 +66,22 @@ pub fn loaded() -> bool {
     job_loaded(LABEL)
 }
 
+/// UI 已写入 wake 后立即触发定时任务；不终止已经在执行的同步进程。
+pub fn request_round() -> Result<bool> {
+    if !loaded() {
+        return Ok(false);
+    }
+    let service = format!("gui/{}/{LABEL}", uid()?);
+    let output = launchctl(&["kickstart", &service])?;
+    if !output.status.success() {
+        bail!(
+            "请求立即搬运失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
 /// 任务当前是否有进程在跑（菜单栏助手用）。
 fn job_running(label: &str) -> bool {
     let Ok(uid) = uid() else {

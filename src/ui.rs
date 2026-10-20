@@ -17,15 +17,12 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::Duration,
 };
-// macOS 的后台代理状态快照用；其他平台没有这段，导入会变成 unused。
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
 // 服务状态轮询：Windows 查 SCM，macOS 查 launchd 是否加载了代理。
 // 不单独 cfg 会让不含该逻辑的平台报 unused。
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -60,7 +57,10 @@ enum Event {
     Manual(Result<String, String>),
     /// 后台轮次结束。
     Round(Result<String, String>),
-    Tested(Result<String, String>),
+    Tested {
+        result: Result<ConnectionTest, String>,
+        notify: bool,
+    },
     /// 设备设置（抢占 / 接管 / 注销 / 导入）结束。
     Device(Result<String, String>),
     UpdateChecked(Option<UpdateInfo>),
@@ -68,6 +68,36 @@ enum Event {
 
 struct ChannelReporter {
     tx: Sender<Event>,
+}
+
+#[derive(Clone)]
+struct BackgroundPaths {
+    base: PathBuf,
+    ini: PathBuf,
+}
+
+#[derive(Clone)]
+struct ConnectionTest {
+    url: String,
+    username: String,
+    password: String,
+    capabilities: webdav::Capabilities,
+}
+
+impl ConnectionTest {
+    fn matches(&self, settings: &Settings) -> bool {
+        self.url == settings.webdav_url.trim()
+            && self.username == settings.username.trim()
+            && self.password == settings.password
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "服务端能力：{}\n上传校验档位：{}",
+            self.capabilities.describe(),
+            self.capabilities.tier().label()
+        )
+    }
 }
 
 impl Reporter for ChannelReporter {
@@ -172,10 +202,12 @@ fn set_fonts(ctx: &egui::Context) {
 struct App {
     base: PathBuf,
     ini: PathBuf,
+    background_paths: Arc<Mutex<BackgroundPaths>>,
     log_path: PathBuf,
     settings: Settings,
     context: Option<Context>,
     context_error: Option<String>,
+    context_checked_at: std::time::Instant,
     logs: String,
     /// 已经显示过的日志字节数；界面靠它增量读取 `RimeSync.log`。
     ///
@@ -215,6 +247,9 @@ struct App {
     dav_password: String,
     dav_password_visible: bool,
     capability_text: String,
+    tested_connection: Option<ConnectionTest>,
+    capabilities_dirty: bool,
+    capability_retry_at: std::time::Instant,
 
     device_id_draft: String,
     device_password_draft: String,
@@ -288,9 +323,12 @@ impl App {
         check_for_update(tx.clone());
         let busy_flag = Arc::new(AtomicBool::new(false));
         let service_running = Arc::new(AtomicBool::new(false));
+        let background_paths = Arc::new(Mutex::new(BackgroundPaths {
+            base: base.clone(),
+            ini: ini.clone(),
+        }));
         spawn_background(
-            base.clone(),
-            ini.clone(),
+            background_paths.clone(),
             tx.clone(),
             busy_flag.clone(),
             service_running.clone(),
@@ -301,6 +339,7 @@ impl App {
         let mut app = Self {
             base,
             ini,
+            background_paths,
             log_path,
             dav_url: settings.webdav_url.clone(),
             dav_username: settings.username.clone(),
@@ -308,6 +347,7 @@ impl App {
             settings,
             context: None,
             context_error: None,
+            context_checked_at: std::time::Instant::now(),
             log_offset: logs.len() as u64,
             logs,
             progress: 0,
@@ -333,6 +373,9 @@ impl App {
             config_dir_draft: String::new(),
             dav_password_visible: false,
             capability_text: String::new(),
+            tested_connection: None,
+            capabilities_dirty: false,
+            capability_retry_at: std::time::Instant::now(),
             device_id_draft: String::new(),
             device_password_draft: String::new(),
             device_password_confirm: String::new(),
@@ -392,6 +435,7 @@ impl App {
 
     /// 重新构建同步上下文（保存 WebDAV / 设备设置后调用）。
     fn refresh_context(&mut self) {
+        self.context_checked_at = std::time::Instant::now();
         match build_context(&self.base, &self.ini) {
             Ok(context) => {
                 let notices = context.notices().to_vec();
@@ -403,6 +447,9 @@ impl App {
                 }
             }
             Err(error) => {
+                if self.context.is_some() && is_sync_busy(&error) {
+                    return;
+                }
                 self.context = None;
                 self.context_error = Some(error.to_string());
             }
@@ -505,14 +552,29 @@ impl App {
                         "后台搬运未完成: {error}"
                     ))),
                 },
-                Event::Tested(result) => {
+                Event::Tested { result, notify } => {
                     self.set_busy(false);
                     match result {
-                        Ok(text) => {
+                        Ok(test) => {
+                            let text = test.description();
                             self.capability_text = text.clone();
-                            self.notice = Some(format!("连接测试通过（含写入测试）。\n{text}"));
+                            self.capabilities_dirty = test.matches(&self.settings);
+                            self.tested_connection = Some(test);
+                            if let Err(error) = self.apply_tested_capabilities()
+                                && !is_sync_busy(&error)
+                            {
+                                self.append(&crate::report::timestamped(&format!(
+                                    "服务端能力暂未保存，将在后台重试：{error}"
+                                )));
+                            }
+                            if notify {
+                                self.notice = Some(format!("连接测试通过（含写入测试）。\n{text}"));
+                            }
                         }
-                        Err(error) => self.notice = Some(format!("测试失败：{error}")),
+                        Err(error) if notify => self.notice = Some(format!("测试失败：{error}")),
+                        Err(error) => self.append(&crate::report::timestamped(&format!(
+                            "服务端能力探测失败：{error}"
+                        ))),
                     }
                 }
                 Event::Device(result) => {
@@ -526,7 +588,41 @@ impl App {
                 Event::UpdateChecked(update) => self.available_update = update,
             }
         }
+        if self.context.is_none()
+            && self
+                .context_error
+                .as_deref()
+                .is_some_and(|error| error.contains("另一个同步实例"))
+            && self.context_checked_at.elapsed() >= Duration::from_secs(2)
+        {
+            self.refresh_context();
+        }
+        if self.capabilities_dirty && self.capability_retry_at.elapsed() >= Duration::from_secs(2) {
+            let _ = self.apply_tested_capabilities();
+        }
         self.refresh_service_state();
+    }
+
+    fn apply_tested_capabilities(&mut self) -> Result<()> {
+        self.capability_retry_at = std::time::Instant::now();
+        if !self.capabilities_dirty {
+            return Ok(());
+        }
+        let Some(test) = self
+            .tested_connection
+            .as_ref()
+            .filter(|test| test.matches(&self.settings))
+        else {
+            self.capabilities_dirty = false;
+            return Ok(());
+        };
+        if cache_capabilities(&self.settings, test.capabilities)? {
+            if let Some(context) = &mut self.context {
+                context.device.capabilities = test.capabilities;
+            }
+            self.capabilities_dirty = false;
+        }
+        Ok(())
     }
 
     /// 每 5 秒问一次 SCM：服务装没装、跑没跑。
@@ -577,10 +673,26 @@ impl App {
 
     /// 请后台服务立刻跑一轮；没装服务时由内建线程消费，效果一样。
     fn request_background_round(&self) {
-        if let Some(context) = &self.context
-            && let Err(error) = daemon::request_wake(&context.layout.meta)
-        {
-            let _ = error;
+        let Some(meta) = daemon::meta_dir_for_settings(&self.settings) else {
+            return;
+        };
+        if let Err(error) = daemon::request_wake(&meta) {
+            daemon::append_log(
+                &self.log_path,
+                &crate::report::timestamped(&error.to_string()),
+            );
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = crate::agent::request_round() {
+                        let _ = tx.send(Event::Log(crate::report::timestamped(&format!(
+                            "唤醒后台代理失败：{error}"
+                        ))));
+                    }
+                });
+            }
         }
     }
 
@@ -589,6 +701,15 @@ impl App {
     fn run_service_action(&mut self, uninstall: bool) {
         if self.busy {
             return;
+        }
+        if !uninstall {
+            if let Err(error) = crate::service::prepare_settings_for_service(&self.base) {
+                self.notice = Some(error.to_string());
+                return;
+            }
+            if let Ok(settings) = Settings::load(&self.ini) {
+                self.settings = settings;
+            }
         }
         let mut arguments = vec![if uninstall {
             "--uninstall-service".to_owned()
@@ -717,6 +838,10 @@ impl App {
     }
 
     fn test_webdav(&mut self) {
+        self.probe_webdav(true);
+    }
+
+    fn probe_webdav(&mut self, notify: bool) {
         if self.busy {
             return;
         }
@@ -726,18 +851,21 @@ impl App {
         let password = self.dav_password.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = (|| -> Result<String> {
+            let result = (|| -> Result<ConnectionTest> {
                 let dav = webdav::WebDav::new(&url, &username, &password)?;
-                dav.test_write()?;
+                if notify {
+                    dav.test_write()?;
+                }
                 let capabilities = dav.probe_capabilities();
-                Ok(format!(
-                    "服务端能力：{}\n上传校验档位：{}",
-                    capabilities.describe(),
-                    capabilities.tier().label()
-                ))
+                Ok(ConnectionTest {
+                    url,
+                    username,
+                    password,
+                    capabilities,
+                })
             })()
             .map_err(|error: anyhow::Error| error.to_string());
-            let _ = tx.send(Event::Tested(result));
+            let _ = tx.send(Event::Tested { result, notify });
         });
     }
 
@@ -745,13 +873,46 @@ impl App {
         if self.config_broken {
             bail!("{CONFIG_BROKEN_NOTICE}");
         }
-        self.settings.webdav_url = self.dav_url.trim().to_owned();
-        self.settings.username = self.dav_username.trim().to_owned();
-        self.settings.password = self.dav_password.clone();
-        self.settings.save(&self.ini)?;
+        let mut settings = self.settings.clone();
+        settings.webdav_url = self.dav_url.trim().to_owned();
+        settings.username = self.dav_username.trim().to_owned();
+        settings.password = self.dav_password.clone();
+        let changed = settings.webdav_url != self.settings.webdav_url
+            || settings.username != self.settings.username
+            || settings.password != self.settings.password;
+        if changed {
+            // 不能把上一个地址或账号的能力套到新连接上。
+            cache_capabilities(&settings, webdav::Capabilities::default())?;
+        }
+        settings.save(&self.ini)?;
+        self.settings = settings;
+        self.update_background_paths()?;
+        self.capabilities_dirty = self
+            .tested_connection
+            .as_ref()
+            .is_some_and(|test| test.matches(&self.settings));
+        let _ = self.apply_tested_capabilities();
         self.append(&crate::report::timestamped("已保存 WebDAV 设置。"));
         self.refresh_context();
         self.request_background_round();
+        if changed
+            && !self
+                .tested_connection
+                .as_ref()
+                .is_some_and(|test| test.matches(&self.settings))
+        {
+            self.probe_webdav(false);
+        }
+        Ok(())
+    }
+
+    fn update_background_paths(&self) -> Result<()> {
+        let mut paths = self
+            .background_paths
+            .lock()
+            .map_err(|_| anyhow::anyhow!("后台配置路径锁不可用"))?;
+        paths.base = self.base.clone();
+        paths.ini = self.ini.clone();
         Ok(())
     }
 
@@ -793,6 +954,11 @@ impl App {
             ));
         }
         self.refresh_context();
+        self.capabilities_dirty = self
+            .tested_connection
+            .as_ref()
+            .is_some_and(|test| test.matches(&self.settings));
+        let _ = self.apply_tested_capabilities();
     }
 
     fn open_sync_files(&mut self) {
@@ -843,6 +1009,7 @@ impl App {
 
     fn save_sync_files(&mut self) -> Result<()> {
         let context = self.context.as_ref().context("请先完成设备设置")?;
+        let _lock = crate::state::LocalLock::acquire(&context.layout.lock_file())?;
         let mut list = context.load_list()?;
         let removed: Vec<String> = list
             .files
@@ -911,11 +1078,18 @@ impl App {
         }
         let ini = target.join("RimeUserDictSync.ini");
         self.settings.save(&ini)?;
+        if crate::agent::installed() {
+            crate::agent::install(&target, self.settings.background_minutes)?;
+        }
         config::set_app_dir(&target)?;
         self.base = target.clone();
         self.ini = ini;
         self.log_path = target.join("RimeSync.log");
         self.config_dir_draft = target.to_string_lossy().into_owned();
+        self.log_offset = 0;
+        self.update_background_paths()?;
+        self.refresh_context();
+        self.request_background_round();
         Ok(())
     }
 }
@@ -1222,7 +1396,10 @@ impl App {
                     {
                         self.test_webdav();
                     }
-                    if ui.button("保存").clicked() {
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("保存"))
+                        .clicked()
+                    {
                         if let Err(error) = self.save_webdav() {
                             self.notice = Some(error.to_string());
                         } else {
@@ -1580,8 +1757,7 @@ impl App {
 /// 与服务的调度完全同构：每 [`daemon::TICK`] 醒一次，判断 `DueAt` 是否到期，
 /// 并消费 `.rime-sync/wake` 以响应「立刻搬运一轮」。装了服务就让位。
 fn spawn_background(
-    base: PathBuf,
-    ini: PathBuf,
+    paths: Arc<Mutex<BackgroundPaths>>,
     tx: Sender<Event>,
     busy: Arc<AtomicBool>,
     service_running: Arc<AtomicBool>,
@@ -1591,6 +1767,10 @@ fn spawn_background(
         let mut last_error = String::new();
         loop {
             std::thread::sleep(daemon::TICK);
+            let Ok(current) = paths.lock().map(|paths| paths.clone()) else {
+                continue;
+            };
+            let BackgroundPaths { base, ini } = current;
             let settings = match Settings::load(&ini) {
                 Ok(settings) => settings,
                 Err(_) => continue,
@@ -1639,6 +1819,30 @@ fn build_context(base: &Path, ini: &Path) -> Result<Context> {
     Context::build(base, ini, &mut settings)
 }
 
+fn is_sync_busy(error: &anyhow::Error) -> bool {
+    error.to_string().contains("另一个同步实例")
+}
+
+/// 能力缓存与身份文件共用本地锁，更新时保留设备令牌、密码等身份字段。
+fn cache_capabilities(settings: &Settings, capabilities: webdav::Capabilities) -> Result<bool> {
+    let rime = context::resolve_rime_dir(settings);
+    if !rime.join("installation.yaml").is_file() {
+        return Ok(false);
+    }
+    let meta = rime.join(paths::META_DIR_NAME);
+    let _lock = crate::state::LocalLock::acquire(&meta.join(paths::LOCK_FILE))?;
+    let path = meta.join(paths::DEVICE_FILE);
+    let mut device = if path.is_file() {
+        DeviceFile::load(&path)?
+    } else {
+        DeviceFile::default()
+    };
+    device.capabilities = capabilities;
+    device.capabilities_key = context::capabilities_key(settings);
+    device.save(&path)?;
+    Ok(true)
+}
+
 /// 设备设置的全部网络动作都在后台线程执行。
 fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
     let mut settings = Settings::load(ini)?;
@@ -1650,6 +1854,12 @@ fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
     if !installation.is_file() {
         bail!("请先点击「指定 RIME 用户词库」选择包含 installation.yaml 的目录。");
     }
+    let _lock = crate::state::LocalLock::acquire(
+        &rime_dir.join(paths::META_DIR_NAME).join(paths::LOCK_FILE),
+    )?;
+    if let DeviceAction::Claim { id, .. } | DeviceAction::TakeoverForced { id, .. } = &action {
+        paths::validate_installation_id(id)?;
+    }
     let dav = webdav::WebDav::new(
         settings.webdav_url.trim(),
         settings.username.trim(),
@@ -1657,7 +1867,14 @@ fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
     )?;
     let snapshot_dir = rime_dir.join(paths::SYNC_DIR_NAME);
     let mut device = load_device_file(&rime_dir).unwrap_or_default();
-    let seed = DeviceSeed::from_device(&device, snapshot_dir.to_string_lossy().into_owned());
+    let mut seed = DeviceSeed::from_device(&device, snapshot_dir.to_string_lossy().into_owned());
+    if matches!(
+        &action,
+        DeviceAction::Claim { .. } | DeviceAction::TakeoverForced { .. }
+    ) {
+        seed.capabilities = dav.probe_capabilities();
+        seed.capabilities_key = context::capabilities_key(&settings);
+    }
 
     match action {
         DeviceAction::Claim {
@@ -1728,6 +1945,7 @@ fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
             if !confirm {
                 bail!("强制接管会让该 ID 的旧设备立即停止同步，请先勾选确认框。");
             }
+            device::validate_remote_id(&dav, &id)?;
             let owner = identity::Owner::load(&dav, &id)?.unwrap_or_default();
             let layout = Layout::new(&rime_dir, &id);
             layout.ensure_dirs()?;
@@ -1778,6 +1996,10 @@ fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
             // 不要先删 device.json：它与 ID 无关（固定为 .rime-sync/device.json），
             // persist 随后会整体覆盖；一旦 import 校验失败，反而会把旧设备身份也一起弄丢。
             let notices = device::import(&exported, &mut device, &mut settings, &layout)?;
+            if let Some(imported_dav) = build_webdav(&settings)? {
+                device.capabilities = imported_dav.probe_capabilities();
+                device.capabilities_key = context::capabilities_key(&settings);
+            }
             persist(&rime_dir, &mut settings, ini, &device)?;
             Ok(format!(
                 "{}\n导入后请直接点「同步词库」，ID 与 token 一致，无需接管。",
@@ -1809,6 +2031,8 @@ fn persist(
         let _ = notice;
     }
     settings.legacy_sync_files.clear();
+    // 固定当前用户解析出的路径，后台服务不能再依赖 SYSTEM 的默认目录。
+    settings.user_data_dir = rime_dir.to_string_lossy().into_owned();
     settings.save(ini)?;
     Ok(())
 }
@@ -1917,5 +2141,98 @@ mod tests {
         assert!(text.contains("mac"));
         assert!(text.contains("密码状态：未设置（老版本创建或手工建目录）"));
         assert!(device::minutes_since_last_sync(&owner).unwrap() <= 1);
+    }
+
+    #[test]
+    fn capability_cache_preserves_identity_and_waits_for_the_sync_lock() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("installation.yaml"),
+            "installation_id: pc01\n",
+        )
+        .unwrap();
+        let layout = Layout::new(root.path(), "pc01");
+        let device = DeviceFile {
+            installation_id: "pc01".into(),
+            session_token: "keep-this-token".into(),
+            password: "keep-this-password-hash".into(),
+            ..Default::default()
+        };
+        device.save(&layout.device_file()).unwrap();
+        let settings = Settings {
+            user_data_dir: root.path().to_string_lossy().into_owned(),
+            webdav_url: "https://example.invalid/".into(),
+            username: "user".into(),
+            ..Default::default()
+        };
+        let caps = webdav::Capabilities {
+            if_match: true,
+            etag: true,
+            ..Default::default()
+        };
+        let lock = crate::state::LocalLock::acquire(&layout.lock_file()).unwrap();
+        assert!(cache_capabilities(&settings, caps).is_err());
+        assert!(
+            !DeviceFile::load(&layout.device_file())
+                .unwrap()
+                .capabilities
+                .if_match
+        );
+        drop(lock);
+        assert!(cache_capabilities(&settings, caps).unwrap());
+        let saved = DeviceFile::load(&layout.device_file()).unwrap();
+        assert_eq!(saved.capabilities, caps);
+        assert_eq!(saved.session_token, device.session_token);
+        assert_eq!(saved.password, device.password);
+        assert_eq!(saved.capabilities_key, context::capabilities_key(&settings));
+        let ini = root.path().join("RimeUserDictSync.ini");
+        settings.save(&ini).unwrap();
+        let mut settings = settings;
+        let context = Context::build(root.path(), &ini, &mut settings).unwrap();
+        assert_eq!(context.device.capabilities, caps);
+    }
+
+    #[test]
+    fn device_actions_cannot_run_during_a_background_round() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("installation.yaml"),
+            "installation_id: pc01\n",
+        )
+        .unwrap();
+        let settings = Settings {
+            user_data_dir: root.path().to_string_lossy().into_owned(),
+            webdav_url: "http://127.0.0.1:1/".into(),
+            username: "user".into(),
+            ..Default::default()
+        };
+        let ini = root.path().join("RimeUserDictSync.ini");
+        settings.save(&ini).unwrap();
+        let layout = Layout::new(root.path(), "pc01");
+        let _lock = crate::state::LocalLock::acquire(&layout.lock_file()).unwrap();
+        let error = run_device_action(&ini, DeviceAction::Export).unwrap_err();
+        assert!(is_sync_busy(&error), "{error:#}");
+    }
+
+    #[test]
+    fn capability_results_only_apply_to_the_tested_connection() {
+        let mut settings = Settings {
+            webdav_url: "https://example.test/dav/".into(),
+            username: "user".into(),
+            password: "first-password".into(),
+            ..Default::default()
+        };
+        let test = ConnectionTest {
+            url: settings.webdav_url.clone(),
+            username: settings.username.clone(),
+            password: settings.password.clone(),
+            capabilities: webdav::Capabilities::default(),
+        };
+        assert!(test.matches(&settings));
+        settings.password = "another-password".into();
+        assert!(!test.matches(&settings));
+        settings.password = test.password.clone();
+        settings.webdav_url = "https://another.test/".into();
+        assert!(!test.matches(&settings));
     }
 }

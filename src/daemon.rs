@@ -80,11 +80,13 @@ pub fn run_once(
     ))
 }
 
-/// 无界面地把「同步词库」完整跑一遍，这就是桌面快捷方式做的事。
+/// 无界面地把「同步词库」完整跑一遍：搬运 + 并集合并写回 + RIME `/sync` + `/deploy`。
 ///
 /// 它包含 RIME 自带的用户资料同步（`/sync`）与重新部署（`/deploy`），
-/// 但在那之前必须先做一遍并集与写回：否则 `Sync/Others/` 里的"其他同步文件"
+/// 在那之前还会做一遍并集与写回：否则 `Sync/Others/` 里的"其他同步文件"
 /// 根本不会出现在 RIME 用户目录里，`/deploy` 也就无从生效。
+///
+/// 桌面快捷方式**不用**它 —— 快捷方式只补齐服务做不到的两步，见 [`rime_sync`]。
 pub fn sync_now(
     app_dir: &Path,
     ini: &Path,
@@ -109,6 +111,25 @@ pub fn sync_now(
         ));
     }
     Ok(message)
+}
+
+/// 只补齐后台服务做不到的两步：RIME 自带的用户资料同步与重新部署。
+///
+/// 桌面快捷方式用的就是它 —— 与 macOS 菜单栏图标同一策略。文件拉取与上传由后台
+/// 服务（[`run_once`]）完成，文本配置合并写回仍需完整同步，快捷方式不等待网络。
+pub fn rime_sync(
+    app_dir: &Path,
+    ini: &Path,
+    cancel: &AtomicBool,
+    reporter: &dyn Reporter,
+) -> Result<String> {
+    let mut settings = Settings::load(ini)?;
+    let context = Context::build(app_dir, ini, &mut settings)?;
+    for notice in context.notices() {
+        reporter.log(notice);
+    }
+    crate::engine::rime_sync_and_deploy(&context, cancel, reporter)?;
+    Ok("RIME 用户资料同步完成，并已重新部署。".to_owned())
 }
 
 /// 写日志文件的 [`Reporter`]：无界面模式（服务）使用，日志与 GUI 共用同一个 `RimeSync.log`。
@@ -167,12 +188,10 @@ pub fn take_wake(meta_dir: &Path) -> bool {
     }
 }
 
-/// 从设置推出 `.rime-sync` 目录；用户目录还没配置时返回 `None`。
+/// 与同步上下文使用相同的目录解析规则，包括平台默认目录。
 pub fn meta_dir_for_settings(settings: &Settings) -> Option<PathBuf> {
-    if settings.user_data_dir.trim().is_empty() {
-        return None;
-    }
-    Some(crate::context::resolve_rime_dir(settings).join(paths::META_DIR_NAME))
+    let rime = crate::context::resolve_rime_dir(settings);
+    (!rime.as_os_str().is_empty()).then(|| rime.join(paths::META_DIR_NAME))
 }
 
 /// 消费设置对应的唤醒请求（服务每轮 tick 调用它）。
@@ -217,5 +236,14 @@ mod tests {
         request_wake(&meta).unwrap();
         assert!(take_wake(&meta));
         assert!(!take_wake(&meta));
+    }
+
+    #[test]
+    fn default_user_directory_has_the_same_wake_location_as_sync() {
+        let settings = Settings::default();
+        assert_eq!(
+            meta_dir_for_settings(&settings),
+            Some(crate::context::resolve_rime_dir(&settings).join(paths::META_DIR_NAME))
+        );
     }
 }

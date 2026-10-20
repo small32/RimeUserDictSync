@@ -40,7 +40,9 @@ RIME 用户词库同步工具
 不带参数启动图形界面；带参数时进入无界面模式（结果写入配置目录下的 RimeSync.log）：
 
   --sync-now             执行一次完整「同步词库」：拉取 → 并集 → 写回 → 上传
-                         → RIME /sync → /deploy（桌面快捷方式用的就是它）
+                         → RIME /sync → /deploy
+  --rime-sync            只做 RIME 自带的用户资料同步 + 重新部署
+                         （桌面快捷方式用的就是它；文件搬运由后台服务负责）
   --round                只执行一轮后台搬运后退出（不合并、不部署）
   --scheduled-round      供 macOS 后台代理调用：后台搬运关闭时跳过，否则跑一轮
   --install-service      安装并启动 Windows 后台服务（需要管理员权限）
@@ -75,6 +77,7 @@ fn main() {
 
 enum Command {
     SyncNow,
+    RimeSync,
     Round,
     ScheduledRound,
     InstallService,
@@ -102,6 +105,7 @@ fn parse(arguments: &[String]) -> Result<Options> {
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--sync-now" => command = Some(Command::SyncNow),
+            "--rime-sync" => command = Some(Command::RimeSync),
             "--round" => command = Some(Command::Round),
             "--scheduled-round" => command = Some(Command::ScheduledRound),
             "--install-service" => command = Some(Command::InstallService),
@@ -181,15 +185,21 @@ fn dispatch(command: Command, app_dir: &Path) -> Result<String> {
             let cancel = AtomicBool::new(false);
             daemon::sync_now(app_dir, &ini, &cancel, &reporter)
         }
+        Command::RimeSync => {
+            let reporter = daemon::FileReporter::new(app_dir);
+            let cancel = AtomicBool::new(false);
+            daemon::rime_sync(app_dir, &ini, &cancel, &reporter)
+        }
         Command::Round => {
             let reporter = daemon::FileReporter::new(app_dir);
             let cancel = AtomicBool::new(false);
             daemon::run_once(app_dir, &ini, &cancel, &reporter)
         }
-        // launchd 定时触发。关掉「后台搬运」开关后直接跳过，不产生网络请求与日志。
+        // 周期触发尊重开关；显式 wake 请求即使关闭后台活动也执行一次。
         Command::ScheduledRound => {
             let settings = config::Settings::load(&ini)?;
-            if !settings.background_enabled {
+            let wake = daemon::take_wake_for_settings(&settings);
+            if !settings.background_enabled && !wake {
                 return Ok(String::new());
             }
             let reporter = daemon::FileReporter::new(app_dir);

@@ -28,6 +28,7 @@
 @property(nonatomic, strong) dispatch_source_t sigtermSource;
 @property(nonatomic, copy) NSString *appDir;
 @property(nonatomic) BOOL syncing;
+@property(nonatomic, strong) NSTask *activeTask;
 @end
 
 @implementation MenuBarAgent
@@ -85,6 +86,11 @@
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+  @synchronized(self) {
+    if (self.activeTask.isRunning) {
+      kill(self.activeTask.processIdentifier, SIGKILL);
+    }
+  }
   if (self.statusItem != nil) {
     [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem];
     self.statusItem = nil;
@@ -159,8 +165,20 @@
 }
 
 - (void)menuOpenApp {
-  NSURL *url = [NSURL fileURLWithPath:@"/Applications/RimeUserDictSync.app"];
-  [[NSWorkspace sharedWorkspace] openURL:url];
+  NSURL *url = [NSURL fileURLWithPath:NSProcessInfo.processInfo.arguments[0]];
+  url = [url URLByResolvingSymlinksInPath];
+  while (url.path.length > 1) {
+    if ([url.pathExtension isEqualToString:@"app"] &&
+        [[[NSBundle bundleWithURL:url] bundleIdentifier]
+            isEqualToString:@"com.small32.rime-user-dict-sync"]) {
+      if (![[NSWorkspace sharedWorkspace] openURL:url]) {
+        [self showError:[NSString stringWithFormat:@"打开主程序失败：\n%@", url.path]];
+      }
+      return;
+    }
+    url = [url URLByDeletingLastPathComponent];
+  }
+  [self showError:@"找不到菜单栏助手所属的主应用，请重新安装完整的 RimeUserDictSync.app。"];
 }
 
 - (void)menuQuit {
@@ -184,13 +202,21 @@
   [self updateProgress:@"正在同步用户数据…" value:0.1];
 
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-    [self run:executable arguments:@[ @"--sync" ]];
+    NSString *failure = nil;
+    if (![self run:executable arguments:@[ @"--sync" ] error:&failure]) {
+      dispatch_async(dispatch_get_main_queue(), ^{ [self finishSyncWithError:failure]; });
+      return;
+    }
     // 命令行只是投递通知，给用户一个能看清的阶段反馈，再进入下一步。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                      [self updateProgress:@"正在重新部署…" value:0.55];
                      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                       [self run:executable arguments:@[ @"--reload" ]];
+                       NSString *failure = nil;
+                       if (![self run:executable arguments:@[ @"--reload" ] error:&failure]) {
+                         dispatch_async(dispatch_get_main_queue(), ^{ [self finishSyncWithError:failure]; });
+                         return;
+                       }
                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
                                       dispatch_get_main_queue(), ^{
                                         [self updateProgress:@"已触发同步与部署" value:1.0];
@@ -206,6 +232,13 @@
                      });
                    });
   });
+}
+
+- (void)finishSyncWithError:(NSString *)message {
+  [self hideProgressPopover];
+  self.syncing = NO;
+  self.statusItem.button.appearsDisabled = NO;
+  [self showError:message ?: @"RIME 命令执行失败。"];
 }
 
 #pragma mark - 进度浮层
@@ -262,7 +295,7 @@
   [self.progressPopover performClose:nil];
 }
 
-- (BOOL)run:(NSString *)path arguments:(NSArray<NSString *> *)arguments {
+- (BOOL)run:(NSString *)path arguments:(NSArray<NSString *> *)arguments error:(NSString **)failure {
   NSTask *task = [[NSTask alloc] init];
   task.executableURL = [NSURL fileURLWithPath:path];
   task.arguments = arguments;
@@ -270,10 +303,36 @@
   task.standardError = [NSFileHandle fileHandleWithNullDevice];
   NSError *error = nil;
   if (![task launchAndReturnError:&error]) {
+    *failure = [NSString stringWithFormat:@"无法启动鼠须管：\n%@", error.localizedDescription];
     return NO;
   }
+  @synchronized(self) {
+    self.activeTask = task;
+  }
+  NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+  BOOL timedOut = NO;
+  while (task.isRunning) {
+    if (NSProcessInfo.processInfo.systemUptime - started >= 300.0) {
+      timedOut = YES;
+      kill(task.processIdentifier, SIGKILL);
+      break;
+    }
+    [NSThread sleepForTimeInterval:0.1];
+  }
   [task waitUntilExit];
-  return task.terminationStatus == 0;
+  @synchronized(self) {
+    self.activeTask = nil;
+  }
+  if (timedOut) {
+    *failure = @"RIME 命令超过 300 秒仍未结束，已终止；可以重新尝试同步。";
+    return NO;
+  }
+  if (task.terminationStatus != 0) {
+    *failure = [NSString stringWithFormat:@"RIME %@ 执行失败，退出码 %d。",
+               [arguments componentsJoinedByString:@" "], task.terminationStatus];
+    return NO;
+  }
+  return YES;
 }
 
 - (void)showError:(NSString *)message {

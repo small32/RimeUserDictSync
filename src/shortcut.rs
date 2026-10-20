@@ -1,11 +1,15 @@
 //! 快捷方式「同步词库」。
 //!
-//! 后台服务只搬运文件，`/sync` 与 `/deploy` 必须在用户登录会话里执行，
-//! 所以需要一个入口让用户"点一下就让远端内容生效"。
+//! 后台服务（session 0）只搬运文件，`/sync` 与 `/deploy` 必须在用户登录会话里执行，
+//! 所以需要一个入口让用户"点一下就让词库生效"。
+//!
+//! **只做两步**：RIME 自带的用户资料同步 + 重新部署 —— 与 macOS 菜单栏图标
+//! （`Squirrel --sync` → `--reload`）完全同一策略。文件拉取与上传由后台服务完成，
+//! 文本文件的合并写回仍由 GUI 完整同步负责，双击不必再等一次网络。
 //!
 //! 快捷方式就创建在**程序所在目录**（不往桌面塞东西），需要的话自己拖到
 //! 桌面、开始菜单或任务栏。
-//! 它指向 `RimeUserDictSync.exe --sync-now --notify --app-dir <配置目录>`。
+//! 它指向 `RimeUserDictSync.exe --rime-sync --notify --app-dir <配置目录>`。
 
 use anyhow::{Context as _, Result};
 use std::{
@@ -86,9 +90,9 @@ pub fn install(app_dir: &Path) -> Result<String> {
     let _ = fs::remove_file(app_dir.join(LEGACY_ICON_FILE));
     let mut link = mslnk::ShellLink::new(&exe).context("构造快捷方式失败")?;
     link.set_name(Some(SHORTCUT_TITLE.to_owned()));
-    // 快捷方式自己处理搬运与合并，最后才调用 RIME 的 /sync 与 /deploy。
+    // 只补齐服务做不到的两步：RIME /sync + /deploy。文本合并仍由 GUI 完整同步负责。
     link.set_arguments(Some(format!(
-        "--sync-now --notify --app-dir {}",
+        "--rime-sync --notify --app-dir {}",
         crate::platform::quote_windows_argument(&app_dir.to_string_lossy())
     )));
     if let Some(parent) = exe.parent() {
@@ -107,7 +111,7 @@ pub fn install(app_dir: &Path) -> Result<String> {
     })?;
     write_icon_index(&target, ICON_INDEX)?;
     Ok(format!(
-        "已创建快捷方式：{}\n图标取自 {} 内嵌的齿轮资源（资源 ID {}），EXE 自己的图标不受影响，目录里也不需要额外的 .ico 文件。\n双击它会执行：拉取远端 → 并集合并 → 写回本地 → 上传 → RIME /sync → /deploy。",
+        "已创建快捷方式：{}\n图标取自 {} 内嵌的齿轮资源（资源 ID {}），EXE 自己的图标不受影响，目录里也不需要额外的 .ico 文件。\n双击它会执行：RIME 用户资料同步（/sync）→ 重新部署（/deploy）。文本配置的合并写回请使用 GUI「同步词库」。",
         target.display(),
         exe.display(),
         ICON_RESOURCE_ID
@@ -163,7 +167,7 @@ mod tests {
         assert!(flags & 0x40 != 0, "HasIconLocation 位没置上");
 
         // StringData 里只该有路径，没有 ",索引" 尾巴
-        let stored = stored_icon_location(&bytes, flags);
+        let stored = stored_string_data(&bytes, flags, 0x40).expect("缺 ICON_LOCATION 字段");
         assert_eq!(stored, exe.to_string_lossy(), "IconLocation 不是裸路径");
         assert!(!stored.contains(','), "IconLocation 里混进了逗号/索引");
 
@@ -177,8 +181,11 @@ mod tests {
         assert_eq!(index, -101, "头部 IconIndex 没写对");
     }
 
-    /// 按 MS-SHLLINK 的结构把 ICON_LOCATION 取出来，用于断言真实字节。
-    fn stored_icon_location(bytes: &[u8], flags: u32) -> String {
+    /// 按 MS-SHLLINK 的结构取出 `StringData` 里指定标志位对应的字符串。
+    ///
+    /// 字段顺序固定（NAME → RELATIVE_PATH → WORKING_DIR → ARGUMENTS → ICON_LOCATION），
+    /// 但只有标志位为 1 的才出现，所以要按这个顺序逐个跳过，才能定位到目标字段。
+    fn stored_string_data(bytes: &[u8], flags: u32, mask: u32) -> Option<String> {
         let mut position = 0x4c;
         if flags & 0x1 != 0 {
             let size = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
@@ -194,20 +201,19 @@ mod tests {
             position += size;
         }
         let unicode = flags & 0x80 != 0;
-        // StringData 按这个固定顺序出现，只处理实际置位的那些。
-        for mask in [0x4u32, 0x8, 0x10, 0x20, 0x40] {
-            if flags & mask == 0 {
+        for current in [0x4u32, 0x8, 0x10, 0x20, 0x40] {
+            if flags & current == 0 {
                 continue;
             }
             let count = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
             position += 2;
             let length = if unicode { count * 2 } else { count };
-            if mask == 0x40 {
-                return decode_string(bytes, position, length, unicode);
+            if current == mask {
+                return Some(decode_string(bytes, position, length, unicode));
             }
             position += length;
         }
-        panic!("这个 .lnk 里没有 ICON_LOCATION 字段");
+        None
     }
 
     fn decode_string(bytes: &[u8], position: usize, length: usize, unicode: bool) -> String {
@@ -222,6 +228,30 @@ mod tests {
             index += 2;
         }
         String::from_utf16_lossy(&units)
+    }
+
+    /// 快捷方式只请求 RIME `/sync` + `/deploy`，不再自己搬文件。
+    ///
+    /// 后台服务负责拉取与上传；文本配置的合并写回仍由 GUI 完整同步负责。
+    #[test]
+    fn shortcut_only_asks_for_rime_sync_and_deploy() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path()).unwrap();
+
+        let bytes = fs::read(dir.path().join(SHORTCUT_NAME)).unwrap();
+        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let arguments = stored_string_data(&bytes, flags, 0x20).expect("缺 COMMAND_LINE_ARGUMENTS");
+
+        assert!(
+            arguments.starts_with("--rime-sync "),
+            "实际写的参数是：{arguments}"
+        );
+        assert!(arguments.contains("--notify"), "缺 --notify：{arguments}");
+        assert!(arguments.contains("--app-dir"), "缺 --app-dir：{arguments}");
+        assert!(
+            !arguments.contains("--sync-now"),
+            "不该再跑完整同步：{arguments}"
+        );
     }
 
     /// 快捷方式不该再散出额外的图标文件。
