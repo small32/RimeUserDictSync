@@ -22,7 +22,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 先把 tag 与 Cargo.toml 的版本对齐，后面两个平台就不用各查一遍，
+  # 先把 tag 与 Cargo.toml 的版本对齐，后面三个平台就不用各查一遍，
   # 也就不会出现「Windows 构建成功、macOS 才发现版本号不对」这种半截状态。
   resolve:
     name: Validate release tag
@@ -137,12 +137,63 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  linux:
+    name: Linux x86_64
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Select Rust stable with fmt and clippy
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      # eframe 走 X11/Wayland，rfd 的 GTK3 后端要 gtk+-3.0.pc：
+      # 缺这几个 -dev 包时，pkg-config 会在编译期直接报 "system library not found"。
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      # 这一步同时是「Linux 专属模块能不能编」的守门人：
+      # picker_linux / service_linux / shortcut_linux 只在 Linux 上编译。
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Stage Linux asset
+        run: |
+          mkdir -p dist
+          cp target/release/RimeUserDictSync \
+            "dist/RimeUserDictSync-${{ needs.resolve.outputs.tag }}-Linux-x86_64"
+          chmod +x "dist/RimeUserDictSync-${{ needs.resolve.outputs.tag }}-Linux-x86_64"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish one GitHub Release
     needs:
       - resolve
       - windows
       - macos
+      - linux
     runs-on: ubuntu-latest
     steps:
       - name: Check out source

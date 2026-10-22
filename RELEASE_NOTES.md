@@ -1,31 +1,69 @@
-# v0.3.3
+# v0.5.0
 
 ## 新增
 
-- **Windows 服务安装目录换成受保护路径** `%ProgramData%\RimeUserDictSyncService`。
-  旧目录把 `Write` 权限给了 `BUILTIN\Users`，而服务以 `LocalSystem` 运行其中的 EXE，
-  等于把提权通道留在 ProgramData 里。新目录只允许 `SYSTEM` 与 `Administrators` 写入，
-  安装前还会校验属主与 DACL，拒绝使用他人预先创建的不安全目录。
-- 快捷方式「同步词库」改为**只做 RIME 自带的用户资料同步 + 重新部署**，
-  与 macOS 菜单栏图标同一策略：文件搬运由后台服务完成，双击不再等待网络。
-  文本配置的合并写回仍由 GUI 的「同步词库」按钮负责。
-- 设备设置（接管 / 导入 / 注销）通过远端 `__rime-owner-lock-<ID>/` 互斥，
-  两台设备同时操作不会再互相覆盖。
-- 每台设备使用独立的会话心跳文件，`last_sync` 不再被其他设备覆盖。
-- 命令行新增 `--rime-sync`：只执行 `/sync` + `/deploy`。
+### Linux 支持（本次新增平台）
+
+- **后台定时同步**：systemd 用户级 timer，`--install-service` 安装、`--uninstall-service` 卸载、
+  `--service-status` 查看状态。登录后 2 分钟先跑一次，之后每轮跑完再计一个间隔；
+  `Nice=10` + `IOSchedulingClass=idle`，不跟打字抢 CPU/IO。
+  程序目录搬家后，启动时比对 `ExecStart` 里的路径并按当前位置重写（否则 systemd 会 `203/EXEC`）。
+- **菜单项「同步词库」**：生成 `~/.local/share/applications/rime-user-dict-sync.desktop`，
+  开始菜单搜索即可运行。图标不用通用脚本图标，取 `assets/sync-gear.ico` 里最大的一帧解成
+  256×256 PNG 并把白底抠成透明，`Icon=` 直接写绝对路径绕过主题缓存；
+  删除或覆盖前校验 `X-RimeUserDictSync=1` 标记，同名但不是本工具生成的菜单项一律拒绝。
+- **原生通知**：走 `notify-send`，失败不影响同步。
+- **前端探测**：自动识别 fcitx5-rime（`~/.local/share/fcitx5/rime`）与 ibus-rime
+  （`~/.config/ibus/rime`），并兼容老发行版的 `~/.config/fcitx5/rime`。
+- `--install-agent` 在 Linux 上等同 `--install-service`，跨平台脚本只写一个参数即可。
+
+### RIME 用户目录探测（Linux）
+
+- **分层判定：先查当前账号，再兜底其他账号**。第 0 层是进程 `HOME`（root 运行时就是 `/root`），
+  只要这一层有一个目录含 `installation.yaml` 或 `*.userdb` 就直接用它，绝不跨层；
+  第 1 层才是 `SUDO_USER` 指向的账号、`/home` 下每个目录、非 root 运行时的 `/root`。
+  这样 `sudo ./RimeUserDictSync` 也能找到 `/home/<你的账号>` 下真正在用的词库。
+- **层内打分挑选**：`*.userdb`（+2）> `installation.yaml`（+1）> 目录存在（+1），同分取先出现的。
+  装 fcitx5 时顺手建的空壳目录不再被当成结果。
+- 只做只读探测，读不到别人家 700 的 home 时直接跳过。
+- 探测明细写进日志：每个候选目录的**所属层级、得分、命中特征**（`目录存在` /
+  `installation.yaml` / `*.userdb`），排查「为什么没选中」不用靠猜。
+
+### 指定 RIME 用户词库（Linux）
+
+- 换成**自绘目录选择器**：原生对话框（xdg-portal / GTK3）不给调用方「显示隐藏文件」的开关，
+  而 RIME 用户目录本身就在 `.local/share/fcitx5/rime` 这类隐藏路径下；
+  没装 portal 的桌面上原生对话框甚至直接返回空，点了没反应。
+- **隐藏文件和文件夹默认就列出来**，可勾掉「显示隐藏文件」反过来折叠，折叠时会提示被藏了几项。
+- 支持直接粘贴路径，认 `~/`、`%HOME%` 与相对路径，回车跳转。
+- 含 `installation.yaml` 的目录标绿色 `RIME` 徽标，一眼看出该点哪个；顶部列出「常见位置」。
+- **选错一层不关窗**：错误直接写在窗口里，省得从头再点一遍。
+
+### 程序装在只读目录时
+
+- `/opt`、`/usr/local/bin`、只读挂载下的程序目录写不进 INI 与日志，会导致「设置看起来存住了、
+  重启又变回原样」。现在启动时**真的试写一次**（建临时文件再删，只读挂载 / ACL / immutable
+  都骗不过去），不可写就回退到 `$XDG_DATA_HOME/rime-user-dict-sync`
+  （默认 `~/.local/share/rime-user-dict-sync`），并把程序目录里已有的 INI **继承**过来。
+- 回退不是静默的：界面日志写一行，`--service-status` 首行直接给出配置目录与回退原因。
 
 ## 修复
 
-- **升级后台服务时覆盖 EXE 撞上共享冲突（`os error 32`），安装失败且把服务留在「已停止」**：
-  SCM 报告 `Stopped` 之后进程镜像还会映射 EXE 一小会儿，现在复制带重试，
-  并且任何失败都会把已安装的服务重新启动。
-- **`fs::canonicalize` 的 `\\?\` 前缀被写进注册表、`app-dir.txt` 与服务命令行**：
-  日志里显示 `\\?\D:\…`，而且 GUI 拿它和用户选的普通路径比较永远不相等，
-  会误报「服务指向别的目录」。现在写入前剥离该前缀，UNC 路径也正确还原。
-- 升级后旧版服务目录残留一份没人用的 EXE（还会被 SYSTEM 权限启动过），
-  现在安装与卸载都会清理，且不会删除当前正在运行的那一份。
-- 接管或导入后的首轮会恢复远端快照，不再用本地空目录清空远端清单；
-  恢复副本暂存于 `Sync/__rime_restore_<ID>/`，合并成功后清理。
-- WebDAV 能力探测结果与当前连接绑定，更换地址或凭据后会重新探测，
-  不再沿用旧服务器的上传校验方式。
-- 短语文本按「文本 + 编码」并集时允许省略权重列，`opencc/*.txt` 仍按首列 key。
+- **界面顶栏被诊断信息淹没**：错误消息与诊断彻底分开。顶栏只留一句能立刻照做的
+  （例如「找不到 RIME 用户目录 …，请点击「指定 RIME 用户词库」」），候选明细只写进日志；
+  同一句错误只记一次，不会因启动、保存设置、每轮结束反复刷新而刷屏。
+- **系统通知塞满 stderr**：`--notify` 与 Windows 服务日志改为「通知给一句，日志给全量」，
+  通知框里不再出现十几行扫描结果。
+- **userdb 被输入法占用时的提示没用**：原来只有一句「请先退出输入法」。现在说清两条路——
+  在输入法图标右键的 RIME 菜单里点「同步」（再点「重新部署」），或退出输入法后重试本程序。
+  **本程序不会自动退出或重启你的输入法。**
+- Linux 的 `.desktop` 与 systemd 单元生成、代码格式与 clippy 一并整理。
+
+## 已知限制
+
+- Linux 上 `rime_dict_manager --sync` 需要独占 `*.userdb`，而 fcitx5 / ibus 常驻持有它，
+  所以你在开着输入法时点「同步词库」会在最后两步失败并给出上面那句提示。
+  此时**跨机文件已经同步完成**（远端快照已写进 `Sync/<各ID>/`），点一下输入法菜单里的
+  「同步」再「重新部署」即收尾；后台轮次只搬运文件，不碰 userdb，不受影响。
+- Linux 只支持 fcitx5-rime 与 ibus-rime 两种前端；其他前端可用 INI 的
+  `[rime] deployer_path` 指向自带的 `--sync` / `--deploy` 工具。
