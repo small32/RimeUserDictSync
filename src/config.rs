@@ -238,6 +238,9 @@ pub fn app_dir_note() -> Option<String> {
     APP_DIR_NOTE.get().cloned().flatten()
 }
 
+/// 只在 Linux 的回退分支里调用：其他平台没有「程序目录不可写」这条路径，
+/// 留着会让 Windows / macOS 的 `clippy -D warnings` 报死代码。
+#[cfg(target_os = "linux")]
 fn remember_app_dir_note(note: Option<String>) -> Option<String> {
     // 只记第一次：后续调用（命令行、界面各算一次）不该覆盖真正的来源。
     let _ = APP_DIR_NOTE.set(note.clone());

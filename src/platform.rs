@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use std::{
-    fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -10,6 +9,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+// 只有 Linux 的探测/权限判定会碰文件系统：Windows 上是 Win32 API，
+// macOS 走 config.rs 那条路径。不加 cfg 的话 Windows / macOS 的
+// `clippy -D warnings` 会因「未使用导入」直接失败。
+#[cfg(target_os = "linux")]
+use std::fs;
 
 /// RIME 命令的最长执行时间。超时就杀掉：进程卡住会一直占着同步锁，
 /// 而后台轮次没有「停止同步」按钮，只能重启程序才能恢复。
@@ -326,17 +331,15 @@ pub fn rime_probe_lines() -> Vec<String> {
 }
 
 /// 候选目录清单（只要路径，按优先级顺序），供目录选择器做「常见位置」快捷跳转。
+///
+/// 只给 Linux 的 `picker_linux` 用，因此不留其他平台的空壳：Windows / macOS
+/// 上的空壳没人调用，`clippy -D warnings` 会把它当成死代码整条报错。
 #[cfg(target_os = "linux")]
 pub fn rime_candidate_dirs() -> Vec<PathBuf> {
     linux_rime_candidates()
         .into_iter()
         .map(|(_, dir)| dir)
         .collect()
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn rime_candidate_dirs() -> Vec<PathBuf> {
-    Vec::new()
 }
 
 /// 给「找不到 RIME 用户目录」这类错误补上候选明细，**只用于写日志**。
