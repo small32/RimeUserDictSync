@@ -130,7 +130,11 @@ pub fn manual_sync(
     check(cancel)?;
 
     // 4. RIME /sync：合并 Sync/<各ID>/ 下的 userdb 快照（自造词与删除传播在此发生）。
-    let rime = platform::find_rime(&context.settings.deployer_path, &context.base_dir)?;
+    let rime = platform::find_rime(
+        &context.settings.deployer_path,
+        &context.base_dir,
+        &context.layout.rime,
+    )?;
     rime_sync(context, &rime, cancel, report, "步骤 4/6")?;
     report.progress(75);
     check(cancel)?;
@@ -180,7 +184,11 @@ pub fn rime_sync_and_deploy(
     // 与服务共用同一把本地锁：`/sync` 要读 `Sync/<ID>/`，而服务可能正在往里写。
     let _lock = LocalLock::acquire(&context.layout.lock_file())?;
     transport::check_local_identity(context)?;
-    let rime = platform::find_rime(&context.settings.deployer_path, &context.base_dir)?;
+    let rime = platform::find_rime(
+        &context.settings.deployer_path,
+        &context.base_dir,
+        &context.layout.rime,
+    )?;
     report.progress(10);
 
     rime_sync(context, &rime, cancel, report, "步骤 1/2")?;
@@ -205,11 +213,10 @@ fn rime_sync(
     stage: &str,
 ) -> Result<()> {
     report.log(&format!(
-        "{stage}：运行 RIME 用户资料同步（{} {}）。",
-        rime.executable.display(),
-        rime.sync_arg
+        "{stage}：运行 RIME 用户资料同步（{}）。",
+        rime.describe(platform::RimeStage::Sync)
     ));
-    platform::run(rime, rime.sync_arg, cancel)?;
+    platform::run(rime, platform::RimeStage::Sync, cancel)?;
     transport::clear_restored_snapshots(&context.layout)?;
     let list = context.load_list()?;
     purge_snapshot_dir(context, &list, report)
@@ -223,11 +230,10 @@ fn rime_deploy(
     stage: &str,
 ) -> Result<()> {
     report.log(&format!(
-        "{stage}：重新部署 RIME 使词库生效（{} {}）。",
-        rime.executable.display(),
-        rime.deploy_arg
+        "{stage}：重新部署 RIME 使词库生效（{}）。",
+        rime.describe(platform::RimeStage::Deploy)
     ));
-    platform::run(rime, rime.deploy_arg, cancel)
+    platform::run(rime, platform::RimeStage::Deploy, cancel)
 }
 
 fn check(cancel: &AtomicBool) -> Result<()> {

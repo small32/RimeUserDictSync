@@ -23,9 +23,9 @@ use std::{
     },
     time::Duration,
 };
-// 服务状态轮询：Windows 查 SCM，macOS 查 launchd 是否加载了代理。
+// 服务状态轮询：Windows 查 SCM，macOS 查 launchd，Linux 查 systemd 用户级 timer。
 // 不单独 cfg 会让不含该逻辑的平台报 unused。
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::time::Instant;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,11 +37,12 @@ const CONFIG_BROKEN_NOTICE: &str =
     "配置文件读取失败，为避免覆盖原有配置已禁用保存；请手动修复或删除配置文件后重启程序。";
 /// 后台服务/代理状态的轮询间隔。
 ///
-/// Windows 查 SCM 很便宜，5 秒足够跟上提权安装的节奏；
-/// macOS 每次要 fork 一个 launchctl，放宽到 30 秒，避免无谓的进程创建。
+/// Windows 查 SCM 很便宜，5 秒足够跟上提权安装的节奏。
 #[cfg(target_os = "windows")]
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(target_os = "macos")]
+// macOS 每次要 fork 一个 launchctl，Linux 每次要 fork 一个 systemctl，
+// 都放宽到 30 秒，避免无谓的进程创建。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -138,6 +139,10 @@ pub fn run() -> eframe::Result {
             // 放进后台线程，别拖慢首帧。
             #[cfg(target_os = "macos")]
             std::thread::spawn(crate::agent::heal_after_update);
+            // Linux：程序被挪过位置后 ExecStart 里的绝对路径会失效（203/EXEC），
+            // 启动时比对一次并重写。同样放后台，别拖慢首帧。
+            #[cfg(target_os = "linux")]
+            std::thread::spawn(crate::service_linux::heal_after_update);
             Ok(Box::new(App::new()))
         }),
     )
@@ -219,17 +224,17 @@ struct App {
     busy_flag: Arc<AtomicBool>,
     /// 后台服务是否在跑。服务接管搬运后，内建线程就让位，避免重复劳动。
     service_running: Arc<AtomicBool>,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     service_text: String,
-    /// macOS：后台线程定期查 launchd，UI 只读快照。
+    /// macOS / Linux：后台线程定期查 launchd / systemd，UI 只读快照。
     ///
-    /// 直接在 UI 线程调 `agent::status()` 会 spawn `id` + 两次 `launchctl print`，
-    /// 每 5 秒卡一下界面。
-    #[cfg(target_os = "macos")]
+    /// 直接在 UI 线程查会 spawn 子进程（`launchctl print` / `systemctl is-active`），
+    /// 每 30 秒卡一下界面。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     agent_snapshot: Arc<Mutex<AgentSnapshot>>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     shortcut_text: String,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     service_checked_at: Instant,
     config_broken: bool,
 
@@ -268,8 +273,11 @@ struct App {
     available_update: Option<UpdateInfo>,
 }
 
-/// macOS 后台代理状态快照（由后台线程刷新，UI 只读）。
-#[cfg(target_os = "macos")]
+/// 后台代理状态快照（由后台线程刷新，UI 只读）。
+///
+/// macOS 查 launchd，Linux 查 systemd 用户级 timer：两者都要 spawn 子进程，
+/// 直接在 UI 线程查会每 5 秒卡一下界面。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Default)]
 struct AgentSnapshot {
     text: String,
@@ -277,13 +285,13 @@ struct AgentSnapshot {
     loaded: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_agent_poller() -> Arc<Mutex<AgentSnapshot>> {
     let snapshot = Arc::new(Mutex::new(AgentSnapshot::default()));
     let shared = snapshot.clone();
     std::thread::spawn(move || {
         loop {
-            let (text, loaded) = crate::agent::status();
+            let (text, loaded) = background_status();
             if let Ok(mut guard) = shared.lock() {
                 guard.text = text;
                 guard.loaded = loaded;
@@ -292,6 +300,24 @@ fn spawn_agent_poller() -> Arc<Mutex<AgentSnapshot>> {
         }
     });
     snapshot
+}
+
+/// 查一次「后台搬运装没装、跑没跑」，返回（描述文本, 是否已接管搬运）。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn background_status() -> (String, bool) {
+    #[cfg(target_os = "macos")]
+    return crate::agent::status();
+    #[cfg(target_os = "linux")]
+    return crate::service_linux::status();
+}
+
+/// 让已安装的后台任务立刻跑一轮（macOS: launchctl kickstart / Linux: systemctl start）。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn background_request_round() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    return crate::agent::request_round().map(|_| ());
+    #[cfg(target_os = "linux")]
+    return crate::service_linux::request_round().map(|_| ());
 }
 
 impl App {
@@ -333,7 +359,7 @@ impl App {
             busy_flag.clone(),
             service_running.clone(),
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let agent_snapshot = spawn_agent_poller();
 
         let mut app = Self {
@@ -354,13 +380,13 @@ impl App {
             busy: false,
             busy_flag,
             service_running,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             service_text: String::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             agent_snapshot,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             shortcut_text: String::new(),
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             service_checked_at: Instant::now() - SERVICE_POLL_INTERVAL,
             config_broken,
             show_webdav: false,
@@ -645,8 +671,9 @@ impl App {
         self.service_running.store(running, Ordering::Relaxed);
     }
 
-    /// macOS：读后台线程刷新的快照；加载了就让 GUI 内建线程让位。
-    #[cfg(target_os = "macos")]
+    /// macOS（launchd）/ Linux（systemd）：读后台线程刷新的快照；
+    /// 已接管搬运就让 GUI 内建线程让位。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn refresh_service_state(&mut self) {
         if self.service_checked_at.elapsed() < SERVICE_POLL_INTERVAL {
             return;
@@ -664,9 +691,14 @@ impl App {
         }
         self.service_text = text;
         self.service_running.store(loaded, Ordering::Relaxed);
+        // Linux 的快捷方式状态没有单独的后台线程，顺手在这里刷一次（读本地文件，很轻）。
+        #[cfg(target_os = "linux")]
+        {
+            self.shortcut_text = crate::shortcut_linux::describe();
+        }
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     fn refresh_service_state(&mut self) {
         self.service_running.store(false, Ordering::Relaxed);
     }
@@ -682,13 +714,16 @@ impl App {
                 &crate::report::timestamped(&error.to_string()),
             );
         } else {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = crate::agent::request_round() {
+                    // 两边都是「启动一次定时任务」，失败只记日志：
+                    // wake 标记还在，内建线程或下一轮 timer 会接手。
+                    let result = background_request_round();
+                    if let Err(error) = result {
                         let _ = tx.send(Event::Log(crate::report::timestamped(&format!(
-                            "唤醒后台代理失败：{error}"
+                            "唤醒后台搬运失败：{error}"
                         ))));
                     }
                 });
@@ -789,6 +824,48 @@ impl App {
         // 立刻刷新状态，下一帧就能看到「已加载 / 未安装」。
         self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
         self.refresh_service_state();
+    }
+
+    /// Linux：装 systemd 用户级 timer，不需要提权，所以不用像 Windows 那样
+    /// 先发一个 UAC 拉起自己的子进程，直接在本进程里做完即可。
+    #[cfg(target_os = "linux")]
+    fn run_service_action(&mut self, uninstall: bool) {
+        if self.busy {
+            return;
+        }
+        let result = if uninstall {
+            crate::service_linux::uninstall()
+        } else {
+            crate::service_linux::install(&self.base, self.settings.background_minutes)
+        };
+        match result {
+            Ok(message) => {
+                self.append(&crate::report::timestamped(&message));
+                self.notice = Some(message);
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        // 立刻刷新状态，下一帧就能看到「已开启 / 未开启」。
+        self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
+        self.refresh_service_state();
+    }
+
+    /// Linux：生成/删除 `.desktop` 菜单项。
+    #[cfg(target_os = "linux")]
+    fn run_shortcut_action(&mut self, uninstall: bool) {
+        let result = if uninstall {
+            crate::shortcut_linux::uninstall()
+        } else {
+            crate::shortcut_linux::install(&self.base)
+        };
+        match result {
+            Ok(message) => {
+                self.append(&crate::report::timestamped(&message));
+                self.notice = Some(message);
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        self.shortcut_text = crate::shortcut_linux::describe();
     }
 
     fn set_busy(&mut self, value: bool) {
@@ -1181,10 +1258,17 @@ impl eframe::App for App {
                         } else {
                             let _ = self.settings.save(&self.ini);
                         }
-                        // 开 → 拉起菜单栏图标；关 → 图标立即消失。
+                        // 开 → 拉起菜单栏图标 / 启动 timer；关 → 立即停下。
                         #[cfg(target_os = "macos")]
                         {
                             let _ = crate::agent::apply_background_switch(enabled);
+                            self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
+                        }
+                        // Linux：停 timer 只是不再定时拉起；单元文件保留，
+                        // `--scheduled-round` 自己也会按 enabled 跳过，双重保险。
+                        #[cfg(target_os = "linux")]
+                        {
+                            let _ = crate::service_linux::apply_background_switch(enabled);
                             self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
                         }
                     }
@@ -1206,6 +1290,17 @@ impl eframe::App for App {
                             ) {
                                 Ok(true) => self.append(&crate::report::timestamped(
                                     "已按新的间隔更新后台代理。",
+                                )),
+                                Ok(false) => {}
+                                Err(error) => self.notice = Some(error.to_string()),
+                            }
+                            // Linux 的间隔写在 timer 单元里，改完设置要同步过去。
+                            #[cfg(target_os = "linux")]
+                            match crate::service_linux::refresh_interval(
+                                self.settings.background_minutes,
+                            ) {
+                                Ok(true) => self.append(&crate::report::timestamped(
+                                    "已按新的间隔更新 systemd timer。",
                                 )),
                                 Ok(false) => {}
                                 Err(error) => self.notice = Some(error.to_string()),
@@ -1307,6 +1402,49 @@ impl eframe::App for App {
                         "快捷方式：未创建"
                     })
                     .on_hover_text(crate::shortcut_macos::describe(&self.base));
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("创建 / 更新快捷方式"))
+                        .clicked()
+                    {
+                        self.run_shortcut_action(false);
+                    }
+                    if ui
+                        .add_enabled(!self.busy && created, egui::Button::new("删除快捷方式"))
+                        .clicked()
+                    {
+                        self.run_shortcut_action(true);
+                    }
+                });
+                #[cfg(target_os = "linux")]
+                ui.horizontal(|ui| {
+                    if self.service_text.is_empty() {
+                        self.refresh_service_state();
+                    }
+                    ui.label(&self.service_text);
+                    let installed = crate::service_linux::installed();
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("开启 / 更新 Rime词库同步"))
+                        .clicked()
+                    {
+                        self.run_service_action(false);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && installed,
+                            egui::Button::new("关闭 Rime词库同步"),
+                        )
+                        .clicked()
+                    {
+                        self.run_service_action(true);
+                    }
+                });
+                #[cfg(target_os = "linux")]
+                ui.horizontal(|ui| {
+                    if self.shortcut_text.is_empty() {
+                        self.refresh_service_state();
+                    }
+                    ui.label(&self.shortcut_text);
+                    let created = crate::shortcut_linux::exists();
                     if ui
                         .add_enabled(!self.busy, egui::Button::new("创建 / 更新快捷方式"))
                         .clicked()

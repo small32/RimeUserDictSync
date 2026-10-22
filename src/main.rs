@@ -23,6 +23,12 @@ mod shortcut;
 /// macOS 用 AppleScript applet 提供同名快捷方式。
 #[cfg(target_os = "macos")]
 mod shortcut_macos;
+/// Linux 没有 Windows 服务，用 systemd 用户级 timer 定时跑 `--scheduled-round`。
+#[cfg(target_os = "linux")]
+mod service_linux;
+/// Linux 用 freedesktop `.desktop` 菜单项提供同名快捷方式。
+#[cfg(target_os = "linux")]
+mod shortcut_linux;
 mod state;
 mod transport;
 mod ui;
@@ -45,12 +51,14 @@ RIME 用户词库同步工具
                          （桌面快捷方式用的就是它；文件搬运由后台服务负责）
   --round                只执行一轮后台搬运后退出（不合并、不部署）
   --scheduled-round      供 macOS 后台代理调用：后台搬运关闭时跳过，否则跑一轮
-  --install-service      安装并启动 Windows 后台服务（需要管理员权限）
-  --uninstall-service    停止并卸载 Windows 后台服务（需要管理员权限）
-  --install-agent        安装 macOS 后台代理（launchd 定时搬运，不需要程序常开）
+  --install-service      安装并启动后台搬运：Windows 为 SCM 服务（需管理员权限），
+                         Linux 为 systemd 用户级 timer（不需要提权）
+  --uninstall-service    停止并卸载后台搬运
+  --install-agent        安装 macOS 后台代理（launchd 定时搬运，不需要程序常开）；
+                         Linux 上等同 --install-service
   --uninstall-agent      卸载 macOS 后台代理
-  --install-shortcut     在程序所在目录创建「同步词库」快捷方式
-                         （Windows 为 .lnk，macOS 为 AppleScript .app）
+  --install-shortcut     创建「同步词库」快捷方式
+                         （Windows 为 .lnk，macOS 为 AppleScript .app，Linux 为菜单项）
   --uninstall-shortcut   删除该快捷方式
   --run-service          由服务控制管理器调用，不应手工执行
   --service-status       打印后台服务状态
@@ -234,19 +242,38 @@ fn dispatch(command: Command, app_dir: &Path) -> Result<String> {
             let _ = app_dir;
             bail!("后台服务只在 Windows 上提供；macOS 请使用 --install-agent（launchd 代理）")
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         Command::InstallAgent | Command::UninstallAgent => {
             let _ = app_dir;
             bail!("后台代理只在 macOS 上提供；Windows 请使用 --install-service")
         }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        // Linux：没有常驻服务，用 systemd 用户级 timer 定时拉起 `--scheduled-round`。
+        // `--install-agent` 在这里等同 `--install-service`，免得脚本要按平台分支。
+        #[cfg(target_os = "linux")]
+        Command::InstallService | Command::InstallAgent => {
+            service_linux::install(app_dir, settings_minutes(app_dir))
+        }
+        #[cfg(target_os = "linux")]
+        Command::UninstallService | Command::UninstallAgent => service_linux::uninstall(),
+        #[cfg(target_os = "linux")]
+        Command::InstallShortcut => shortcut_linux::install(app_dir),
+        #[cfg(target_os = "linux")]
+        Command::UninstallShortcut => shortcut_linux::uninstall(),
+        #[cfg(target_os = "linux")]
+        Command::RunService => {
+            let _ = app_dir;
+            bail!("Linux 没有常驻服务进程：后台搬运由 systemd 用户级 timer 调度，请用 --scheduled-round")
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         Command::InstallService
         | Command::UninstallService
+        | Command::InstallAgent
+        | Command::UninstallAgent
         | Command::InstallShortcut
         | Command::UninstallShortcut
         | Command::RunService => {
             let _ = app_dir;
-            bail!("后台服务与快捷方式目前只在 Windows / macOS 上提供")
+            bail!("后台服务与快捷方式目前只在 Windows / macOS / Linux 上提供")
         }
     }
 }
@@ -268,15 +295,25 @@ fn service_status_text(app_dir: &Path) -> Result<String> {
             shortcut_macos::describe(app_dir)
         ))
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 的快捷方式和配置目录无关（固定在 XDG 应用菜单目录），这里只为对齐签名。
+        let _ = app_dir;
+        Ok(format!(
+            "{}\n{}",
+            service_linux::describe(),
+            shortcut_linux::describe()
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = app_dir;
         Ok("本平台暂不支持后台服务与快捷方式：后台搬运由程序在运行期间执行。".to_owned())
     }
 }
 
-/// `--install-agent` 的间隔：沿用「后台搬运」设置里的分钟数。
-#[cfg(target_os = "macos")]
+/// `--install-service` / `--install-agent` 的间隔：沿用「后台搬运」设置里的分钟数。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn settings_minutes(app_dir: &Path) -> u32 {
     config::Settings::load(&app_dir.join("RimeUserDictSync.ini"))
         .map(|settings| settings.background_minutes)

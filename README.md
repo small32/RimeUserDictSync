@@ -1,6 +1,6 @@
 # RIME 用户词库同步工具
 
-跨平台 RIME（Windows 小狼毫 / macOS 鼠须管）多设备词库同步工具，Rust 实现。
+跨平台 RIME（Windows 小狼毫 / macOS 鼠须管 / Linux fcitx5-rime、ibus-rime）多设备词库同步工具，Rust 实现。
 设计目标：**多端最终一致、同步过程不打断输入、删除基本可用**。
 
 核心思路是把**传输**与**生效**解耦：
@@ -14,7 +14,8 @@
 - **数据分层**：`Sync/<ID>/` 放各设备的 userdb 快照（整文件增量），
   `Sync/Others/` 放文本词典的公共合并结果（词条级并集）。
 - **后台搬运**：比对远端 `Others/` 与各设备 `<ID>/.index.json`，按需增量下载/上传。
-  可由 **Windows 服务**常驻执行（开机即跑、不必打开本程序），未安装服务时由程序内建线程兜底。
+  可由 **Windows 服务 / macOS LaunchAgent / Linux systemd 用户级 timer** 常驻执行（不必打开本程序），
+  未安装时由程序内建线程兜底。
 - **手动同步**：严格按 拉取 → 并集 → 写回 → 上传 → `/sync` → `/deploy` 执行。
 - **按类型合并**：`*.dict.yaml` 词条并集取大权重；短语文本按「文本 + 编码」并集（权重可省略），`opencc/*.txt` 按首列 key 并集；
   `*.yaml`（非 dict）/`*.json`/`*.lua` 走 newest。
@@ -24,11 +25,12 @@
 - **WebDAV 能力探测**：自动选择 `If-Match` / ETag / size+mtime 三档上传校验。
   探测结果会保存并绑定当前连接；更换地址或凭据后重新探测，避免沿用旧服务器的能力。
 - 提供后台开关与间隔、进度条、实时日志、停止同步、连接与写入测试。
-- 启动后自动检查 GitHub 最新 Release；同一套源码可在 Windows、macOS 原生编译。
+- 启动后自动检查 GitHub 最新 Release；同一套源码可在 Windows、macOS、Linux 原生编译。
 
 ## 运行环境
 
-- Windows 10/11 并安装小狼毫；或 macOS 并安装鼠须管。
+- Windows 10/11 并安装小狼毫；或 macOS 并安装鼠须管；
+  或 Linux（Mint / Ubuntu 等）并安装 fcitx5-rime 或 ibus-rime，且装有 `librime-bin`、`librime-data`。
 - WebDAV 服务需要支持 `PROPFIND`、`MKCOL`、`GET`、`PUT`、`DELETE`；
   `If-Match`、`MOVE` 为可选（不支持会自动降级，方案仍可用）。
 - 程序所在目录（或 macOS 配置目录）必须可读写。建议不要放在 `Program Files` 下。
@@ -36,7 +38,8 @@
 ## 目录布局
 
 ```text
-<RIME 用户目录>/                     Windows: %APPDATA%\Rime   macOS: ~/Library/Rime
+<RIME 用户目录>/    Windows: %APPDATA%\Rime   macOS: ~/Library/Rime
+                    Linux: ~/.local/share/fcitx5/rime 或 ~/.config/ibus/rime
 ├─ installation.yaml                 installation_id / sync_dir / Password(派生串)
 ├─ *.userdb/                         leveldb，设备私有，绝不上传
 ├─ my_words.dict.yaml                本地源（权威副本）
@@ -190,6 +193,7 @@ macOS:   ~/Library/Rime
 | --- | --- | --- | --- |
 | **Windows 服务**（推荐） | Windows | 想让它一直生效 | 开机即跑，不用打开本程序；只做搬运 |
 | **launchd LaunchAgent**（轻量） | macOS | 同上 | 登录后由 launchd 每 N 分钟拉起一次 `--scheduled-round`，跑完即退，**没有常驻进程** |
+| **systemd 用户级 timer**（轻量） | Linux | 同上 | 登录后由 systemd 每 N 分钟拉起一次 `--scheduled-round`，跑完即退，**没有常驻进程** |
 | 程序内建线程（兜底） | 两端 | 不想装服务/代理 | 只在程序运行期间跑；检测到服务或代理已加载就自动让位 |
 
 ### 为什么服务只做搬运
@@ -282,6 +286,52 @@ macOS 没有 SCM 服务，用两个用户级 LaunchAgent，都只在**登录后*
 与 Windows 服务的差异：LaunchAgent 只在**用户登录后**运行，做不到登录前同步；
 好处是不需要管理员权限。GUI 每 30 秒查一次 launchd，
 定时搬运已加载时内建线程自动让位，不会两边同时搬。
+
+### Linux：systemd 用户级 timer + 菜单项
+
+Linux 既没有 SCM 服务也没有 launchd，用 **systemd 用户级 timer** 做同一件事：
+到点拉起 `--scheduled-round`，跑完即退，没有常驻进程。
+
+```sh
+./RimeUserDictSync --install-service --app-dir "$HOME/RimeUserDictSync"
+./RimeUserDictSync --uninstall-service
+./RimeUserDictSync --service-status
+./RimeUserDictSync --install-shortcut --app-dir "$HOME/RimeUserDictSync"
+```
+
+| 项 | 值 |
+| --- | --- |
+| service | `~/.config/systemd/user/rime-user-dict-sync.service`（`Type=oneshot`） |
+| timer | `~/.config/systemd/user/rime-user-dict-sync.timer` |
+| 调度 | 登录后 2 分钟先跑一次，之后每轮跑完再计一个间隔（`OnBootSec` + `OnUnitActiveSec`），`AccuracySec=30s` |
+| 资源 | `Nice=10` + `IOSchedulingClass=idle`，不跟打字抢 CPU/IO |
+| 会话 | 用户级：**登录后**才跑。想在未登录时也同步，执行 `loginctl enable-linger "$USER"` |
+| 改间隔 | 界面点「保存间隔」重写 timer 并 `systemctl --user restart`；内容没变则不动 |
+| 程序搬家 | 启动时比对 `ExecStart` 里的路径，不一致就按当前位置重写（否则 systemd 会 `203/EXEC`） |
+
+`--install-agent` 在 Linux 上等同 `--install-service`，跨平台脚本只写一个参数即可。
+
+菜单项「同步词库」：
+
+- 生成 `~/.local/share/applications/rime-user-dict-sync.desktop`，开始菜单里搜「同步词库」即可运行；
+- 图标不用通用脚本图标：取 `assets/sync-gear.ico` 里最大的一帧解成 256×256 PNG，白底抠成透明，
+  `Icon=` 直接写绝对路径，绕过图标主题缓存；
+- 执行 `--sync-now --notify`，与 macOS 的 `.app` 一样是**完整一轮**（理由见上一节）；
+- 删除/覆盖前校验 `X-RimeUserDictSync=1` 标记，同名但不是本工具生成的菜单项一律拒绝。
+
+Linux 的 RIME 前端是自动探测的：
+
+| 前端 | 用户目录 | 同步 / 部署 |
+| --- | --- | --- |
+| fcitx5-rime | `$XDG_DATA_HOME/fcitx5/rime`（默认 `~/.local/share/fcitx5/rime`） | `rime_dict_manager --sync`、`rime_deployer --build <user> /usr/share/rime-data` |
+| ibus-rime | `$XDG_CONFIG_HOME/ibus/rime`（默认 `~/.config/ibus/rime`） | 同上 |
+
+- 判定顺序：先找含 `installation.yaml` 的目录，其次找已存在的目录，都没有才退回 fcitx5 默认路径；
+- 这两个 librime 工具都从**当前目录**读 `installation.yaml`，所以程序把子进程的工作目录固定在 RIME 用户目录；
+- 部署完用 `fcitx5-remote -r` 让 fcitx5 立刻重新加载；失败不算错，切换输入法时也会生效；
+- 依赖：`sudo apt install librime-bin librime-data`；
+- 不同前端的命令确实不统一，留了逃生口：在 INI 写 `[rime] deployer_path=/path/to/tool`，
+  程序改用它的 `--sync` / `--deploy`。
 
 ### 调度细节
 
@@ -381,12 +431,13 @@ session 0 里做不到的那两步（读用户配置、让输入法重载），�
                        （桌面快捷方式用的就是它；文件搬运由后台服务负责）
 --round                只执行一轮后台搬运后退出（不合并、不部署）
 --scheduled-round      供 macOS 后台代理调用：后台搬运关闭时跳过，否则跑一轮
---install-service      安装并启动 Windows 后台服务（需要管理员权限）
---uninstall-service    停止并卸载 Windows 后台服务（需要管理员权限）
---install-agent        安装 macOS 后台代理（launchd 定时搬运，不需要程序常开）
+--install-service      安装并启动后台搬运：Windows 为 SCM 服务（需管理员权限），
+                       Linux 为 systemd 用户级 timer（不需要提权）
+--uninstall-service    停止并卸载后台搬运
+--install-agent        安装 macOS 后台代理（launchd 定时搬运）；Linux 上等同 --install-service
 --uninstall-agent      卸载 macOS 后台代理
---install-shortcut     在程序所在目录创建「同步词库」快捷方式
-                       （Windows 为 .lnk，macOS 为 AppleScript .app）
+--install-shortcut     创建「同步词库」快捷方式
+                       （Windows .lnk / macOS AppleScript .app / Linux 菜单项）
 --uninstall-shortcut   删除该快捷方式
 --run-service          由服务控制管理器调用，不应手工执行
 --service-status       打印后台服务状态
@@ -524,7 +575,9 @@ cargo build --release
 ```
 
 Windows 输出 `target/release/RimeUserDictSync.exe`；
-macOS 可运行 `./build-macos.sh` 一次生成 ARM64、x86_64 与 Universal 2 三个 `.app` 压缩包。
+macOS 可运行 `./build-macos.sh` 一次生成 ARM64、x86_64 与 Universal 2 三个 `.app` 压缩包；
+Linux 输出 `target/release/RimeUserDictSync`（编译需要 GTK3 / XKB 的头文件：
+`sudo apt install build-essential libgtk-3-dev libxkbcommon-dev`，运行需要 `librime-bin`）。
 
 源码中的 `Program.cs`、`MainForm.cs`、`UserDictSync.csproj` 与 `build.cmd`
 是旧版 C# 实现，仅作参考保留；构建入口是 `Cargo.toml`。
