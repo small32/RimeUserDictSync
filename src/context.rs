@@ -97,6 +97,8 @@ impl Context {
     pub fn build(base_dir: &Path, ini: &Path, settings: &mut Settings) -> Result<Self> {
         let rime_dir = resolve_rime_dir(settings);
         if !rime_dir.is_dir() {
+            // 这里只给一句能立刻照做的话：扫过的候选明细由调用方写进日志
+            // （见 `platform::attach_rime_diagnostics`），顶栏一行字放不下也用不着。
             bail!(
                 "找不到 RIME 用户目录 {}，请点击「指定 RIME 用户词库」",
                 rime_dir.display()
@@ -120,6 +122,13 @@ impl Context {
             &rime_dir.join(paths::META_DIR_NAME).join(paths::LOCK_FILE),
         )?;
         let mut notices = Vec::new();
+        // 自动探测结果要交代清楚：以 root / sudo 运行时 HOME 是 /root，
+        // 而候选横跨 /home，最终选中的很可能是 /home/<user> 下的那套。
+        if settings.user_data_dir.trim().is_empty()
+            && let Some(hint) = crate::platform::rime_dir_origin_hint(&rime_dir)
+        {
+            notices.push(hint);
+        }
 
         let mut device = if device_path.is_file() {
             DeviceFile::load(&device_path)?
@@ -597,6 +606,26 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 界面顶栏只有一行：这里必须只给「照做就行」的那句，
+    /// 候选明细交给 `platform::attach_rime_diagnostics` 写日志。
+    #[test]
+    fn missing_rime_dir_error_stays_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            user_data_dir: dir.path().join("no-such-rime").display().to_string(),
+            ..Default::default()
+        };
+        let ini = dir.path().join("RimeUserDictSync.ini");
+        let Err(error) = Context::build(dir.path(), &ini, &mut settings) else {
+            panic!("目录不存在时必须报错");
+        };
+        let error = error.to_string();
+        assert!(error.starts_with("找不到 RIME 用户目录"));
+        assert!(error.contains("请点击「指定 RIME 用户词库」"));
+        assert!(!error.contains("已扫描的候选目录"), "明细不该进这条消息");
+        assert!(!error.contains('\n'), "必须是一行");
     }
 
     #[test]

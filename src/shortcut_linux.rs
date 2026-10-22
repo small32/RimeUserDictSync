@@ -169,8 +169,16 @@ fn largest_ico_frame(bytes: &[u8]) -> Option<&[u8]> {
         let start = 6 + index * 16;
         let entry = bytes.get(start..start + 16)?;
         // 0 表示 256（老格式里一个字节放不下 256）。
-        let width = if entry[0] == 0 { 256 } else { u32::from(entry[0]) };
-        let height = if entry[1] == 0 { 256 } else { u32::from(entry[1]) };
+        let width = if entry[0] == 0 {
+            256
+        } else {
+            u32::from(entry[0])
+        };
+        let height = if entry[1] == 0 {
+            256
+        } else {
+            u32::from(entry[1])
+        };
         let length = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
         let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
         let frame = bytes.get(offset..offset.checked_add(length)?)?;
@@ -314,7 +322,7 @@ mod tests {
         let image = clear_white_background(icon_rgba().expect("图标应能解码"));
         let alphas: Vec<u8> = image.pixels().map(|pixel| pixel.0[3]).collect();
         // 白底被抠掉，齿轮本体仍然不透明——两者都得有，否则等于把图标抠没了。
-        assert!(alphas.iter().any(|alpha| *alpha == 0));
-        assert!(alphas.iter().any(|alpha| *alpha == 255));
+        assert!(alphas.contains(&0));
+        assert!(alphas.contains(&255));
     }
 }

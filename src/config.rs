@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 /// 应用程序级设置（`RimeUserDictSync.ini`）。
@@ -219,7 +220,35 @@ pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// 配置文件文件名（Windows/Linux 便携布局下就在程序旁边）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const CONFIG_FILE: &str = "RimeUserDictSync.ini";
+
+/// 配置目录回退到用户目录时的说明，供界面与命令行提示。
+static APP_DIR_NOTE: OnceLock<Option<String>> = OnceLock::new();
+
+/// 程序目录不可用时，配置与日志最终落在哪、为什么。
+///
+/// Linux 上把程序装到 `/opt`、`/usr/local/bin` 这类 root 所有的目录里很常见，
+/// 此时普通用户既写不了 `RimeUserDictSync.ini` 也写不了 `RimeSync.log`：
+/// 「指定 RIME 用户词库」点完保存失败，下次启动又回到自动探测，
+/// 用户看到的现象就是「怎么都识别不到词库」。所以这里换成用户可写的目录，
+/// 并把原因留给界面显示，而不是静默换掉。
+pub fn app_dir_note() -> Option<String> {
+    APP_DIR_NOTE.get().cloned().flatten()
+}
+
+fn remember_app_dir_note(note: Option<String>) -> Option<String> {
+    // 只记第一次：后续调用（命令行、界面各算一次）不该覆盖真正的来源。
+    let _ = APP_DIR_NOTE.set(note.clone());
+    note
+}
+
 /// 配置/日志所在目录：Windows 为 EXE 所在目录，macOS 默认用户资料库。
+///
+/// Linux 上优先用 EXE 所在目录（便携版，拷走整个目录即可带走配置）；
+/// 该目录不可写时退到 `$XDG_DATA_HOME/rime-user-dict-sync`，
+/// 这样系统级安装（`/opt`）也不会丢失设置。
 pub fn app_dir() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -237,10 +266,72 @@ pub fn app_dir() -> Result<PathBuf> {
         Ok(dir)
     }
     #[cfg(not(target_os = "macos"))]
-    Ok(std::env::current_exe()?
-        .parent()
-        .context("无法确定程序目录")?
-        .to_path_buf())
+    {
+        let exe_dir = std::env::current_exe()?
+            .parent()
+            .context("无法确定程序目录")?
+            .to_path_buf();
+        #[cfg(target_os = "linux")]
+        {
+            if is_writable(&exe_dir) {
+                remember_app_dir_note(None);
+                Ok(exe_dir)
+            } else {
+                let fallback = user_data_app_dir()?;
+                fs::create_dir_all(&fallback).context("无法创建用户级配置目录")?;
+                inherit_settings(&exe_dir, &fallback);
+                remember_app_dir_note(Some(format!(
+                    "程序目录 {} 不可写，已回退到此",
+                    exe_dir.display()
+                )));
+                Ok(fallback)
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(exe_dir)
+    }
+}
+
+/// 目录是否真的可写。
+///
+/// 用「建一个临时文件再删掉」来判定，而不是看权限位：只读挂载、ACL、
+/// immutable 属性这些都能让 `mode` 看起来正常却写入失败。
+#[cfg(target_os = "linux")]
+fn is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".rime-sync-probe-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Linux 的用户级配置目录：`$XDG_DATA_HOME/rime-user-dict-sync`。
+#[cfg(target_os = "linux")]
+fn user_data_app_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("无法确定用户主目录")?;
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(&home).join(".local/share"));
+    Ok(base.join("rime-user-dict-sync"))
+}
+
+/// 回退时把程序目录里已有的 INI 继承过来：系统级安装升级后不该丢设置。
+#[cfg(target_os = "linux")]
+fn inherit_settings(from: &Path, to: &Path) {
+    let source = from.join(CONFIG_FILE);
+    let target = to.join(CONFIG_FILE);
+    if target.is_file() || !source.is_file() {
+        return;
+    }
+    let _ = fs::copy(&source, &target);
 }
 
 #[cfg(target_os = "macos")]
@@ -267,6 +358,51 @@ pub fn set_app_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 系统级安装（/opt）回退到用户目录时，程序旁边那份 INI 要被继承过来，
+    /// 否则升级一次就等于把所有 WebDAV / 设备设置丢掉。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_are_inherited_when_config_dir_falls_back() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let original = "[webdav]\nurl=https://dav.example.com/rime/\n";
+        fs::write(from.path().join(CONFIG_FILE), original).unwrap();
+
+        inherit_settings(from.path(), to.path());
+        assert_eq!(
+            fs::read_to_string(to.path().join(CONFIG_FILE)).unwrap(),
+            original
+        );
+
+        // 回退目录已有配置时不能被程序旁边那份覆盖。
+        fs::write(from.path().join(CONFIG_FILE), "[webdav]\nurl=别的\n").unwrap();
+        inherit_settings(from.path(), to.path());
+        assert_eq!(
+            fs::read_to_string(to.path().join(CONFIG_FILE)).unwrap(),
+            original
+        );
+    }
+
+    /// 可写判定要真去建文件：只读挂载上权限位看着是 7，写照样失败。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_probe_reports_a_writable_dir_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_writable(dir.path()));
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "探测文件应当被删掉：{leftovers:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_probe_rejects_a_missing_dir() {
+        assert!(!is_writable(Path::new("/nonexistent/rime-sync-probe")));
+    }
 
     #[test]
     fn settings_round_trip_keeps_webdav_and_background() {

@@ -13,22 +13,25 @@ mod hash;
 mod identity;
 mod merge;
 mod paths;
+/// Linux 用自绘目录选择器：原生对话框不列隐藏项，而 RIME 目录本身就是隐藏路径。
+#[cfg(target_os = "linux")]
+mod picker_linux;
 mod platform;
 mod report;
 /// 后台服务只在 Windows 上提供；桌面快捷方式两端都有（Windows `.lnk` / macOS `.app`）。
 #[cfg(target_os = "windows")]
 mod service;
-#[cfg(target_os = "windows")]
-mod shortcut;
-/// macOS 用 AppleScript applet 提供同名快捷方式。
-#[cfg(target_os = "macos")]
-mod shortcut_macos;
 /// Linux 没有 Windows 服务，用 systemd 用户级 timer 定时跑 `--scheduled-round`。
 #[cfg(target_os = "linux")]
 mod service_linux;
+#[cfg(target_os = "windows")]
+mod shortcut;
 /// Linux 用 freedesktop `.desktop` 菜单项提供同名快捷方式。
 #[cfg(target_os = "linux")]
 mod shortcut_linux;
+/// macOS 用 AppleScript applet 提供同名快捷方式。
+#[cfg(target_os = "macos")]
+mod shortcut_macos;
 mod state;
 mod transport;
 mod ui;
@@ -173,11 +176,13 @@ fn run_cli(arguments: &[String]) -> i32 {
             0
         }
         Err(error) => {
-            let text = format!("失败: {error:#}");
-            log_line(&log, &text);
-            eprintln!("{text}");
+            let full = platform::attach_rime_diagnostics(&format!("失败: {error:#}"));
+            // 终端和日志给全量（含 stderr 与候选明细），系统通知只给一句能照做的：
+            // 通知框里塞十来行扫描结果没人看，也看不清。
+            log_line(&log, &full);
+            eprintln!("{full}");
             if options.notify {
-                platform::notify(NOTIFY_TITLE, &text, true);
+                platform::notify(NOTIFY_TITLE, &platform::short_error(&full), true);
             }
             1
         }
@@ -262,7 +267,9 @@ fn dispatch(command: Command, app_dir: &Path) -> Result<String> {
         #[cfg(target_os = "linux")]
         Command::RunService => {
             let _ = app_dir;
-            bail!("Linux 没有常驻服务进程：后台搬运由 systemd 用户级 timer 调度，请用 --scheduled-round")
+            bail!(
+                "Linux 没有常驻服务进程：后台搬运由 systemd 用户级 timer 调度，请用 --scheduled-round"
+            )
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         Command::InstallService
@@ -279,6 +286,65 @@ fn dispatch(command: Command, app_dir: &Path) -> Result<String> {
 }
 
 fn service_status_text(app_dir: &Path) -> Result<String> {
+    Ok(format!(
+        "{}\n{}\n{}",
+        config_dir_line(app_dir),
+        service_status_body(app_dir)?,
+        rime_dir_line(app_dir)
+    ))
+}
+
+/// 配置/日志目录，以及它是否从程序目录回退过来的。
+///
+/// 装在 `/opt`、`/usr/local/bin` 这类 root 所有的目录时，普通用户写不了
+/// 「指定 RIME 用户词库」的结果，看起来就像「怎么也识别不到词库」，
+/// 所以这一行要能直接看出配置到底落在哪。
+fn config_dir_line(app_dir: &Path) -> String {
+    match config::app_dir_note() {
+        Some(note) => format!("配置目录：{}（{note}）", app_dir.display()),
+        None => format!("配置目录：{}（程序所在目录）", app_dir.display()),
+    }
+}
+
+/// 汇报程序当前认为的 RIME 用户目录。
+///
+/// 「找不到词库」几乎都出在目录判断上（以 root / sudo 运行时 `HOME` 指向 `/root`，
+/// 或 fcitx5 与 ibus 两套目录并存），所以把来源和可用性一起打出来。
+fn rime_dir_line(app_dir: &Path) -> String {
+    // 只读：配置文件不存在时不要顺手创建，`--service-status` 不该有副作用。
+    let ini = app_dir.join("RimeUserDictSync.ini");
+    let settings = if ini.is_file() {
+        config::Settings::load(&ini).ok()
+    } else {
+        None
+    };
+    let configured = settings
+        .as_ref()
+        .is_some_and(|settings| !settings.user_data_dir.trim().is_empty());
+    let dir = match &settings {
+        Some(settings) => crate::context::resolve_rime_dir(settings),
+        None => crate::platform::default_user_dir(),
+    };
+    let usable = dir.join("installation.yaml").is_file();
+    let state = if usable {
+        "可用".to_owned()
+    } else {
+        "缺少 installation.yaml".to_owned()
+    };
+    let source = if configured {
+        "配置指定"
+    } else {
+        "自动探测"
+    };
+    let mut line = format!("RIME 用户目录：{}（{source}，{state}）", dir.display());
+    if !usable {
+        // 不可用时把扫过的候选一并列出，否则用户除了「不存在」拿不到任何线索。
+        line.push_str(&crate::platform::rime_dir_diagnostics());
+    }
+    line
+}
+
+fn service_status_body(app_dir: &Path) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
         Ok(format!(

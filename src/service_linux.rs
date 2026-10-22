@@ -34,7 +34,8 @@ fn unit_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
-            let home = std::env::var_os("HOME").context("读不到 HOME，无法定位 systemd 用户单元")?;
+            let home =
+                std::env::var_os("HOME").context("读不到 HOME，无法定位 systemd 用户单元")?;
             PathBuf::from(home).join(".config")
         }
     };
@@ -140,7 +141,9 @@ pub fn uninstall() -> Result<String> {
         }
     }
     let _ = systemctl(&["daemon-reload"]);
-    Ok(format!("已关闭 {UNIT_TITLE}：后台搬运的 timer 与 service 均已移除。"))
+    Ok(format!(
+        "已关闭 {UNIT_TITLE}：后台搬运的 timer 与 service 均已移除。"
+    ))
 }
 
 /// 改间隔：只重写 timer，内容没变就不折腾 systemd。
@@ -233,7 +236,9 @@ pub fn heal_after_update() {
 fn systemctl(arguments: &[&str]) -> Result<Output> {
     let mut command = Command::new("systemctl");
     command.arg("--user").args(arguments);
-    command.output().context("调用 systemctl 失败（系统里没有 systemd？）")
+    command
+        .output()
+        .context("调用 systemctl 失败（系统里没有 systemd？）")
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
@@ -253,7 +258,10 @@ fn interval_minutes(minutes: u32) -> u32 {
 /// 双引号里 `\` 与 `"` 需要转义；`%` 是 systemd 的说明符前缀（`%h`、`%i`……），
 /// 路径里真出现 `%` 时必须写成 `%%`，否则 unit 会解析失败。
 fn exec_quote(value: &str) -> String {
-    let escaped = value.replace('%', "%%").replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped = value
+        .replace('%', "%%")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
 
@@ -303,11 +311,7 @@ fn interval_minutes_of_unit(text: &str) -> Option<u32> {
         .map(str::trim)
         .find(|line| line.starts_with("OnUnitActiveSec="))?;
     let value = line.trim_start_matches("OnUnitActiveSec=").trim();
-    value
-        .strip_suffix("min")?
-        .trim()
-        .parse::<u32>()
-        .ok()
+    value.strip_suffix("min")?.trim().parse::<u32>().ok()
 }
 
 /// 取 `ExecStart=` 里的第一个参数（去掉引号与转义）。
@@ -408,6 +412,9 @@ mod tests {
             exec_program(&unit).as_deref(),
             Some("/home/me/程序 with space/RimeUserDictSync")
         );
-        assert_eq!(recorded_app_dir(&unit).as_deref(), Some("/home/me/Rime Config"));
+        assert_eq!(
+            recorded_app_dir(&unit).as_deref(),
+            Some("/home/me/Rime Config")
+        );
     }
 }

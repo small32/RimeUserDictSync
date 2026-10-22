@@ -87,6 +87,16 @@ macOS:   ~/Library/Rime
 
 程序会读取其中的 `installation_id`，并把 `sync_dir` 写成该目录下的 `Sync`。
 
+Linux 上这个按钮用的是**程序自绘的选择器**，不是系统对话框：RIME 用户目录天生在
+`~/.local/share/fcitx5/rime`、`~/.config/ibus/rime` 这类**隐藏目录**里，而
+xdg-desktop-portal / GTK 的文件对话框都不给调用方「显示隐藏文件」的开关，默认根本看不见
+`.local`，只能手打整条路径（没装 portal 的桌面更是点了没反应）。所以这里：
+
+- **隐藏文件与隐藏文件夹默认就列出来**，右上角可勾掉「显示隐藏文件」反过来折叠；
+- 可以直接粘贴路径跳转，支持 `~/`、`%HOME%` 与相对写法，回车生效；
+- 目录里有 `installation.yaml` 的会额外标一个绿色 `RIME`，一眼认出该点哪个；
+- 顶部「常见位置」直接列出自动探测到的候选目录，省掉逐层找 `.local`。
+
 ### 2. WebDAV 设置
 
 填写地址、用户名、密码，点击「测试连接」。测试会执行
@@ -326,12 +336,98 @@ Linux 的 RIME 前端是自动探测的：
 | fcitx5-rime | `$XDG_DATA_HOME/fcitx5/rime`（默认 `~/.local/share/fcitx5/rime`） | `rime_dict_manager --sync`、`rime_deployer --build <user> /usr/share/rime-data` |
 | ibus-rime | `$XDG_CONFIG_HOME/ibus/rime`（默认 `~/.config/ibus/rime`） | 同上 |
 
-- 判定顺序：先找含 `installation.yaml` 的目录，其次找已存在的目录，都没有才退回 fcitx5 默认路径；
+- **判定顺序（账号优先，跨账号兜底）**：候选目录分两层，**先查当前账号自己的 home**，
+  这一层查不到（不存在，或只是空目录）才降级去 `/home` 下别的账号：
+
+  | 层 | 内容 | 何时使用 |
+  | --- | --- | --- |
+  | 0 当前账号优先 | 进程 `HOME`（root 运行时就是 `/root`） | 只要有一个目录含 `installation.yaml` 或 `*.userdb` 就直接用它，**不会**跳到 1 层 |
+  | 1 其他账号备选 | `SUDO_USER` 指向的账号、`/home` 下每个目录、非 root 运行时的 `/root` | 仅当 0 层一个都没命中 |
+
+  层内按「像不像真的在用」打分：`*.userdb`（+2）> `installation.yaml`（+1）> 目录存在（+1），
+  同分取先出现的（fcitx5 在 ibus 之前）。这样 root 下自己那套词库会被优先同步，
+  而 root 下空空如也时（最常见：词库跟着桌面账号走）也能自动落到 `/home/<你的账号>`，
+  不会对着一句「RIME 用户目录不存在」发呆。只做只读探测，读不到别人家 700 的 home 时直接跳过；
+- `--service-status` 会打出当前认定的目录、来源（自动探测 / 配置指定）和是否可用，排查时先看这一行：
+  ```
+  RIME 用户目录：/home/small32/.local/share/fcitx5/rime（自动探测，可用）
+  ```
+  自动探测到别的账号时会提示一句，不让你误以为同步的是自己的词库；
 - 这两个 librime 工具都从**当前目录**读 `installation.yaml`，所以程序把子进程的工作目录固定在 RIME 用户目录；
 - 部署完用 `fcitx5-remote -r` 让 fcitx5 立刻重新加载；失败不算错，切换输入法时也会生效；
 - 依赖：`sudo apt install librime-bin librime-data`；
 - 不同前端的命令确实不统一，留了逃生口：在 INI 写 `[rime] deployer_path=/path/to/tool`，
   程序改用它的 `--sync` / `--deploy`。
+
+#### 输入法占着 userdb 时（LevelDB 独占锁）
+
+librime 的 userdb 是 LevelDB，**同一时刻只允许一个进程打开**。桌面上的 fcitx5 / ibus 常驻持有
+`*.userdb`，于是本程序另起的 `rime_dict_manager --sync` 会失败：
+
+```
+IO error: lock /home/u/.local/share/fcitx5/rime/./rime_ice.userdb/LOCK: Resource temporarily unavailable
+```
+
+这里有个容易混淆的点：RIME 自己菜单里的「同步 / 重新部署」**不会**撞锁——它是在 fcitx5
+进程内部直接调 librime（`RimeSyncUserData`），本来就跟自己共享同一个 userdb 句柄。但那个入口
+只能鼠标点：`fcitx5-remote` 只有 `-c/-o/-r/-t/-e/-g/-n/-q/-s`，没有 sync/deploy；
+DBus 控制器也没有对应方法；`ibus` 除了 `ibus exit` 同样别无他途。这也正是 RIME 官方额外提供
+`rime_dict_manager` / `rime_deployer` 这组 CLI 的原因——它是给「前端不在跑」的场景准备的。
+
+**本程序的策略：不碰你的输入法。** 不做「临时退出 fcitx5 → 同步 → 再拉起」那一套，因为那会让
+输入法在同步瞬间消失一两秒，正在打字时尤其讨厌。分工因此变成：
+
+| 阶段 | 谁来做 | 撞锁吗 |
+| --- | --- | --- |
+| 后台轮次：拉取、合并文本、上传 | 本程序（systemd timer） | 不碰 userdb，不会 |
+| 把远端快照写进 `Sync/<各ID>/` | 本程序 | 不会 |
+| `--sync` 合并 userdb、`--deploy` 让词生效 | 撞锁时交给 RIME 菜单 | 由 fcitx5 自己执行，不会 |
+
+所以撞锁时顶栏只给一句能立刻照做的话：
+
+```
+词库被输入法占用：跨机快照已就位，请在输入法图标右键的 RIME 菜单点「同步」，再点「重新部署」；或退出输入法后重试本程序
+```
+
+- 看到这句时**跨机文件其实已经同步完了**（步骤 1–3 已落盘），只差 userdb 合并与生效，点完菜单即完成；
+- 想让本程序一手包完，就先 `fcitx5-remote -e`（ibus 用 `ibus exit`）退出输入法，再点「同步词库」，
+  完成后重新启动输入法即可；
+- 完整的 stderr（含 LevelDB 原文与解释）只写进日志和终端，界面不摊开，避免把这句话淹掉；
+- 其他平台不受影响：Windows 的 `WeaselDeployer /sync`、macOS 的 Squirrel `--sync` 由各自前端处理锁。
+
+#### 装在 `/opt` 这类系统目录时
+
+程序默认把 `RimeUserDictSync.ini` 与 `RimeSync.log` 放在**程序所在目录**（便携式，拷走整个目录
+就能带走配置）。但 `/opt`、`/usr/local/bin` 通常属于 root，普通用户写不进去，而「指定 RIME
+用户词库」「WebDAV 设置」「设备设置」全都要落盘 —— 结果是**设置看起来存住了，重启又变回原样**，
+表现就是「怎么都识别不到词库」。
+
+所以程序启动时会真的试写一次（建临时文件再删，只读挂载 / ACL / immutable 都骗不过去）：
+
+| 程序目录 | 配置与日志位置 |
+| --- | --- |
+| 可写（`~/Apps/…`、便携 U 盘） | 就近放在程序旁边 |
+| 不可写（`/opt`、`/usr/local/bin`、只读挂载） | `$XDG_DATA_HOME/rime-user-dict-sync`（默认 `~/.local/share/rime-user-dict-sync`） |
+
+- 回退时会把程序目录里已有的 INI **继承**过来，升级不会丢设置；
+- 回退不是静默的：界面日志里写一行，`--service-status` 也直接给出位置：
+  ```
+  配置目录：/home/small32/.local/share/rime-user-dict-sync（程序目录 /opt/RimeUserDictSync 不可写，已回退到此）
+  ```
+- 想强制指定位置仍然用 `--app-dir <目录>`，systemd 单元与 `.desktop` 都会记这个值；
+- 探测不到词库时，这行会跟着列出**扫过的每个候选目录、所属层级和得分**，不用靠猜：
+  ```
+  RIME 用户目录：/root/.local/share/fcitx5/rime（自动探测，缺少 installation.yaml）
+  已扫描的候选目录（先查「当前账号优先」这一组，全都没命中才降级到「其他账号备选」；分数越高越像是在用的那套）：
+    [当前账号优先] /root/.local/share/fcitx5/rime（0 分：不存在）
+    [当前账号优先] /root/.config/ibus/rime（1 分：目录存在）
+    [其他账号备选] /home/small32/.local/share/fcitx5/rime（4 分：目录存在、installation.yaml、*.userdb）
+  当前 HOME：/root
+  ```
+- 界面与日志分工：主窗口顶栏**只留一句能立刻照做的话**
+  （`找不到 RIME 用户目录 …，请点击「指定 RIME 用户词库」`），
+  上面那份候选明细只写进日志（`RimeSync.log`、终端 stderr、systemd journal），
+  同一句错误不会在日志里反复刷屏；系统通知同样只带这一句。
 
 ### 调度细节
 
@@ -584,15 +680,24 @@ Linux 输出 `target/release/RimeUserDictSync`（编译需要 GTK3 / XKB 的头�
 
 ## 自动构建和发布
 
-`.github/workflows/release.yml` 在推送 `v*` 标签时，用 GitHub 托管的 Windows 与 macOS
-构建机完成测试、编译和打包，两个平台全部成功后上传到同一个 GitHub Release。
+`.github/workflows/release.yml` 在推送 `v*` 标签时，用 GitHub 托管的 Windows、macOS 与 Linux
+构建机完成格式检查、clippy、测试、编译和打包，三个平台全部成功后上传到同一个 GitHub Release：
+
+| 平台 | 产物 |
+| --- | --- |
+| Windows x64 | `RimeUserDictSync-v0.5.0-Windows-x64.exe` |
+| macOS | `RimeUserDictSync-v0.5.0-macOS-*.zip`（ARM64 / Intel / Universal 2） |
+| Linux x86_64 | `RimeUserDictSync-v0.5.0-Linux-x86_64`（单文件，`chmod +x` 后直接运行） |
+
+Linux 构建机额外装 `libgtk-3-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`，
+这是 eframe 与 rfd 编译期需要的 `pkg-config` 条目。
 
 发布新版本时，先把 `Cargo.toml` 的版本号改好并提交，再推送匹配的标签：
 
 ```bash
-git tag v0.3.0
+git tag v0.5.0
 git push origin main
-git push origin v0.3.0
+git push origin v0.5.0
 ```
 
 标签必须是 `v` 加 `Cargo.toml` 中的版本号，否则构建会主动失败。

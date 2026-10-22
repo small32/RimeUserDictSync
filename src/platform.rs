@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::{
+    fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -82,48 +83,312 @@ pub fn default_user_dir() -> PathBuf {
     }
     #[cfg(target_os = "linux")]
     {
-        // Linux 没有统一的 RIME 用户目录：fcitx5-rime 与 ibus-rime 各用一套。
-        // 判定顺序：含 installation.yaml 的优先（这才是真正在用的那套），
-        // 其次已存在的目录，都没有才退回 fcitx5 的默认位置。
+        // Linux 没有统一的 RIME 用户目录：fcitx5-rime 与 ibus-rime 各用一套；
+        // 而且以 root / sudo 运行时进程的 HOME 指向 /root，真正在用的词库却在
+        // 自己账号的 /home/<user> 下，所以候选要横跨 /home 下所有账号。
         let candidates = linux_rime_candidates();
-        if let Some(found) = candidates
-            .iter()
-            .find(|dir| dir.join("installation.yaml").is_file())
-        {
-            return found.clone();
+        if let Some(found) = linux_pick_rime_dir(&candidates) {
+            return found;
         }
-        if let Some(found) = candidates.iter().find(|dir| dir.is_dir()) {
-            return found.clone();
-        }
-        return candidates.into_iter().next().unwrap_or_default();
+        return candidates
+            .into_iter()
+            .map(|(_, dir)| dir)
+            .next()
+            .unwrap_or_default();
     }
     #[allow(unreachable_code)]
     PathBuf::new()
 }
 
-/// Linux 上 RIME 用户目录的候选位置，按「更可能是当前在用的」排序。
+/// 候选目录的优先级：0 = 当前账号自己的 home（root 运行时就是 `/root`）。
 #[cfg(target_os = "linux")]
-fn linux_rime_candidates() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".local/share")));
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+const TIER_SELF: u8 = 0;
+/// 1 = 其他账号：`SUDO_USER`、`/home` 下每个账号、以及非 root 运行时的 `/root`。
+#[cfg(target_os = "linux")]
+const TIER_OTHER_ACCOUNT: u8 = 1;
 
+/// 「找到了」的门槛：目录存在，且至少有 `installation.yaml` 或 `*.userdb`。
+///
+/// 只认 `is_dir()` 不行：装过 fcitx5 的机器上 `~/.local/share/fcitx5/rime`
+/// 可能只是个空壳（1 分），把它当结果等于同步空气，也就永远轮不到 `/home` 下
+/// 那套真正在用的词库。
+#[cfg(target_os = "linux")]
+const LINUX_RIME_USABLE_SCORE: u8 = 2;
+
+/// Linux 上 RIME 用户目录的候选位置，带优先级分组。
+///
+/// 分级的意义是用户视角的「先查自己的，再查别人的」：
+/// - 以 root / sudo 拉起时，先在 **root 自己的 home** 里找，找到就用，不越权去动
+///   别人的词库；
+/// - root 下确实没有（这是常态：词库跟着桌面账号走），才降级到 `/home` 下各账号；
+/// - 普通账号运行时，自己家目录永远是 0 层，`/root` 退到 1 层兜底。
+///
+/// 组内仍按 `linux_rime_dir_score` 挑最像在用的那个，组间是硬边界：
+/// 0 层只要达到门槛就绝不看 1 层。
+///
+/// 只做只读探测：别人家 700 的 home 读不到时 `is_dir()` 直接为假，不影响结果。
+#[cfg(target_os = "linux")]
+fn linux_rime_candidates() -> Vec<(u8, PathBuf)> {
+    let current_home = std::env::var_os("HOME").map(PathBuf::from);
     let mut candidates = Vec::new();
-    // fcitx5-rime：XDG 数据目录下的 fcitx5/rime。
-    if let Some(data_home) = &data_home {
-        candidates.push(data_home.join("fcitx5/rime"));
-    }
-    // ibus-rime：XDG 配置目录下的 ibus/rime。
-    if let Some(config_home) = &config_home {
-        candidates.push(config_home.join("ibus/rime"));
+    for (tier, home) in linux_home_roots(&current_home) {
+        // XDG 变量只描述「当前进程所属用户」的布局，套到别人身上会指到错误位置。
+        let is_current = current_home.as_deref() == Some(home.as_path());
+        let data_home = if is_current {
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| home.join(".local/share"));
+        let config_home = if is_current {
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| home.join(".config"));
+
+        // fcitx5-rime：XDG 数据目录下的 fcitx5/rime。
+        push_unique(&mut candidates, tier, data_home.join("fcitx5/rime"));
+        // ibus-rime：XDG 配置目录下的 ibus/rime。
+        push_unique(&mut candidates, tier, config_home.join("ibus/rime"));
         // 少数老发行版把 fcitx5 的 RIME 数据放在 ~/.config/fcitx5/rime。
-        candidates.push(config_home.join("fcitx5/rime"));
+        push_unique(&mut candidates, tier, config_home.join("fcitx5/rime"));
     }
     candidates
+}
+
+/// 可能放着 RIME 用户目录的 home 根，带优先级分组、按路径去重。
+#[cfg(target_os = "linux")]
+fn linux_home_roots(current_home: &Option<PathBuf>) -> Vec<(u8, PathBuf)> {
+    let mut roots: Vec<(u8, PathBuf)> = Vec::new();
+    // 当前账号永远排第一：root 运行时这里就是 /root 自己。
+    if let Some(home) = current_home {
+        push_unique(&mut roots, TIER_SELF, home.clone());
+    }
+    // `sudo ./RimeUserDictSync`：HOME 变成 /root，但词库在真实账号下。
+    if let Some(user) = std::env::var_os("SUDO_USER") {
+        let name = user.to_string_lossy();
+        if !name.is_empty() && name != "root" {
+            push_unique(
+                &mut roots,
+                TIER_OTHER_ACCOUNT,
+                PathBuf::from("/home").join(name.as_ref()),
+            );
+        }
+    }
+    // 其余账号：只读扫一层 /home，不递归。
+    if let Ok(entries) = fs::read_dir("/home") {
+        let mut others: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .map(|entry| entry.path())
+            .collect();
+        others.sort();
+        for path in others {
+            push_unique(&mut roots, TIER_OTHER_ACCOUNT, path);
+        }
+    }
+    // root 直接登录时它在 0 层；普通账号运行时它只是 1 层的兜底。
+    push_unique(&mut roots, TIER_OTHER_ACCOUNT, PathBuf::from("/root"));
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn push_unique(list: &mut Vec<(u8, PathBuf)>, tier: u8, path: PathBuf) {
+    // 同一路径只保留最先出现的那次（也就是优先级最高、最早被扫到的分组）。
+    if !list.iter().any(|(_, existing)| existing == &path) {
+        list.push((tier, path));
+    }
+}
+
+/// 从候选里挑一个最像「正在被输入法使用」的目录。
+///
+/// 先按分组：0 层（当前账号）里只要有一个达到 `LINUX_RIME_USABLE_SCORE`，就用它，
+/// 绝不跨到 1 层；0 层全是空的或不存在时才降级到 1 层。组内比分数，
+/// 同分保留先出现的，从而让 fcitx5 优先于 ibus 之类「更常见」的位置胜出。
+#[cfg(target_os = "linux")]
+fn linux_pick_rime_dir(candidates: &[(u8, PathBuf)]) -> Option<PathBuf> {
+    let mut tiers: Vec<u8> = candidates.iter().map(|(tier, _)| *tier).collect();
+    tiers.sort_unstable();
+    tiers.dedup();
+
+    // 兜底：所有分组都没达到门槛时，仍返回「相对最像样」的那个，
+    // 让上层报错时能把最可能的路径摆给用户看。
+    let mut best_overall: Option<(u8, PathBuf)> = None;
+    for tier in tiers {
+        let mut best_in_tier: Option<(u8, PathBuf)> = None;
+        for (_, dir) in candidates.iter().filter(|(t, _)| *t == tier) {
+            let score = linux_rime_dir_score(dir);
+            let better = |best: &Option<(u8, PathBuf)>| match best {
+                Some((best_score, _)) => score > *best_score,
+                None => true,
+            };
+            if better(&best_overall) {
+                best_overall = Some((score, dir.clone()));
+            }
+            if better(&best_in_tier) {
+                best_in_tier = Some((score, dir.clone()));
+            }
+        }
+        if let Some((score, dir)) = best_in_tier
+            && score >= LINUX_RIME_USABLE_SCORE
+        {
+            return Some(dir);
+        }
+    }
+    best_overall.map(|(_, dir)| dir)
+}
+
+/// 0 = 不存在；1 = 目录存在；+1 有 `installation.yaml`；+2 有 `*.userdb`。
+#[cfg(target_os = "linux")]
+fn linux_rime_dir_score(dir: &Path) -> u8 {
+    if !dir.is_dir() {
+        return 0;
+    }
+    let mut score = 1;
+    if dir.join("installation.yaml").is_file() {
+        score += 1;
+    }
+    if linux_has_userdb(dir) {
+        score += 2;
+    }
+    score
+}
+
+#[cfg(target_os = "linux")]
+fn linux_has_userdb(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".userdb"))
+}
+
+/// 自动探测到「别人的 home」时的说明。
+///
+/// 以 root / sudo 运行时 `HOME` 是 `/root`，真正在用的词库在 `/home/<user>`；
+/// 不说一句的话，用户会以为自己同步的是个空目录。
+#[cfg(target_os = "linux")]
+pub fn rime_dir_origin_hint(dir: &Path) -> Option<String> {
+    let current = std::env::var_os("HOME").map(PathBuf::from)?;
+    origin_hint(dir, &current)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn rime_dir_origin_hint(_dir: &Path) -> Option<String> {
+    None
+}
+
+/// 探测明细：每个候选目录的优先级分组、得分与命中特征。
+///
+/// 「找不到词库」时用户手里只有一句「目录不存在」，而原因可能是权限、可能是
+/// 前端不同、也可能是程序跑在 root 下；把扫过的位置全列出来，一次就能看出来。
+#[cfg(target_os = "linux")]
+pub fn rime_probe_lines() -> Vec<String> {
+    linux_rime_candidates()
+        .into_iter()
+        .map(|(tier, dir)| {
+            let mut marks = vec![if dir.is_dir() {
+                "目录存在"
+            } else {
+                "不存在"
+            }];
+            if dir.join("installation.yaml").is_file() {
+                marks.push("installation.yaml");
+            }
+            if linux_has_userdb(&dir) {
+                marks.push("*.userdb");
+            }
+            format!(
+                "  [{}] {}（{} 分：{}）",
+                tier_label(tier),
+                dir.display(),
+                linux_rime_dir_score(&dir),
+                marks.join("、")
+            )
+        })
+        .collect()
+}
+
+/// 候选目录的优先级标签，直接进日志给用户看。
+#[cfg(target_os = "linux")]
+fn tier_label(tier: u8) -> &'static str {
+    match tier {
+        TIER_SELF => "当前账号优先",
+        _ => "其他账号备选",
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn rime_probe_lines() -> Vec<String> {
+    Vec::new()
+}
+
+/// 候选目录清单（只要路径，按优先级顺序），供目录选择器做「常见位置」快捷跳转。
+#[cfg(target_os = "linux")]
+pub fn rime_candidate_dirs() -> Vec<PathBuf> {
+    linux_rime_candidates()
+        .into_iter()
+        .map(|(_, dir)| dir)
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn rime_candidate_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// 给「找不到 RIME 用户目录」这类错误补上候选明细，**只用于写日志**。
+///
+/// 界面顶栏只有一行，塞进十来行扫描结果会把那句「点这里指定目录」淹掉；
+/// 而排查又确实需要这些明细，所以拆开：界面显示原句，日志里跟一段诊断。
+pub fn attach_rime_diagnostics(message: &str) -> String {
+    if !message.contains("找不到 RIME 用户目录") {
+        return message.to_owned();
+    }
+    let extra = rime_dir_diagnostics();
+    if extra.is_empty() {
+        message.to_owned()
+    } else {
+        format!("{message}{extra}")
+    }
+}
+
+/// 拼成一段可直接放进日志/对话框的探测报告。
+pub fn rime_dir_diagnostics() -> String {
+    let lines = rime_probe_lines();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(
+        "\n已扫描的候选目录（先查「当前账号优先」这一组，全都没命中才降级到「其他账号备选」；\
+         分数越高越像是在用的那套）：",
+    );
+    for line in lines {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        text.push_str(&format!("\n当前 HOME：{}", PathBuf::from(home).display()));
+    }
+    if let Some(user) = std::env::var_os("SUDO_USER") {
+        text.push_str(&format!("\nSUDO_USER：{}", user.to_string_lossy()));
+    }
+    text
+}
+
+#[cfg(target_os = "linux")]
+fn origin_hint(dir: &Path, current_home: &Path) -> Option<String> {
+    if current_home.as_os_str().is_empty() || dir.starts_with(current_home) {
+        return None;
+    }
+    Some(format!(
+        "已自动使用 {} 下的 RIME 用户目录（当前进程 HOME 是 {}）。\
+         若要改回自己账号下的词库，请点「指定 RIME 用户词库」。",
+        dir.display(),
+        current_home.display()
+    ))
 }
 
 /// librime 的共享数据目录（方案与预编译产物都在这里）。
@@ -135,9 +400,9 @@ fn linux_shared_data_dir() -> Option<PathBuf> {
         .find(|dir| dir.is_dir())
 }
 
-/// 在 PATH 里找一个可执行文件；找不到再看 `/usr/bin`。
+/// 在 PATH 里找一个可执行文件；找不到再看常见系统目录。
 #[cfg(target_os = "linux")]
-fn which(name: &str) -> Option<PathBuf> {
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let is_executable = |path: &Path| {
         path.metadata()
@@ -152,8 +417,10 @@ fn which(name: &str) -> Option<PathBuf> {
         })
         .unwrap_or_default();
     found.or_else(|| {
-        let fallback = PathBuf::from("/usr/bin").join(name);
-        is_executable(&fallback).then_some(fallback)
+        ["/usr/bin", "/usr/local/bin", "/bin"]
+            .into_iter()
+            .map(|dir| PathBuf::from(dir).join(name))
+            .find(|candidate| is_executable(candidate))
     })
 }
 
@@ -380,23 +647,61 @@ fn run_argv(argv: &[String], cwd: Option<&Path>, cancel: &AtomicBool) -> Result<
     }
 }
 
-/// LevelDB 单进程锁的额外提示。
+/// 判断一条 stderr 是不是「userdb 被别的进程占着」。
 ///
-/// Linux 上没有「输入法自己执行同步」这条路，只能另起 `rime_dict_manager`，
+/// librime 的原文有两种措辞：LevelDB 的 `IO error: lock ...LOCK: already held by
+/// process` 与系统的 `Resource temporarily unavailable`（同一件事的 errno 说法）。
+/// 这个判断决定要不要临时退出输入法重试，宁可窄一点，别把别的错误也当成锁冲突。
+pub fn is_userdb_lock_error(details: &str) -> bool {
+    let lowered = details.to_ascii_lowercase();
+    lowered.contains("already held by process")
+        || lowered.contains("resource temporarily unavailable")
+        || (lowered.contains("lock")
+            && (lowered.contains(".userdb") || lowered.contains("leveldb")))
+}
+
+/// 撞锁时界面顶栏那一句（完整 stderr 另由 [`short_error`] 之外的路径写进日志）。
+///
+/// 刻意**不**自动退出输入法：那会在同步瞬间让用户的输入法消失一两秒，
+/// 正在打字时尤其讨厌；而 RIME 自己菜单里的「同步 / 重新部署」是在
+/// fcitx5 进程内直接调 librime 的，从不撞锁。所以策略是——
+/// 后台轮次照旧只搬文件（不碰 userdb，永不撞锁），
+/// 真要 sync/deploy 又撞上锁时，把「点输入法菜单」这个动作交给用户。
+pub const LOCK_SHORT_HINT: &str = "词库被输入法占用：跨机快照已就位，请在输入法图标右键的 RIME 菜单点「同步」，再点「重新部署」；或退出输入法后重试本程序";
+
+/// 把一段错误压成界面能只显示一行的短句。
+///
+/// 顶栏只有一行高，而 RIME 命令失败时的原文带着整段 stderr（好几行）。
+/// 这里只负责「界面显示什么」，日志依旧用 [`attach_rime_diagnostics`] 拿全量。
+pub fn short_error(details: &str) -> String {
+    if is_userdb_lock_error(details) {
+        return LOCK_SHORT_HINT.to_owned();
+    }
+    let mut lines = details.lines().filter(|line| !line.trim().is_empty());
+    let first = lines.next().unwrap_or_default().trim().to_owned();
+    if lines.next().is_some() {
+        first
+    } else {
+        details.trim().to_owned()
+    }
+}
+
+/// LevelDB 单进程锁的额外提示（拼在命令 stderr 后面，只进日志/终端）。
+///
+/// Linux 上没有「输入法自己执行同步」这条外部通路，只能另起 `rime_dict_manager`，
 /// 而正在运行的 fcitx5 / ibus 往往正占着 `*.userdb`：报错原文只有一行
 /// `IO error: lock ... already held by process`，不解释的话用户完全无从下手。
+///
+/// 这里**只说明怎么解决，不代劳**：本程序不退出、不重启用户的输入法。
 fn lock_hint(details: &str) -> &'static str {
-    let lowered = details.to_lowercase();
-    let locked = lowered.contains("already held")
-        || lowered.contains("lock")
-        || lowered.contains("资源暂时不可用")
-        || lowered.contains("resource temporarily unavailable");
-    if !locked {
+    if !is_userdb_lock_error(details) {
         return "";
     }
     "\n提示：输入法正占用 userdb（LevelDB 只允许一个进程打开）。\n      \
-     请先退出输入法再重试：fcitx5 执行 fcitx5-remote -e；ibus 执行 ibus exit。\n      \
-     同步完成后重新启动输入法即可。"
+     最省事的做法：在输入法图标右键的 RIME 菜单里点「同步」（必要时再点「重新部署」），\n      \
+     那是在 fcitx5 进程内直接调 librime，不会撞锁。\n      \
+     想让本程序自己跑完，就先退出输入法再重试：fcitx5 执行 fcitx5-remote -e；\n      \
+     ibus 执行 ibus exit，同步完成后重新启动输入法即可。"
 }
 
 /// 按 Windows 命令行分隔规则给参数加引号（含空白或引号时才包裹）。
@@ -550,6 +855,243 @@ pub fn expand_env(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 「找不到词库」时唯一的线索就是这份明细，至少要能列出来并带上得分。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_lines_list_candidates_with_scores() {
+        let lines = rime_probe_lines();
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| line.contains("分：")));
+        let text = rime_dir_diagnostics();
+        assert!(text.contains("已扫描的候选目录"));
+    }
+
+    /// 界面只显示一句，明细跟去日志：这两者的分界线就在这个函数里。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostics_are_attached_only_for_the_missing_rime_dir_error() {
+        let short = "找不到 RIME 用户目录 /nope，请点击「指定 RIME 用户词库」";
+        let full = attach_rime_diagnostics(short);
+        assert!(full.starts_with(short), "原句必须原样保留在最前面");
+        assert!(full.contains("已扫描的候选目录"), "明细要跟上");
+        assert!(full.contains("[当前账号优先]"));
+
+        // 别的错误一个字都不加，免得日志里冒出无关的扫描结果。
+        for other in [
+            "尚未配置 WebDAV 地址或用户名",
+            "尚未完成设备设置：请先指定 RIME 用户词库并设置设备 ID 与密码。",
+            "",
+        ] {
+            assert_eq!(attach_rime_diagnostics(other), other);
+        }
+    }
+
+    /// 撞锁时不代用户退出输入法，只给一句能照做的；完整 stderr 留在日志里。
+    #[test]
+    fn short_error_turns_a_lock_conflict_into_one_actionable_sentence() {
+        let details = "失败: RIME 命令执行失败，退出码 Some(1)：/usr/bin/rime_dict_manager --sync\n\
+                       E20261022 14:50:25 level_db.cc:259] Error opening db 'rime_ice': IO error: lock \
+                       /home/u/.local/share/fcitx5/rime/./rime_ice.userdb/LOCK: Resource temporarily unavailable\n\
+                       E20261022 14:50:26 user_dict_manager.cc:198] failed to merge snapshot file\n\
+                       提示：输入法正占用 userdb（LevelDB 只允许一个进程打开）。";
+        let short = short_error(details);
+        assert_eq!(short, LOCK_SHORT_HINT);
+        assert!(!short.contains('\n'), "顶栏只有一行，不能带换行");
+        assert!(short.contains("同步"), "必须告诉用户点哪里");
+    }
+
+    /// 其他错误：多行压成首行，单行原样返回——顶栏永远只放一行。
+    #[test]
+    fn short_error_collapses_multiline_details_to_the_first_line() {
+        let multiline =
+            "RIME 命令执行失败，退出码 Some(1)：/usr/bin/rime_deployer\nE2026 stderr 第二行";
+        assert_eq!(
+            short_error(multiline),
+            "RIME 命令执行失败，退出码 Some(1)：/usr/bin/rime_deployer"
+        );
+
+        let single = "尚未配置 WebDAV 地址或用户名";
+        assert_eq!(short_error(single), single);
+
+        // 首行是空行时不能返回空串，否则顶栏会变成一片空白。
+        assert_eq!(short_error("\n\n真正的原因"), "真正的原因");
+    }
+
+    /// 锁判定要窄：别把普通 stderr 也当成锁冲突，否则界面会给错指引。
+    #[test]
+    fn lock_detection_matches_leveldb_and_errno_wording_only() {
+        assert!(is_userdb_lock_error(
+            "lock ...LOCK: already held by process"
+        ));
+        assert!(is_userdb_lock_error("Resource temporarily unavailable"));
+        assert!(is_userdb_lock_error(
+            "Error opening db 'rime_ice': IO error: lock /x/rime_ice.userdb/LOCK"
+        ));
+        assert!(!is_userdb_lock_error("failed to merge snapshot file"));
+        assert!(!is_userdb_lock_error("no such file or directory"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rime_dir_score_prefers_a_directory_that_is_really_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(linux_rime_dir_score(&missing), 0);
+
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(linux_rime_dir_score(&empty), 1);
+
+        let configured = dir.path().join("configured");
+        fs::create_dir_all(&configured).unwrap();
+        fs::write(
+            configured.join("installation.yaml"),
+            "installation_id: pc01\n",
+        )
+        .unwrap();
+        assert_eq!(linux_rime_dir_score(&configured), 2);
+
+        let used = dir.path().join("used");
+        fs::create_dir_all(used.join("luna_pinyin.userdb")).unwrap();
+        fs::write(used.join("installation.yaml"), "installation_id: pc01\n").unwrap();
+        assert_eq!(linux_rime_dir_score(&used), 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pick_skips_a_stale_root_directory_and_finds_the_real_account() {
+        // 复现用户场景：以 root 运行，/root 下有个空的 fcitx5/rime（只剩 1 分），
+        // 真正在用的词库在 /home/<user>（installation.yaml + userdb，4 分）。
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("root").join("fcitx5").join("rime");
+        let real = dir
+            .path()
+            .join("home")
+            .join("alice")
+            .join(".local/share/fcitx5/rime");
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(real.join("luna_pinyin.userdb")).unwrap();
+        fs::write(real.join("installation.yaml"), "installation_id: pc01\n").unwrap();
+
+        let picked = linux_pick_rime_dir(&[(TIER_SELF, stale), (TIER_OTHER_ACCOUNT, real.clone())])
+            .expect("应挑出一个目录");
+        assert_eq!(picked, real);
+    }
+
+    /// 用户明确要求的行为：root 下自己有一套词库时先用 root 的，
+    /// 哪怕 /home 下那套分数更高也不许越界。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pick_prefers_root_own_dictionary_over_a_higher_scoring_other_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_own = dir.path().join("root").join(".local/share/fcitx5/rime");
+        let alice = dir
+            .path()
+            .join("home")
+            .join("alice")
+            .join(".local/share/fcitx5/rime");
+        fs::create_dir_all(&root_own).unwrap();
+        fs::write(
+            root_own.join("installation.yaml"),
+            "installation_id: pc01\n",
+        )
+        .unwrap();
+        // /home/alice 更「完整」：既有 installation.yaml 也有 userdb。
+        fs::create_dir_all(alice.join("luna_pinyin.userdb")).unwrap();
+        fs::write(alice.join("installation.yaml"), "installation_id: pc02\n").unwrap();
+        assert!(linux_rime_dir_score(&alice) > linux_rime_dir_score(&root_own));
+
+        let picked =
+            linux_pick_rime_dir(&[(TIER_SELF, root_own.clone()), (TIER_OTHER_ACCOUNT, alice)])
+                .expect("应挑出一个目录");
+        assert_eq!(picked, root_own);
+    }
+
+    /// root 下连目录都没有（常态）时才降级到 /home 下的账号。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pick_falls_back_to_home_only_when_the_current_account_has_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("root").join(".local/share/fcitx5/rime");
+        let alice = dir
+            .path()
+            .join("home")
+            .join("alice")
+            .join(".local/share/fcitx5/rime");
+        fs::create_dir_all(alice.join("luna_pinyin.userdb")).unwrap();
+        fs::write(alice.join("installation.yaml"), "installation_id: pc02\n").unwrap();
+
+        let picked = linux_pick_rime_dir(&[
+            (TIER_SELF, missing_root),
+            (TIER_OTHER_ACCOUNT, alice.clone()),
+        ])
+        .expect("应挑出一个目录");
+        assert_eq!(picked, alice);
+    }
+
+    /// 全都不达标时仍要给出一个路径，方便报错时把最可能的位置摆给用户。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pick_still_returns_the_best_effort_when_nothing_is_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("root").join(".local/share/fcitx5/rime");
+        fs::create_dir_all(&empty).unwrap();
+        let missing = dir.path().join("home").join("alice").join("rime");
+        let picked =
+            linux_pick_rime_dir(&[(TIER_SELF, empty.clone()), (TIER_OTHER_ACCOUNT, missing)])
+                .expect("应挑出一个目录");
+        // 存在的 1 分优于不存在的 0 分，即便它来自 0 层。
+        assert_eq!(picked, empty);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pick_keeps_the_first_when_scores_tie() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first").join("rime");
+        let second = dir.path().join("second").join("rime");
+        for path in [&first, &second] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("installation.yaml"), "installation_id: pc01\n").unwrap();
+        }
+        let picked =
+            linux_pick_rime_dir(&[(TIER_SELF, first.clone()), (TIER_SELF, second)]).unwrap();
+        assert_eq!(picked, first);
+    }
+
+    /// 同一个 home 被两条规则命中时（例如 HOME 就是 /root，而兜底又会加一次 /root），
+    /// 只保留优先级最高的那次，避免 0 层被 1 层的重复项覆盖。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn push_unique_keeps_the_first_tier_for_a_repeated_path() {
+        let mut list: Vec<(u8, PathBuf)> = Vec::new();
+        push_unique(&mut list, TIER_SELF, PathBuf::from("/root"));
+        push_unique(&mut list, TIER_OTHER_ACCOUNT, PathBuf::from("/root"));
+        assert_eq!(list, vec![(TIER_SELF, PathBuf::from("/root"))]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hint_mentions_the_other_account_only_when_it_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home").join("alice");
+        let own = home.join(".local/share/fcitx5/rime");
+        fs::create_dir_all(&own).unwrap();
+        // 自己家目录下的：不提示。
+        assert!(origin_hint(&own, &home).is_none());
+
+        // 别人的：提示里要同时出现选中的目录和当前 HOME，用户才知道发生了什么。
+        let other = dir
+            .path()
+            .join("home")
+            .join("bob")
+            .join(".local/share/fcitx5/rime");
+        fs::create_dir_all(&other).unwrap();
+        let hint = origin_hint(&other, &home).expect("跨账号应给提示");
+        assert!(hint.contains(&other.display().to_string()));
+        assert!(hint.contains(&home.display().to_string()));
+    }
+
     #[test]
     fn leveldb_lock_errors_get_an_actionable_hint() {
         // librime 的原文，Linux 上几乎必然遇到（fcitx5 占着 userdb 时）。
@@ -574,7 +1116,10 @@ mod tests {
             reload: Vec::new(),
             cwd: Some(PathBuf::from("/home/me/rime")),
         };
-        assert_eq!(command.describe(RimeStage::Sync), "rime_dict_manager --sync");
+        assert_eq!(
+            command.describe(RimeStage::Sync),
+            "rime_dict_manager --sync"
+        );
         assert_eq!(
             command.describe(RimeStage::Deploy),
             "rime_deployer --build /home/me/rime"

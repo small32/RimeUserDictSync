@@ -929,7 +929,11 @@ mod imp {
             ));
             match daemon::run_once(app_dir, &ini, &cancel, &reporter) {
                 Ok(message) => reporter.log(&message),
-                Err(error) => reporter.log(&format!("后台搬运未完成: {error:#}")),
+                // 服务日志没有「顶栏」的限制，明细直接跟上，排查时不用另跑一次。
+                Err(error) => reporter.log(&format!(
+                    "后台搬运未完成: {}",
+                    crate::platform::attach_rime_diagnostics(&format!("{error:#}"))
+                )),
             }
         }
 

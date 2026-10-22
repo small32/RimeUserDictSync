@@ -212,6 +212,11 @@ struct App {
     settings: Settings,
     context: Option<Context>,
     context_error: Option<String>,
+    /// 已经写进日志的那条 context 错误。
+    ///
+    /// `refresh_context` 会被反复调用（启动、保存设置、每轮结束），同一句错误
+    /// 只该在日志里出现一次；顶栏则始终显示当前这条。
+    context_error_logged: String,
     context_checked_at: std::time::Instant,
     logs: String,
     /// 已经显示过的日志字节数；界面靠它增量读取 `RimeSync.log`。
@@ -242,6 +247,9 @@ struct App {
     show_device: bool,
     show_sync_files: bool,
     show_about: bool,
+    /// Linux：自绘目录选择器（原生对话框不显示隐藏项，RIME 目录本身是隐藏的）。
+    #[cfg(target_os = "linux")]
+    rime_picker: Option<crate::picker_linux::DirPicker>,
     #[cfg(target_os = "macos")]
     show_config_files: bool,
     #[cfg(target_os = "macos")]
@@ -373,6 +381,7 @@ impl App {
             settings,
             context: None,
             context_error: None,
+            context_error_logged: String::new(),
             context_checked_at: std::time::Instant::now(),
             log_offset: logs.len() as u64,
             logs,
@@ -393,6 +402,8 @@ impl App {
             show_device: false,
             show_sync_files: false,
             show_about: false,
+            #[cfg(target_os = "linux")]
+            rime_picker: None,
             #[cfg(target_os = "macos")]
             show_config_files: false,
             #[cfg(target_os = "macos")]
@@ -417,6 +428,12 @@ impl App {
             available_update: None,
         };
         app.startup();
+        // 系统级安装（/opt 等）时配置目录会回退，必须说清楚：
+        // 否则用户找不到自己的设置，只会觉得「词库识别不到」。
+        if let Some(note) = config::app_dir_note() {
+            app.append(&crate::report::timestamped(&note));
+            app.notice = Some(note);
+        }
         Self::trim_display(&mut app.logs);
         app
     }
@@ -468,6 +485,7 @@ impl App {
                 self.device_id_draft = context.device.installation_id.clone();
                 self.context = Some(context);
                 self.context_error = None;
+                self.context_error_logged.clear();
                 for notice in notices {
                     self.append(&crate::report::timestamped(&notice));
                 }
@@ -477,7 +495,15 @@ impl App {
                     return;
                 }
                 self.context = None;
-                self.context_error = Some(error.to_string());
+                let message = error.to_string();
+                // 顶栏只放这一句；候选明细进日志，且同一句只写一次，免得反复刷新刷屏。
+                if message != self.context_error_logged {
+                    self.context_error_logged = message.clone();
+                    self.append(&crate::report::timestamped(
+                        &platform::attach_rime_diagnostics(&message),
+                    ));
+                }
+                self.context_error = Some(message);
             }
         }
     }
@@ -566,8 +592,12 @@ impl App {
                     self.notice = Some(match result {
                         Ok(message) => message,
                         Err(error) => {
-                            self.append(&crate::report::timestamped(&format!("失败: {error}")));
-                            error
+                            // 日志拿全量（含 stderr 与锁提示），顶栏只放一句能照做的话。
+                            self.append(&crate::report::timestamped(&format!(
+                                "失败: {}",
+                                platform::attach_rime_diagnostics(&error)
+                            )));
+                            platform::short_error(&error)
                         }
                     });
                     self.refresh_context();
@@ -575,7 +605,8 @@ impl App {
                 Event::Round(result) => match result {
                     Ok(message) => self.append(&crate::report::timestamped(&message)),
                     Err(error) => self.append(&crate::report::timestamped(&format!(
-                        "后台搬运未完成: {error}"
+                        "后台搬运未完成: {}",
+                        platform::attach_rime_diagnostics(&error)
                     ))),
                 },
                 Event::Tested { result, notify } => {
@@ -1004,9 +1035,26 @@ impl App {
             // 用户可能填 %APPDATA%\Rime 这类环境变量写法，与 resolve_rime_dir 保持一致。
             PathBuf::from(platform::expand_env(&self.settings.user_data_dir))
         };
-        let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() else {
-            return;
-        };
+        // Linux 用自绘选择器：rfd 走的 portal / GTK 对话框不列隐藏项，
+        // 而 RIME 用户目录本身就在 `.local/share/fcitx5/rime` 这类隐藏路径下。
+        #[cfg(target_os = "linux")]
+        {
+            self.rime_picker = Some(crate::picker_linux::DirPicker::new(
+                start,
+                "请选择包含 installation.yaml 的 RIME 用户目录",
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() else {
+                return;
+            };
+            self.apply_rime_dir(dir);
+        }
+    }
+
+    /// 选定 RIME 用户目录后的校验与落盘（选择器与原生对话框共用）。
+    fn apply_rime_dir(&mut self, dir: PathBuf) {
         let installation = dir.join("installation.yaml");
         if !installation.is_file() {
             self.notice = Some(format!(
@@ -1036,6 +1084,36 @@ impl App {
             .as_ref()
             .is_some_and(|test| test.matches(&self.settings));
         let _ = self.apply_tested_capabilities();
+    }
+
+    /// 自绘目录选择器的窗口；选完就落地成 RIME 用户目录。
+    #[cfg(target_os = "linux")]
+    fn rime_picker_window(&mut self, ctx: &egui::Context) {
+        let outcome = {
+            let Some(picker) = self.rime_picker.as_mut() else {
+                return;
+            };
+            picker.show(ctx, "指定 RIME 用户词库")
+        };
+        match outcome {
+            Some(crate::picker_linux::PickerEvent::Accept(dir)) => {
+                // 选错层（比如点到了 `rime/` 的父目录）时不关窗：
+                // 直接把原因写回选择器，省得用户从头再点一遍。
+                if !dir.join("installation.yaml").is_file() {
+                    if let Some(picker) = self.rime_picker.as_mut() {
+                        picker.report_error(format!(
+                            "{} 里没有 installation.yaml，请再进去一层（通常就是名为 rime 的那个目录）",
+                            dir.display()
+                        ));
+                    }
+                    return;
+                }
+                self.rime_picker = None;
+                self.apply_rime_dir(dir);
+            }
+            Some(crate::picker_linux::PickerEvent::Cancel) => self.rime_picker = None,
+            None => {}
+        }
     }
 
     fn open_sync_files(&mut self) {
@@ -1478,6 +1556,8 @@ impl eframe::App for App {
         self.webdav_window(ctx);
         self.device_window(ctx);
         self.sync_files_window(ctx);
+        #[cfg(target_os = "linux")]
+        self.rime_picker_window(ctx);
         #[cfg(target_os = "macos")]
         self.config_dir_window(ctx);
         self.about_window(ctx);
