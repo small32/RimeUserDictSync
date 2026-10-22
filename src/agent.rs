@@ -212,10 +212,18 @@ pub fn apply_background_switch(enabled: bool) -> Result<()> {
     }
     let uid = uid()?;
     let service = format!("gui/{uid}/{MENUBAR_LABEL}");
-    if enabled {
-        let _ = launchctl(&["kickstart", "-k", &service]);
+    let output = if enabled {
+        launchctl(&["kickstart", "-k", &service])
     } else {
-        let _ = launchctl(&["kill", "SIGTERM", &service]);
+        launchctl(&["kill", "SIGTERM", &service])
+    }
+    .context("更新菜单栏助手状态失败")?;
+    if !output.status.success() {
+        bail!(
+            "{}菜单栏助手失败：{}",
+            if enabled { "启动" } else { "停止" },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }

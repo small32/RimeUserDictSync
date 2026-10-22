@@ -194,11 +194,19 @@ pub fn apply_background_switch(enabled: bool) -> Result<()> {
     if !installed() {
         return Ok(());
     }
-    let _ = if enabled {
+    let output = if enabled {
         systemctl(&["start", TIMER_NAME])
     } else {
         systemctl(&["stop", TIMER_NAME])
-    };
+    }
+    .context("更新后台定时器状态失败")?;
+    if !output.status.success() {
+        bail!(
+            "{}后台定时器失败：{}",
+            if enabled { "启动" } else { "停止" },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 

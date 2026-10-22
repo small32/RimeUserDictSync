@@ -63,7 +63,10 @@ enum Event {
         notify: bool,
     },
     /// 设备设置（抢占 / 接管 / 注销 / 导入）结束。
-    Device(Result<String, String>),
+    Device {
+        result: Result<String, String>,
+        exported: bool,
+    },
     UpdateChecked(Option<UpdateInfo>),
 }
 
@@ -250,6 +253,8 @@ struct App {
     /// Linux：自绘目录选择器（原生对话框不显示隐藏项，RIME 目录本身是隐藏的）。
     #[cfg(target_os = "linux")]
     rime_picker: Option<crate::picker_linux::DirPicker>,
+    #[cfg(target_os = "linux")]
+    sync_file_picker: Option<crate::picker_linux::DirPicker>,
     #[cfg(target_os = "macos")]
     show_config_files: bool,
     #[cfg(target_os = "macos")]
@@ -404,6 +409,8 @@ impl App {
             show_about: false,
             #[cfg(target_os = "linux")]
             rime_picker: None,
+            #[cfg(target_os = "linux")]
+            sync_file_picker: None,
             #[cfg(target_os = "macos")]
             show_config_files: false,
             #[cfg(target_os = "macos")]
@@ -634,9 +641,14 @@ impl App {
                         ))),
                     }
                 }
-                Event::Device(result) => {
+                Event::Device { result, exported } => {
                     self.set_busy(false);
                     self.notice = Some(match result {
+                        Ok(text) if exported => {
+                            self.exported_text = text;
+                            "已生成设备配置，已填入设备设置的文本框，请复制保存到网盘或 U 盘。"
+                                .into()
+                        }
                         Ok(message) => message,
                         Err(error) => format!("设备设置失败：{error}"),
                     });
@@ -1111,7 +1123,10 @@ impl App {
                 self.rime_picker = None;
                 self.apply_rime_dir(dir);
             }
-            Some(crate::picker_linux::PickerEvent::Cancel) => self.rime_picker = None,
+            Some(
+                crate::picker_linux::PickerEvent::Cancel
+                | crate::picker_linux::PickerEvent::Files(_),
+            ) => self.rime_picker = None,
             None => {}
         }
     }
@@ -1133,11 +1148,53 @@ impl App {
 
     fn add_sync_files(&mut self) {
         let user_dir = context::resolve_rime_dir(&self.settings);
-        let Some(files) = rfd::FileDialog::new().set_directory(&user_dir).pick_files() else {
+        #[cfg(target_os = "linux")]
+        {
+            self.sync_file_picker = Some(crate::picker_linux::DirPicker::for_files(
+                user_dir,
+                "请选择当前 RIME 用户目录内需要同步的文件",
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(files) = rfd::FileDialog::new().set_directory(&user_dir).pick_files() {
+                self.add_selected_sync_files(files);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync_file_picker_window(&mut self, ctx: &egui::Context) {
+        if !self.show_sync_files {
+            self.sync_file_picker = None;
+            return;
+        }
+        let Some(picker) = self.sync_file_picker.as_mut() else {
             return;
         };
+        match picker.show(ctx, "添加同步文件") {
+            Some(crate::picker_linux::PickerEvent::Files(files)) => {
+                self.sync_file_picker = None;
+                self.add_selected_sync_files(files);
+            }
+            Some(
+                crate::picker_linux::PickerEvent::Cancel
+                | crate::picker_linux::PickerEvent::Accept(_),
+            ) => {
+                self.sync_file_picker = None;
+            }
+            None => {}
+        }
+    }
+
+    fn add_selected_sync_files(&mut self, files: Vec<PathBuf>) {
+        let user_dir = context::resolve_rime_dir(&self.settings);
         let canonical_root = user_dir.canonicalize().unwrap_or(user_dir);
         for file in files {
+            if !file.is_file() {
+                self.notice = Some(format!("{} 不存在或不是文件，请重新选择。", file.display()));
+                continue;
+            }
             let canonical_file = file.canonicalize().unwrap_or(file);
             let Ok(relative) = canonical_file.strip_prefix(&canonical_root) else {
                 self.notice = Some("同步文件必须位于当前 RIME 用户词库目录内。".into());
@@ -1202,9 +1259,27 @@ impl App {
         let tx = self.tx.clone();
         self.set_busy(true);
         std::thread::spawn(move || {
+            let exported = matches!(action, DeviceAction::Export);
             let result = run_device_action(&ini, action).map_err(|error| error.to_string());
-            let _ = tx.send(Event::Device(result));
+            let _ = tx.send(Event::Device { result, exported });
         });
+    }
+
+    fn set_background_enabled(&mut self, enabled: bool) -> Result<()> {
+        if self.config_broken {
+            bail!("{CONFIG_BROKEN_NOTICE}");
+        }
+        save_background_enabled(&mut self.settings, &self.ini, enabled)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
+            #[cfg(target_os = "macos")]
+            let result = crate::agent::apply_background_switch(enabled);
+            #[cfg(target_os = "linux")]
+            let result = crate::service_linux::apply_background_switch(enabled);
+            result.context("后台设置已保存，但系统启停失败")?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -1225,11 +1300,8 @@ impl App {
         if target != source && target.starts_with(&source) {
             bail!("配置目录不能放在当前配置目录的子目录中");
         }
-        if target != source {
-            fs::create_dir_all(target.join("Sync"))?;
-            if self.log_path.is_file() {
-                fs::copy(&self.log_path, target.join("RimeSync.log"))?;
-            }
+        if target != source && self.log_path.is_file() {
+            fs::copy(&self.log_path, target.join("RimeSync.log"))?;
         }
         let ini = target.join("RimeUserDictSync.ini");
         self.settings.save(&ini)?;
@@ -1329,26 +1401,11 @@ impl eframe::App for App {
                             egui::Checkbox::new(&mut enabled, "Rime词库同步"),
                         )
                         .changed()
+                        && let Err(error) = self.set_background_enabled(enabled)
                     {
-                        self.settings.background_enabled = enabled;
-                        if self.config_broken {
-                            self.notice = Some(CONFIG_BROKEN_NOTICE.into());
-                        } else {
-                            let _ = self.settings.save(&self.ini);
-                        }
-                        // 开 → 拉起菜单栏图标 / 启动 timer；关 → 立即停下。
-                        #[cfg(target_os = "macos")]
-                        {
-                            let _ = crate::agent::apply_background_switch(enabled);
-                            self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
-                        }
-                        // Linux：停 timer 只是不再定时拉起；单元文件保留，
-                        // `--scheduled-round` 自己也会按 enabled 跳过，双重保险。
-                        #[cfg(target_os = "linux")]
-                        {
-                            let _ = crate::service_linux::apply_background_switch(enabled);
-                            self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
-                        }
+                        let message = format!("{error:#}");
+                        self.append(&crate::report::timestamped(&message));
+                        self.notice = Some(message);
                     }
                     ui.add_enabled(
                         !self.busy && self.settings.background_enabled,
@@ -1558,6 +1615,8 @@ impl eframe::App for App {
         self.sync_files_window(ctx);
         #[cfg(target_os = "linux")]
         self.rime_picker_window(ctx);
+        #[cfg(target_os = "linux")]
+        self.sync_file_picker_window(ctx);
         #[cfg(target_os = "macos")]
         self.config_dir_window(ctx);
         self.about_window(ctx);
@@ -2199,10 +2258,7 @@ fn run_device_action(ini: &Path, action: DeviceAction) -> Result<String> {
             let layout = Layout::new(&rime_dir, &id);
             let list = SyncList::load(&layout.list_file())?;
             let exported = device::export(&device, settings.webdav_url.trim(), &list);
-            Ok(format!(
-                "已生成设备配置，请复制保存到网盘或 U 盘：\n{}",
-                exported.to_text()?
-            ))
+            exported.to_text()
         }
         DeviceAction::Import { text } => {
             if text.trim().is_empty() {
@@ -2311,6 +2367,17 @@ fn available_release(tag: &str, url: &str, current: &str) -> Result<Option<Updat
     }))
 }
 
+/// 配置写入失败时恢复内存中的开关，避免界面显示成已经保存。
+fn save_background_enabled(settings: &mut Settings, ini: &Path, enabled: bool) -> Result<()> {
+    let previous = settings.background_enabled;
+    settings.background_enabled = enabled;
+    if let Err(error) = settings.save(ini) {
+        settings.background_enabled = previous;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// `test_webdav` 之外的地方只需要一个只读的 WebDAV 探测入口，这里给出统一构造点。
 fn build_webdav(settings: &Settings) -> Result<Option<webdav::WebDav>> {
     if !settings.webdav_ready() {
@@ -2326,6 +2393,49 @@ fn build_webdav(settings: &Settings) -> Result<Option<webdav::WebDav>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_choice_is_only_changed_after_settings_can_be_saved() {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        // 目标是目录，写入失败；界面里的开关必须保持此前的值。
+        assert!(save_background_enabled(&mut settings, root.path(), false).is_err());
+        assert!(settings.background_enabled);
+        let ini = root.path().join("settings.ini");
+        save_background_enabled(&mut settings, &ini, false).unwrap();
+        assert!(!settings.background_enabled);
+        assert!(!Settings::load(&ini).unwrap().background_enabled);
+    }
+
+    #[test]
+    fn device_export_returns_importable_text_for_the_editor() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("installation.yaml"),
+            "installation_id: pc01\n",
+        )
+        .unwrap();
+        let settings = Settings {
+            user_data_dir: root.path().to_string_lossy().into_owned(),
+            webdav_url: "http://127.0.0.1:1/".into(),
+            username: "user".into(),
+            ..Default::default()
+        };
+        let ini = root.path().join("settings.ini");
+        settings.save(&ini).unwrap();
+        let layout = Layout::new(root.path(), "pc01");
+        let device = DeviceFile {
+            installation_id: "pc01".into(),
+            session_token: "export-this-token".into(),
+            ..Default::default()
+        };
+        device.save(&layout.device_file()).unwrap();
+        let text = run_device_action(&ini, DeviceAction::Export).unwrap();
+        let exported: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(exported["id"], "pc01");
+        assert_eq!(exported["session_token"], "export-this-token");
+        assert!(exported.get("password").is_none());
+    }
 
     #[test]
     fn only_newer_stable_release_is_available() {

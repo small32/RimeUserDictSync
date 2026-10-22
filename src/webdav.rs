@@ -107,6 +107,7 @@ fn yes_no(value: bool) -> &'static str {
 pub struct WebDav {
     root: Url,
     client: Client,
+    collection_client: Client,
     username: String,
     password: String,
 }
@@ -115,15 +116,22 @@ impl WebDav {
     pub fn new(url: &str, username: &str, password: &str) -> Result<Self> {
         let root =
             Url::parse(&format!("{}/", url.trim_end_matches('/'))).context("WebDAV 地址无效")?;
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            // 单个大词库文件在慢速网络上可能远超 90 秒。
-            .timeout(Duration::from_secs(600))
-            .user_agent(concat!("RimeUserDictSync/", env!("CARGO_PKG_VERSION")))
+        let build_client = || {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(30))
+                // 单个大词库文件在慢速网络上可能远超 90 秒。
+                .timeout(Duration::from_secs(600))
+                .user_agent(concat!("RimeUserDictSync/", env!("CARGO_PKG_VERSION")))
+        };
+        let client = build_client().build()?;
+        // MKCOL 重定向不代表创建成功，也不能跟随到另一个目录执行创建。
+        let collection_client = build_client()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             root,
             client,
+            collection_client,
             username: username.trim().to_owned(),
             password: password.to_owned(),
         })
@@ -447,17 +455,28 @@ impl WebDav {
         self.delete(relative)
     }
 
-    /// 创建目录；返回是否真的创建（405/301 表示已存在，幂等成功）。
+    /// 创建目录；405/301 只有经 PROPFIND 证实目标是集合后才视为已存在。
     pub fn mkcol(&self, relative: &str) -> Result<MkcolOutcome> {
         self.mkcol_url(self.uri(relative, true)?)
     }
 
     fn mkcol_url(&self, url: Url) -> Result<MkcolOutcome> {
-        let response = self.request("MKCOL", url)?.send()?;
+        let response = self
+            .collection_client
+            .request(Method::from_bytes(b"MKCOL")?, url.clone())
+            .basic_auth(&self.username, Some(&self.password))
+            .send()?;
         match response.status() {
             status if status.is_success() => Ok(MkcolOutcome::Created),
             StatusCode::METHOD_NOT_ALLOWED | StatusCode::MOVED_PERMANENTLY => {
-                Ok(MkcolOutcome::AlreadyExists)
+                let status = response.status();
+                if self.collection_exists_at(&url)? {
+                    Ok(MkcolOutcome::AlreadyExists)
+                } else {
+                    bail!(
+                        "创建 WebDAV 目录失败: HTTP {status}，目标目录不存在或不是集合；服务器可能不支持 MKCOL"
+                    )
+                }
             }
             StatusCode::CONFLICT => bail!("创建 WebDAV 目录失败: HTTP 409（父目录不存在）"),
             status => {
@@ -466,6 +485,64 @@ impl WebDav {
                 Ok(MkcolOutcome::Created)
             }
         }
+    }
+
+    /// 仅接受本次目标的成功 resourcetype 属性，不能拿父目录或重定向目标充当证据。
+    fn collection_exists_at(&self, url: &Url) -> Result<bool> {
+        let response = self
+            .collection_client
+            .request(Method::from_bytes(b"PROPFIND")?, url.clone())
+            .basic_auth(&self.username, Some(&self.password))
+            .header("Depth", "0")
+            .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(Self::propfind_body())
+            .send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let text = Self::ok(response, "确认 WebDAV 目录是否存在")?.text()?;
+        let doc = Document::parse(&text).context("解析 WebDAV XML 失败")?;
+        let requested = self.relative_from_href(url.as_str())?;
+        Ok(doc
+            .descendants()
+            .filter(|node| node.has_tag_name(("DAV:", "response")))
+            .any(|node| {
+                let matches_target = node
+                    .children()
+                    .find(|child| child.has_tag_name(("DAV:", "href")))
+                    .and_then(|child| child.text())
+                    .is_some_and(|href| {
+                        self.root
+                            .join(href)
+                            .is_ok_and(|actual| actual.origin() == url.origin())
+                            && self.relative_from_href(href).is_ok_and(|actual| {
+                                actual.trim_end_matches('/') == requested.trim_end_matches('/')
+                            })
+                    });
+                matches_target
+                    && node
+                        .children()
+                        .filter(|child| child.has_tag_name(("DAV:", "propstat")))
+                        .any(|propstat| {
+                            let success = propstat
+                                .children()
+                                .find(|child| child.has_tag_name(("DAV:", "status")))
+                                .and_then(|child| child.text())
+                                .and_then(|status| status.split_whitespace().nth(1))
+                                .and_then(|status| status.parse::<u16>().ok())
+                                .is_some_and(|status| (200..300).contains(&status));
+                            success
+                                && propstat
+                                    .children()
+                                    .filter(|child| child.has_tag_name(("DAV:", "prop")))
+                                    .flat_map(|prop| prop.children())
+                                    .filter(|child| child.has_tag_name(("DAV:", "resourcetype")))
+                                    .any(|kind| {
+                                        kind.children()
+                                            .any(|child| child.has_tag_name(("DAV:", "collection")))
+                                    })
+                        })
+            }))
     }
 
     /// 逐级创建祖先目录：部分服务器在父目录不存在时会拒绝 MKCOL。
@@ -559,7 +636,7 @@ impl WebDav {
         }
 
         let probe_dir = format!("__rime-sync-caps-{}", crate::identity::new_path_token(12));
-        if self.mkcol(&probe_dir).is_ok() {
+        if matches!(self.mkcol(&probe_dir), Ok(MkcolOutcome::Created)) {
             caps.mkcol = true;
             let probe_file = format!("{probe_dir}/a.txt");
             let moved = format!("{probe_dir}/b.txt");
@@ -666,6 +743,36 @@ pub(crate) mod test_support {
     }
 
     pub fn serve(mut handler: impl FnMut(&Request) -> Reply + Send + 'static) -> Server {
+        let mut collections = std::collections::BTreeSet::new();
+        serve_raw(move |request| {
+            let collection = format!("{}/", request.path.trim_end_matches('/'));
+            if request.method == "MKCOL" {
+                return Reply::new(
+                    if collections.insert(collection) {
+                        201
+                    } else {
+                        405
+                    },
+                    Vec::new(),
+                );
+            }
+            if request.method == "PROPFIND"
+                && request
+                    .headers
+                    .get("depth")
+                    .is_some_and(|depth| depth == "0")
+                && collections.contains(&collection)
+            {
+                return Reply::new(207, format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>{collection}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>").into_bytes());
+            }
+            if request.method == "DELETE" {
+                collections.remove(&collection);
+            }
+            handler(request)
+        })
+    }
+
+    pub fn serve_raw(mut handler: impl FnMut(&Request) -> Reply + Send + 'static) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
@@ -715,11 +822,7 @@ pub(crate) mod test_support {
                     body: raw[header_end..header_end + size].to_vec(),
                 };
                 recorded.lock().unwrap().push(request.clone());
-                let reply = if request.method == "MKCOL" {
-                    Reply::new(405, Vec::new())
-                } else {
-                    handler(&request)
-                };
+                let reply = handler(&request);
                 write!(
                     socket,
                     "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -770,6 +873,102 @@ mod tests {
         assert_eq!(caps.tier(), UploadTier::EtagOnly);
         caps.if_match = true;
         assert_eq!(caps.tier(), UploadTier::Conditional);
+    }
+
+    fn collection_xml(href: &str, collection: bool, status: u16) -> Vec<u8> {
+        let kind = if collection { "<d:collection/>" } else { "" };
+        format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>{href}</d:href><d:propstat><d:prop><d:resourcetype>{kind}</d:resourcetype></d:prop><d:status>HTTP/1.1 {status} Test</d:status></d:propstat></d:response></d:multistatus>").into_bytes()
+    }
+
+    #[test]
+    fn mkcol_requires_evidence_of_the_requested_collection() {
+        use super::test_support::{Reply, serve_raw};
+        for status in [405, 301] {
+            for (href, collection, prop_status, accepted) in [
+                ("/existing/", true, 200, true),
+                ("/parent/", true, 200, false),
+                ("/existing/", false, 200, false),
+                ("/existing/", true, 404, false),
+                ("http://example.invalid/existing/", true, 200, false),
+            ] {
+                let server = serve_raw(move |request| match request.method.as_str() {
+                    "MKCOL" => Reply::new(status, Vec::new()),
+                    "PROPFIND" => Reply::new(207, collection_xml(href, collection, prop_status)),
+                    _ => Reply::new(500, Vec::new()),
+                });
+                let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+                assert_eq!(
+                    matches!(dav.mkcol("existing"), Ok(MkcolOutcome::AlreadyExists)),
+                    accepted,
+                    "status={status}, href={href}, collection={collection}, property status={prop_status}"
+                );
+                assert!(
+                    server
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|request| matches!(request.method.as_str(), "MKCOL" | "PROPFIND"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_mkcol_is_not_reported_as_a_busy_device_or_supported_capability() {
+        use super::test_support::{Reply, serve_raw};
+        let server = serve_raw(|request| {
+            Reply::new(
+                if request.method == "MKCOL" { 405 } else { 404 },
+                Vec::new(),
+            )
+        });
+        let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+        assert!(
+            dav.mkcol("pc01")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("不支持 MKCOL")
+        );
+        assert!(!dav.probe_capabilities().mkcol);
+        let seed = crate::device::DeviceSeed::from_device(
+            &crate::context::DeviceFile::default(),
+            String::new(),
+        );
+        let error = match crate::device::claim(&dav, "pc01", None, &seed) {
+            Err(error) => error,
+            Ok(_) => panic!("不支持 MKCOL 时不应声称注册成功或 ID 被占用"),
+        };
+        assert!(error.to_string().contains("不支持 MKCOL"));
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| matches!(request.method.as_str(), "MKCOL" | "PROPFIND"))
+        );
+    }
+
+    #[test]
+    fn capability_probe_never_writes_to_an_existing_probe_directory() {
+        use super::test_support::{Reply, serve_raw};
+        let server = serve_raw(|request| match request.method.as_str() {
+            "MKCOL" => Reply::new(405, Vec::new()),
+            "PROPFIND" => Reply::new(207, collection_xml(&request.path, true, 200)),
+            _ => Reply::new(500, Vec::new()),
+        });
+        let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+        assert!(!dav.probe_capabilities().mkcol);
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| matches!(request.method.as_str(), "MKCOL" | "PROPFIND"))
+        );
     }
 
     #[test]

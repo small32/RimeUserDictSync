@@ -124,7 +124,9 @@ pub fn check_local_identity(context: &Context) -> Result<()> {
 /// §7.5：每轮开始前校验 `session_token`，不匹配说明此 ID 已被其他设备接管。
 pub fn check_session(context: &Context, _report: &dyn Reporter) -> Result<()> {
     let Some(owner) = Owner::load(&context.dav, &context.layout.installation_id)? else {
-        bail!("远端 owner.json 缺失或损坏，无法校验设备身份；本轮禁止上传，请检查设备设置");
+        bail!(
+            "远端 owner.json 缺失或损坏，无法校验设备身份；本轮搬运已中止（不下载、不上传），请检查设备设置"
+        );
     };
     if owner.session_token.trim().is_empty() {
         bail!("远端 owner.json 缺少 session_token，无法校验设备身份，请重新完成设备设置");
@@ -150,6 +152,7 @@ fn check(cancel: &AtomicBool) -> Result<()> {
 // ---------------------------------------------------------------- Others 拉取
 
 fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) -> Result<usize> {
+    let list = context.load_list()?;
     let entries = context.dav.list_tree(OTHERS_DIR_NAME)?;
     let mut downloaded = 0;
     for entry in entries.iter().filter(|entry| !entry.is_dir) {
@@ -157,6 +160,9 @@ fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) 
             continue;
         };
         if relative.is_empty() || is_transfer_temp(relative) {
+            continue;
+        }
+        if list.is_excluded(relative) {
             continue;
         }
         if is_forbidden_in_others(relative) {
@@ -215,9 +221,13 @@ pub fn push_others(
     cancel: &AtomicBool,
     report: &dyn Reporter,
 ) -> Result<usize> {
+    let list = context.load_list()?;
     let mut uploaded = 0;
     for (relative, path) in walk_files(&context.layout.others)? {
         check(cancel)?;
+        if list.is_excluded(&relative) {
+            continue;
+        }
         if is_forbidden_in_others(&relative) {
             report.log(&format!(
                 "跳过 Others/{relative}：userdb 快照不能放进共享目录（§2.2 红线）。"
@@ -412,8 +422,57 @@ fn pull_snapshots(
         };
         let marks = index.snapshots.entry(name.clone()).or_default();
         let target_dir = context.layout.sync.join(&name);
+        // 旧版曾搬运配置文件：只移动已跟踪的镜像，保留副本供用户检查。
+        let legacy: Vec<String> = marks
+            .keys()
+            .filter(|file| !file.to_ascii_lowercase().ends_with(".userdb.txt"))
+            .cloned()
+            .collect();
+        for file in legacy {
+            if crate::state::safe_snapshot_name(&file).is_err() {
+                marks.remove(&file);
+                continue;
+            }
+            let target = target_dir.join(&file);
+            let result = (|| -> Result<()> {
+                if target.is_file() {
+                    let backup_dir = context.layout.meta.join("quarantine/snapshots").join(&name);
+                    fs::create_dir_all(&backup_dir)?;
+                    let backup = backup_dir.join(&file);
+                    let backup = if backup.exists() {
+                        hash::temp_sibling(&backup)
+                    } else {
+                        backup
+                    };
+                    fs::rename(&target, &backup)?;
+                    report.log(&format!(
+                        "旧版非 userdb 镜像 {name}/{file} 已移至 {}。",
+                        backup.display()
+                    ));
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    marks.remove(&file);
+                }
+                Err(error) => report.log(&format!(
+                    "清理旧版非 userdb 镜像 {name}/{file} 失败：{error}；稍后重试。"
+                )),
+            }
+        }
         for (file, snapshot) in &remote_index.files {
-            crate::state::safe_snapshot_name(file)?;
+            if let Err(error) = crate::state::safe_snapshot_name(file) {
+                marks.remove(file);
+                report.log(&format!("跳过远端快照 {name}/{file}：{error}"));
+                continue;
+            }
+            if !file.to_ascii_lowercase().ends_with(".userdb.txt") {
+                report.log(&format!(
+                    "跳过远端 {name}/{file}：快照清单只搬运 .userdb.txt 文件。"
+                ));
+                continue;
+            }
             let target = target_dir.join(file);
             let unchanged = marks.get(file).map(String::as_str) == Some(snapshot.sha256.as_str())
                 && target.is_file();
@@ -421,7 +480,12 @@ fn pull_snapshots(
                 continue;
             }
             let remote_relative = format!("{name}/{file}");
-            download_snapshot(dav, &remote_relative, &target, snapshot)?;
+            if let Err(error) = download_snapshot(dav, &remote_relative, &target, snapshot) {
+                report.log(&format!(
+                    "下载快照 {name}/{file} 失败：{error}；保留现有副本，稍后重试。"
+                ));
+                continue;
+            }
             marks.insert(file.clone(), snapshot.sha256.clone());
             report.log(&format!("已下载其他设备快照 {name}/{file}。"));
             downloaded += 1;
@@ -429,7 +493,10 @@ fn pull_snapshots(
         // 远端清单里已删除的快照：本地镜像也要删掉，否则 librime 会一直合并旧快照。
         let removed: Vec<String> = marks
             .keys()
-            .filter(|file| !remote_index.files.contains_key(*file))
+            .filter(|file| {
+                file.to_ascii_lowercase().ends_with(".userdb.txt")
+                    && !remote_index.files.contains_key(*file)
+            })
             .cloned()
             .collect();
         for file in removed {
@@ -440,7 +507,12 @@ fn pull_snapshots(
             }
             let target = target_dir.join(&file);
             if target.is_file() {
-                fs::remove_file(&target)?;
+                if let Err(error) = fs::remove_file(&target) {
+                    report.log(&format!(
+                        "删除已撤下的镜像 {name}/{file} 失败：{error}；稍后重试。"
+                    ));
+                    continue;
+                }
                 report.log(&format!("远端已删除 {name}/{file}，本地镜像同步删除。"));
             }
             marks.remove(&file);
@@ -547,7 +619,7 @@ fn download_snapshot(
     let result = (|| -> Result<()> {
         dav.get(relative, &temp, modified)?;
         if hash::sha256_file(&temp)? != entry.sha256 {
-            bail!("{relative} 与快照清单的 hash 不一致，本轮停止并保留现有快照");
+            bail!("{relative} 与快照清单的 hash 不一致，未替换现有快照");
         }
         fs::rename(&temp, target)?;
         Ok(())
@@ -931,6 +1003,181 @@ mod tests {
         assert_eq!(strip_dir("Others/a.txt", "Others"), Some("a.txt"));
         assert_eq!(strip_dir("Others/cn/b.yaml", "Others"), Some("cn/b.yaml"));
         assert_eq!(strip_dir("Other/a.txt", "Others"), None);
+    }
+
+    #[test]
+    fn excluded_shared_files_are_neither_downloaded_nor_uploaded() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/custom/phrases.txt".into(), b"remote".to_vec())]),
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, context) = test_context(&server.url);
+        let mut list = crate::state::SyncList::default();
+        list.remove(r"custom\phrases.txt");
+        context.save_list(&list).unwrap();
+        let excluded = context.layout.others.join("custom/phrases.txt");
+        fs::create_dir_all(excluded.parent().unwrap()).unwrap();
+        fs::write(&excluded, b"local").unwrap();
+        fs::write(context.layout.others.join("allowed.txt"), b"allowed").unwrap();
+        let mut index = SyncIndex::default();
+        pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+        assert_eq!(fs::read(&excluded).unwrap(), b"local");
+        assert_eq!(
+            push_others(
+                &context,
+                &mut index,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            state.lock().unwrap().files["/Others/custom/phrases.txt"],
+            b"remote"
+        );
+        assert!(!server.requests.lock().unwrap().iter().any(|request| {
+            matches!(request.method.as_str(), "GET" | "PUT")
+                && request.path == "/Others/custom/phrases.txt"
+        }));
+    }
+
+    #[test]
+    fn bad_peer_snapshot_entries_do_not_block_valid_downloads_or_own_uploads() {
+        let state = remote_snapshot(b"old own words");
+        let snapshot = |bytes: &[u8]| SnapshotEntry {
+            sha256: hash::sha256_hex(bytes),
+            size: bytes.len() as u64,
+            mtime: 0,
+        };
+        let peer_index = SnapshotIndex {
+            files: BTreeMap::from([
+                ("../bad.userdb.txt".into(), snapshot(b"bad")),
+                ("broken.userdb.txt".into(), snapshot(b"expected")),
+                ("missing.userdb.txt".into(), snapshot(b"missing")),
+                ("good.userdb.txt".into(), snapshot(b"good words")),
+                ("config.yaml".into(), snapshot(b"remote config")),
+            ]),
+            ..Default::default()
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.files.insert(
+                "/pc01/owner.json".into(),
+                serde_json::to_vec(&serde_json::json!({"id":"pc01", "session_token":"test-token"}))
+                    .unwrap(),
+            );
+            state.files.insert(
+                "/pc02/.index.json".into(),
+                serde_json::to_vec(&peer_index).unwrap(),
+            );
+            state
+                .files
+                .insert("/pc02/good.userdb.txt".into(), b"good words".to_vec());
+            state.files.insert(
+                "/pc02/broken.userdb.txt".into(),
+                b"mismatched data".to_vec(),
+            );
+            state
+                .files
+                .insert("/pc02/config.yaml".into(), b"remote config".to_vec());
+            state.files.insert(
+                "/pc03/.index.json".into(),
+                serde_json::to_vec(&SnapshotIndex {
+                    files: BTreeMap::from([("other.userdb.txt".into(), snapshot(b"other words"))]),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            state
+                .files
+                .insert("/pc03/other.userdb.txt".into(), b"other words".to_vec());
+        }
+        let server = memory_server(state.clone());
+        let (_dir, context) = test_context(&server.url);
+        fs::write(
+            context.layout.device.join("words.userdb.txt"),
+            b"new own words",
+        )
+        .unwrap();
+        let peer = context.layout.sync.join("pc02");
+        fs::create_dir_all(&peer).unwrap();
+        fs::write(peer.join("broken.userdb.txt"), b"preserved words").unwrap();
+        fs::write(peer.join("config.yaml"), b"preserved config").unwrap();
+        let mut index = SyncIndex::default();
+        index.snapshots.insert(
+            "pc02".into(),
+            BTreeMap::from([
+                ("broken.userdb.txt".into(), "previous hash".into()),
+                ("config.yaml".into(), "previous config hash".into()),
+            ]),
+        );
+        context.save_index(&index).unwrap();
+        let outcome = round_locked(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+        assert!(outcome.uploaded > 0);
+        assert_eq!(
+            fs::read(peer.join("broken.userdb.txt")).unwrap(),
+            b"preserved words"
+        );
+        assert_eq!(
+            fs::read(peer.join("good.userdb.txt")).unwrap(),
+            b"good words"
+        );
+        assert_eq!(
+            fs::read(context.layout.sync.join("pc03/other.userdb.txt")).unwrap(),
+            b"other words"
+        );
+        assert_eq!(
+            state.lock().unwrap().files["/pc01/words.userdb.txt"],
+            b"new own words"
+        );
+        assert!(!peer.join("config.yaml").exists());
+        assert_eq!(
+            fs::read(
+                context
+                    .layout
+                    .meta
+                    .join("quarantine/snapshots/pc02/config.yaml")
+            )
+            .unwrap(),
+            b"preserved config"
+        );
+        let saved = context.load_index().unwrap();
+        assert!(!saved.snapshots["pc02"].contains_key("config.yaml"));
+        assert_eq!(
+            saved.snapshots["pc02"]["broken.userdb.txt"],
+            "previous hash"
+        );
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "GET" && request.path == "/pc02/config.yaml")
+        );
+    }
+
+    #[test]
+    fn missing_owner_stops_all_transport_before_downloads() {
+        let server = memory_server(Arc::new(Mutex::new(MemoryDav::default())));
+        let (_dir, context) = test_context(&server.url);
+        let error = round_locked(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("本轮搬运已中止"));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/pc01/owner.json");
     }
 
     #[test]

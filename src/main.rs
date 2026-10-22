@@ -134,6 +134,9 @@ fn parse(arguments: &[String]) -> Result<Options> {
                 let value = arguments
                     .get(index)
                     .ok_or_else(|| anyhow::anyhow!("--app-dir 后面缺少目录"))?;
+                if value.trim().is_empty() {
+                    bail!("--app-dir 目录不能为空或仅包含空白字符");
+                }
                 app_dir = Some(PathBuf::from(value));
             }
             other => bail!("未知参数 {other}；用 --help 查看用法"),
@@ -388,4 +391,26 @@ fn settings_minutes(app_dir: &Path) -> u32 {
 
 fn log_line(path: &Path, message: &str) {
     daemon::append_log(path, &report::timestamped(message));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_dir_rejects_missing_empty_and_whitespace_arguments() {
+        for arguments in [
+            vec!["--app-dir".to_owned()],
+            vec!["--app-dir".to_owned(), String::new()],
+            vec!["--app-dir".to_owned(), " \t ".to_owned()],
+        ] {
+            assert!(parse(&arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn app_dir_keeps_valid_paths_with_spaces() {
+        let options = parse(&["--app-dir".to_owned(), "a directory".to_owned()]).unwrap();
+        assert_eq!(options.app_dir, PathBuf::from("a directory"));
+    }
 }

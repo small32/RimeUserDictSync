@@ -173,21 +173,44 @@ pub fn yaml_scalar_opt(path: &Path, key: &str) -> Option<String> {
         regex::escape(key)
     ))
     .ok()?;
-    let mut value = rx
+    let raw = rx
         .captures(&text)
         .and_then(|captures| captures.get(1))
-        .map(|matched| matched.as_str().trim().to_owned())?;
-    if let Some(index) = value.find(" #") {
-        value.truncate(index);
-        value = value.trim().to_owned();
-    }
-    if value.len() >= 2
-        && ((value.starts_with('\'') && value.ends_with('\''))
-            || (value.starts_with('"') && value.ends_with('"')))
-    {
-        value = value[1..value.len() - 1].replace("''", "'");
-    }
+        .map(|matched| matched.as_str().trim())?;
+    let value = strip_yaml_comment(raw).trim();
+    let value = if let Some(quoted) = value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        quoted.replace("''", "'")
+    } else if let Some(quoted) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        quoted.to_owned()
+    } else {
+        value.to_owned()
+    };
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// 只把引号外、由空白分隔的 # 当作注释；保留路径、密码中的字面量 #。
+fn strip_yaml_comment(value: &str) -> &str {
+    let mut chars = value.char_indices().peekable();
+    let mut quote = value.chars().next().filter(|ch| matches!(ch, '\'' | '"'));
+    if quote.is_some() {
+        chars.next();
+    }
+    let mut after_whitespace = true;
+    while let Some((index, ch)) = chars.next() {
+        match quote {
+            Some('"') if ch == '\\' => {
+                chars.next();
+            }
+            Some('\'') if ch == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') => {
+                chars.next();
+            }
+            Some(delimiter) if ch == delimiter => quote = None,
+            None if ch == '#' && after_whitespace => return &value[..index],
+            _ => {}
+        }
+        after_whitespace = ch.is_whitespace();
+    }
+    value
 }
 
 /// 写回 YAML 标量：只替换第一处匹配，值统一用单引号包裹。
@@ -477,6 +500,38 @@ mod tests {
             Some("/tmp/Sync")
         );
         assert_eq!(yaml_scalar_opt(&yaml, "other").as_deref(), Some("quoted"));
+    }
+
+    #[test]
+    fn optional_scalar_keeps_hashes_inside_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("installation.yaml");
+        fs::write(
+            &yaml,
+            "sync_dir: \"/a #b\" # outside\nPassword: 'it''s #secret'\nplain: /a#b\nempty: # comment\ntab: /a\t# comment\n",
+        )
+        .unwrap();
+        assert_eq!(yaml_scalar_opt(&yaml, "sync_dir").as_deref(), Some("/a #b"));
+        assert_eq!(
+            yaml_scalar_opt(&yaml, "Password").as_deref(),
+            Some("it's #secret")
+        );
+        assert_eq!(yaml_scalar_opt(&yaml, "plain").as_deref(), Some("/a#b"));
+        assert_eq!(yaml_scalar_opt(&yaml, "empty"), None);
+        assert_eq!(yaml_scalar_opt(&yaml, "tab").as_deref(), Some("/a"));
+    }
+
+    #[test]
+    fn yaml_comment_scanner_respects_escaped_quotes_and_plain_apostrophes() {
+        assert_eq!(
+            strip_yaml_comment(r#""a\" #b" # outside"#).trim(),
+            r#""a\" #b""#
+        );
+        assert_eq!(
+            strip_yaml_comment("'/a'' #b' # outside").trim(),
+            "'/a'' #b'"
+        );
+        assert_eq!(strip_yaml_comment("/a's # outside").trim(), "/a's");
     }
 
     #[test]

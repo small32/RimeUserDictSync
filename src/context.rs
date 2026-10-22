@@ -750,7 +750,28 @@ mod tests {
                             (204, Vec::new())
                         }
                         "PROPFIND" => {
-                            let entries = files.keys().filter(|name| name.strip_prefix("/sync/").is_some_and(|name| !name.contains('/'))).map(|name| format!("<d:response><d:href>{name}</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>")).collect::<String>();
+                            let depth_zero = header.lines().any(|line| {
+                                line.split_once(':').is_some_and(|(name, value)| {
+                                    name.eq_ignore_ascii_case("depth") && value.trim() == "0"
+                                })
+                            });
+                            let requested = path.trim_end_matches('/');
+                            let prefix = format!("{requested}/");
+                            let visible = |name: &str| {
+                                let name = name.trim_end_matches('/');
+                                name == requested
+                                    || (!depth_zero
+                                        && name.strip_prefix(&prefix).is_some_and(|child| {
+                                            !child.is_empty() && !child.contains('/')
+                                        }))
+                            };
+                            let mut entries = String::new();
+                            for name in directories.iter().filter(|name| visible(name)) {
+                                entries.push_str(&format!("<d:response><d:href>{name}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                            }
+                            for name in files.keys().filter(|name| visible(name)) {
+                                entries.push_str(&format!("<d:response><d:href>{name}</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                            }
                             (
                                 207,
                                 format!(

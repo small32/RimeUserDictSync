@@ -3,10 +3,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -595,47 +592,28 @@ fn run_argv(argv: &[String], cwd: Option<&Path>, cancel: &AtomicBool) -> Result<
     // 单独排空 stderr：librime 的工具把真正的失败原因写在这里（比如 LevelDB 的
     // `IO error: lock ... already held by process`），只留一个退出码根本没法排查。
     // 必须开线程读，否则管道写满 64 KB 后子进程会卡住。
-    let collected = Arc::new(Mutex::new(String::new()));
-    if let Some(mut pipe) = child.stderr.take() {
-        let sink = collected.clone();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            while let Ok(read) = pipe.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut text) = sink.lock()
-                    && text.len() < 8192
-                {
-                    text.push_str(&String::from_utf8_lossy(&buffer[..read]));
-                }
-            }
-        });
-    }
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|pipe| std::thread::spawn(move || read_stderr(pipe)));
     let started = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
+            let _ = child.wait();
             bail!("用户已停止同步");
         }
         if let Some(status) = child.try_wait()? {
+            // 进程退出时管道仍可能有未读数据。等读线程结束后再生成提示；
+            // 若后代进程继承了管道，仍允许取消并受同一个总超时约束。
+            let captured = match stderr_reader {
+                Some(reader) => finish_stderr(reader, cancel, started)?,
+                None => StderrCapture::default(),
+            };
             if status.success() {
                 return Ok(());
             }
-            let details = collected
-                .lock()
-                .map(|text| text.trim().to_owned())
-                .unwrap_or_default();
-            let mut message = format!(
-                "RIME 命令执行失败，退出码 {:?}：{}",
-                status.code(),
-                argv.join(" ")
-            );
-            if !details.is_empty() {
-                message.push_str(&format!("\n{details}"));
-            }
-            message.push_str(lock_hint(&details));
-            bail!(message);
+            bail!(rime_command_failure(argv, status.code(), captured));
         }
         if started.elapsed() >= RIME_TIMEOUT {
             let _ = child.kill();
@@ -648,6 +626,86 @@ fn run_argv(argv: &[String], cwd: Option<&Path>, cancel: &AtomicBool) -> Result<
         }
         std::thread::sleep(Duration::from_millis(150));
     }
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    text: String,
+    truncated: bool,
+    lock_error: bool,
+}
+
+fn rime_command_failure(argv: &[String], code: Option<i32>, captured: StderrCapture) -> String {
+    let mut details = captured.text.trim().to_owned();
+    if captured.truncated {
+        details.push_str("\n[stderr 已截断，仅显示前 8192 字节]");
+    }
+    if captured.lock_error && !is_userdb_lock_error(&details) {
+        details.push_str("\n[检测到 LevelDB userdb lock 冲突]");
+    }
+    let mut message = format!("RIME 命令执行失败，退出码 {code:?}：{}", argv.join(" "));
+    if !details.is_empty() {
+        message.push_str(&format!("\n{details}"));
+    }
+    message.push_str(lock_hint(&details));
+    message
+}
+
+fn read_stderr(mut pipe: impl Read) -> std::io::Result<StderrCapture> {
+    let mut captured = StderrCapture::default();
+    let mut buffer = [0u8; 4096];
+    let mut tail = String::new();
+    let mut has_lock = false;
+    let mut has_userdb = false;
+    loop {
+        let read = match pipe.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            return Ok(captured);
+        }
+        let chunk = String::from_utf8_lossy(&buffer[..read]);
+        let scan = format!("{tail}{chunk}").to_ascii_lowercase();
+        has_lock |= scan.contains("lock");
+        has_userdb |= scan.contains(".userdb") || scan.contains("leveldb");
+        captured.lock_error |= is_userdb_lock_error(&scan) || (has_lock && has_userdb);
+        let mut tail_start = scan.len().saturating_sub(64);
+        while !scan.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        tail = scan[tail_start..].to_owned();
+
+        let mut keep = chunk.len().min(8192 - captured.text.len());
+        while !chunk.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        captured.text.push_str(&chunk[..keep]);
+        captured.truncated |= keep < chunk.len();
+    }
+}
+
+fn finish_stderr(
+    reader: std::thread::JoinHandle<std::io::Result<StderrCapture>>,
+    cancel: &AtomicBool,
+    started: Instant,
+) -> Result<StderrCapture> {
+    while !reader.is_finished() {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("用户已停止同步");
+        }
+        if started.elapsed() >= RIME_TIMEOUT {
+            bail!(
+                "RIME 命令已退出，但读取错误输出超过 {} 秒，已停止等待",
+                RIME_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("读取 RIME 错误输出的线程异常退出"))?
+        .context("读取 RIME 错误输出失败")
 }
 
 /// 判断一条 stderr 是不是「userdb 被别的进程占着」。
@@ -857,6 +915,72 @@ pub fn expand_env(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_is_drained_past_the_display_limit_and_keeps_late_lock_errors() {
+        let mut data = vec![b'x'; 12_287];
+        data.extend_from_slice(b"Resource temporarily unavailable");
+        let mut source = std::io::Cursor::new(data);
+        let captured = read_stderr(&mut source).unwrap();
+        assert_eq!(source.position(), source.get_ref().len() as u64);
+        assert_eq!(captured.text.len(), 8192);
+        assert!(captured.truncated);
+        assert!(
+            captured.lock_error,
+            "跨读取块、位于截断区域的锁错误也要识别"
+        );
+        let message = rime_command_failure(&["rime_dict_manager".into()], Some(1), captured);
+        assert!(message.contains("stderr 已截断"));
+        assert!(message.contains("提示：输入法正占用 userdb"));
+        assert_eq!(short_error(&message), LOCK_SHORT_HINT);
+    }
+
+    #[test]
+    fn fast_failed_commands_keep_their_stderr_and_lock_hint() {
+        #[cfg(target_os = "windows")]
+        let argv = vec![
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
+            "/D".into(),
+            "/C".into(),
+            "echo Resource temporarily unavailable 1>&2 & exit /b 7".into(),
+        ];
+        #[cfg(not(target_os = "windows"))]
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo 'Resource temporarily unavailable' >&2; exit 7".into(),
+        ];
+        let error = run_argv(&argv, None, &AtomicBool::new(false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Resource temporarily unavailable"));
+        assert!(error.contains("退出码 Some(7)"));
+        assert_eq!(short_error(&error), LOCK_SHORT_HINT);
+    }
+
+    #[test]
+    fn waiting_for_stderr_respects_cancellation_and_the_command_deadline() {
+        for cancelled in [true, false] {
+            let reader = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(StderrCapture::default())
+            });
+            let started = if cancelled {
+                Instant::now()
+            } else {
+                Instant::now() - RIME_TIMEOUT
+            };
+            let error = finish_stderr(reader, &AtomicBool::new(cancelled), started)
+                .err()
+                .expect("不能无限等待仍持有 stderr 管道的后代进程")
+                .to_string();
+            assert!(error.contains(if cancelled {
+                "用户已停止"
+            } else {
+                "已停止等待"
+            }));
+        }
+    }
 
     /// 「找不到词库」时唯一的线索就是这份明细，至少要能列出来并带上得分。
     #[cfg(target_os = "linux")]

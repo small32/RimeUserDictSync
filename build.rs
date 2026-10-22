@@ -16,9 +16,7 @@ fn main() {
     // ID 101：齿轮图标，**只**给「同步词库」快捷方式用。
     // 快捷方式的 IconLocation 存 EXE 路径，索引 -101 存在 .lnk 头部的 IconIndex 字段里，
     // 所以 EXE 的图标不受影响。见 src/shortcut.rs。
-    resource.set_icon_with_id(r"assets\sync-gear.ico", "101");
+    resource.set_icon_with_id("assets/sync-gear.ico", "101");
 
-    if let Err(error) = resource.compile() {
-        println!("cargo:warning=unable to embed icon: {error}");
-    }
+    resource.compile().expect("无法嵌入 Windows 图标资源");
 }

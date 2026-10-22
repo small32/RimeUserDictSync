@@ -32,7 +32,9 @@ mod imp {
         service_dispatcher,
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
-    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+    use windows_sys::Win32::Foundation::{
+        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE,
+    };
 
     pub const SERVICE_NAME: &str = "RimeUserDictSync";
     pub const SERVICE_DISPLAY_NAME: &str = "RIME 用户词库同步后台搬运";
@@ -130,14 +132,24 @@ mod imp {
         dir.is_dir().then_some(dir)
     }
 
-    fn forget_app_dir() {
+    fn forget_app_dir() -> Result<()> {
         // delete_value 需要写权限；open_subkey 拿的是只读句柄，必须显式要 KEY_SET_VALUE。
-        if let Ok(hklm) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        match winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
             .open_subkey_with_flags(r"SOFTWARE\RimeUserDictSync", winreg::enums::KEY_SET_VALUE)
         {
-            let _ = hklm.delete_value("AppDir");
+            Ok(hklm) => match hklm.delete_value("AppDir") {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("清除服务配置目录注册表项失败"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("打开服务配置目录注册表项失败"),
         }
-        let _ = fs::remove_file(app_dir_file());
+        match fs::remove_file(app_dir_file()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("清除服务配置目录记录失败"),
+        }
     }
 
     // ------------------------------------------------------------------ 状态
@@ -499,14 +511,7 @@ mod imp {
             Err(error) => return Err(error).context("打开已有服务失败"),
         };
         let was_running = match &existing {
-            Some(service) => {
-                let running = service.query_status()?.current_state != ServiceState::Stopped;
-                if running {
-                    let _ = service.stop();
-                    wait_until_stopped(service, Duration::from_secs(30));
-                }
-                running
-            }
+            Some(service) => stop_service(service, Duration::from_secs(30))?,
             None => false,
         };
 
@@ -596,15 +601,48 @@ mod imp {
         Ok(message)
     }
 
-    /// 等 SCM 把状态切到 Stopped；超时就放弃（`start` 会给出真正的错误）。
-    fn wait_until_stopped(service: &windows_service::service::Service, timeout: Duration) {
+    fn stop_service(
+        service: &windows_service::service::Service,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let state = service
+            .query_status()
+            .context("查询服务停止状态失败，已取消操作")?
+            .current_state;
+        if state == ServiceState::Stopped {
+            return Ok(false);
+        }
+        if state != ServiceState::StopPending {
+            service
+                .stop()
+                .context("服务无法停止，已取消操作（可能正在执行搬运，请稍后重试）")?;
+        }
+        wait_until_stopped(service, timeout)?;
+        Ok(true)
+    }
+
+    /// 只有确认 Stopped 才允许覆盖服务程序或删除安装记录。
+    fn wait_until_stopped(
+        service: &windows_service::service::Service,
+        timeout: Duration,
+    ) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            match service.query_status() {
-                Ok(status) if status.current_state == ServiceState::Stopped => return,
-                Ok(_) => std::thread::sleep(Duration::from_millis(250)),
-                Err(_) => return,
+        loop {
+            if service
+                .query_status()
+                .context("等待服务停止时查询状态失败，已取消操作")?
+                .current_state
+                == ServiceState::Stopped
+            {
+                return Ok(());
             }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "服务在 {} 秒内未停止，已取消操作（可能正在执行搬运，请稍后重试）",
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -694,18 +732,29 @@ mod imp {
         let mut removed = true;
         match manager.open_service(SERVICE_NAME, access) {
             Ok(service) => {
+                stop_service(&service, Duration::from_secs(30))?;
                 service.delete().context("标记删除服务失败")?;
-                if service.query_status()?.current_state != ServiceState::Stopped {
-                    let _ = service.stop();
-                }
                 drop(service);
                 // Win32 没有"等待删除完成"的接口，只能自己轮询。
-                for _ in 0..20 {
-                    if manager
-                        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
-                        .is_err()
-                    {
-                        break;
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+                        Err(windows_service::Error::Winapi(error))
+                            if error.raw_os_error()
+                                == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+                        {
+                            break;
+                        }
+                        Err(windows_service::Error::Winapi(error))
+                            if error.raw_os_error()
+                                == Some(ERROR_SERVICE_MARKED_FOR_DELETE as i32) => {}
+                        Err(error) => return Err(error).context("确认服务删除状态失败"),
+                        Ok(_) => {}
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "服务已标记删除，但尚未完成；已保留安装目录和配置记录，请稍后重试卸载"
+                        );
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
@@ -717,9 +766,8 @@ mod imp {
             }
             Err(error) => return Err(error).context("打开服务失败"),
         }
-        forget_app_dir();
-        // 服务副本可能仍被 SCM 句柄占用，删不掉也不算失败。
-        let _ = fs::remove_dir_all(install_dir());
+        remove_install_dir_with_retry(&install_dir())?;
+        forget_app_dir()?;
         // 旧版目录不归 `install_dir()` 管，单独清一次。
         let _ = remove_legacy_install_files();
         Ok(if removed {
@@ -727,6 +775,27 @@ mod imp {
         } else {
             "后台服务未安装，无需卸载。".to_owned()
         })
+    }
+
+    fn remove_install_dir_with_retry(path: &Path) -> Result<()> {
+        for attempt in 0..20 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if attempt < 19 && matches!(error.raw_os_error(), Some(5 | 32)) => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "服务已移除，但安装目录 {} 尚有残留；已保留配置目录记录，请稍后重试卸载",
+                            path.display()
+                        )
+                    });
+                }
+            }
+        }
+        unreachable!("最后一次删除失败会返回错误")
     }
 
     /// 以管理员身份重新启动自己（UAC 提权），用于安装/卸载服务。
@@ -948,6 +1017,42 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn service_cleanup_retries_a_temporarily_locked_executable() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let temp = tempfile::tempdir().unwrap();
+            let installed = temp.path().join("service");
+            fs::create_dir(&installed).unwrap();
+            let exe = installed.join(EXE_FILE);
+            fs::write(&exe, b"old service").unwrap();
+            let locked = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&exe)
+                .unwrap();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                drop(locked);
+            });
+            remove_install_dir_with_retry(&installed).unwrap();
+            release.join().unwrap();
+            assert!(!installed.exists());
+            remove_install_dir_with_retry(&installed).unwrap();
+        }
+
+        #[test]
+        fn service_cleanup_reports_failure_and_keeps_the_target() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("not-a-directory");
+            fs::write(&path, b"keep").unwrap();
+            let error = remove_install_dir_with_retry(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("尚有残留"));
+            assert!(error.contains(&path.display().to_string()));
+            assert_eq!(fs::read(path).unwrap(), b"keep");
+        }
 
         #[test]
         fn service_acl_requires_a_trusted_owner_and_exclusive_admin_writes() {

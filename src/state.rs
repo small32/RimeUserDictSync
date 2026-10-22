@@ -22,6 +22,23 @@ pub struct SyncList {
     pub excluded: Vec<String>,
 }
 
+fn normalized_sync_path(value: &str) -> Option<String> {
+    crate::paths::validate_sync_file_path(value)
+        .ok()
+        .map(|path| {
+            Path::new(&path)
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+}
+
+fn same_sync_path(left: &str, right: &str) -> bool {
+    normalized_sync_path(left)
+        .is_some_and(|left| normalized_sync_path(right).as_ref() == Some(&left))
+}
+
 impl SyncList {
     pub fn load(path: &Path) -> Result<Self> {
         load_json(path)
@@ -35,8 +52,15 @@ impl SyncList {
         self.files.iter().any(|file| file.path == relative)
     }
 
+    /// 比较标准化后的相对路径，兼容旧配置中的 Windows 分隔符。
+    pub fn is_excluded(&self, relative: &str) -> bool {
+        self.excluded
+            .iter()
+            .any(|item| same_sync_path(item, relative))
+    }
+
     pub fn register(&mut self, relative: &str) {
-        self.excluded.retain(|item| item != relative);
+        self.excluded.retain(|item| !same_sync_path(item, relative));
         if !self.contains(relative) {
             self.files.push(SyncFile {
                 path: relative.to_owned(),
@@ -283,6 +307,18 @@ mod tests {
         list.register("my_words.dict.yaml");
         list.save(&path).unwrap();
         assert_eq!(SyncList::load(&path).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn excluded_paths_match_normalized_separators() {
+        let mut list = SyncList::default();
+        list.remove(r"custom\phrases.txt");
+        assert!(list.is_excluded("custom/phrases.txt"));
+        assert!(list.is_excluded("custom//phrases.txt"));
+        assert!(!list.is_excluded("another/phrases.txt"));
+        assert!(!list.is_excluded("../custom/phrases.txt"));
+        list.register("custom/phrases.txt");
+        assert!(!list.is_excluded("custom/phrases.txt"));
     }
 
     #[test]

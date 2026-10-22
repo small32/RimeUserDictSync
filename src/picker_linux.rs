@@ -1,17 +1,17 @@
-//! Linux 专用目录选择器（egui 自绘）。
+//! Linux 专用目录/文件选择器（egui 自绘）。
 //!
 //! 为什么不用 `rfd`：它在 Linux 上走 xdg-desktop-portal / GTK，两个都没暴露
 //! 「显示隐藏文件」的开关；而 RIME 用户目录天生躲在隐藏目录里
 //! （`~/.local/share/fcitx5/rime`、`~/.config/ibus/rime`）。
 //! 列表默认不列以 `.` 开头的项，用户连 `.local` 都看不见，只能手打整条路径。
-//! 更糟的是 Mint 这类没装 portal 的桌面，`pick_folder()` 直接返回 `None`，
-//! 按钮点下去毫无反应。
+//! portal 与 zenity 都不可用时，原生对话框会直接返回 `None`。
 //!
 //! 所以这里用 egui 画列表：隐藏项默认可见（也能一键收起）、可以粘贴路径跳转、
 //! 顺带标出「看起来像 RIME 目录」的文件夹，省掉逐层试错。
 
 use eframe::egui;
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -19,6 +19,7 @@ use std::{
 /// 选择器回给调用方的结果。
 pub enum PickerEvent {
     Accept(PathBuf),
+    Files(Vec<PathBuf>),
     Cancel,
 }
 
@@ -44,6 +45,8 @@ pub struct DirPicker {
     hidden_total: usize,
     error: Option<String>,
     hint: String,
+    select_files: bool,
+    selected_files: BTreeSet<PathBuf>,
 }
 
 impl DirPicker {
@@ -56,8 +59,16 @@ impl DirPicker {
             hidden_total: 0,
             error: None,
             hint: hint.into(),
+            select_files: false,
+            selected_files: BTreeSet::new(),
         };
         picker.navigate(start_dir(&start));
+        picker
+    }
+
+    pub fn for_files(start: PathBuf, hint: impl Into<String>) -> Self {
+        let mut picker = Self::new(start, hint);
+        picker.select_files = true;
         picker
     }
 
@@ -115,10 +126,15 @@ impl DirPicker {
         if target.is_dir() {
             self.navigate(target);
         } else if target.is_file() {
-            // 手滑选了文件：退到它所在目录，比报错有用。
+            // 文件模式也支持直接粘贴文件路径，并在所在目录勾选它。
             let parent = target.parent().map(Path::to_path_buf);
             match parent {
-                Some(dir) => self.navigate(dir),
+                Some(dir) => {
+                    self.navigate(dir);
+                    if self.select_files {
+                        self.selected_files.insert(target);
+                    }
+                }
                 None => self.error = Some(format!("{} 不是目录", target.display())),
             }
         } else {
@@ -229,6 +245,17 @@ impl DirPicker {
                         };
                         // 隐藏项不弱化显示：RIME 的目录本身就藏在 `.local` 下，
                         // 这里正是用户要点的目标，用灰字反而碍事。
+                        if self.select_files && !entry.is_dir {
+                            let mut selected = self.selected_files.contains(&entry.path);
+                            if ui.checkbox(&mut selected, text).changed() {
+                                if selected {
+                                    self.selected_files.insert(entry.path.clone());
+                                } else {
+                                    self.selected_files.remove(&entry.path);
+                                }
+                            }
+                            return;
+                        }
                         let sense = if entry.is_dir {
                             egui::Sense::click()
                         } else {
@@ -263,8 +290,29 @@ impl DirPicker {
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(200, 120, 0), error);
         }
+        if self.select_files {
+            ui.label(format!(
+                "已选 {} 个文件（可跨目录选择）",
+                self.selected_files.len()
+            ));
+        }
         ui.horizontal(|ui| {
-            if ui.button("选择此目录").clicked() {
+            if self.select_files {
+                if ui
+                    .add_enabled(
+                        !self.selected_files.is_empty(),
+                        egui::Button::new("添加所选文件"),
+                    )
+                    .clicked()
+                {
+                    result = Some(PickerEvent::Files(
+                        self.selected_files.iter().cloned().collect(),
+                    ));
+                }
+                if ui.button("清空选择").clicked() {
+                    self.selected_files.clear();
+                }
+            } else if ui.button("选择此目录").clicked() {
                 result = Some(PickerEvent::Accept(self.cwd.clone()));
             }
             if ui.button("取消").clicked() {
@@ -425,6 +473,33 @@ mod tests {
         let picker = DirPicker::new(dir.path().to_path_buf(), "");
         assert!(picker.showing_hidden());
         assert_eq!(picker.cwd(), dir.path());
+    }
+
+    #[test]
+    fn file_picker_accepts_hidden_typed_files_and_keeps_choices_between_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join(".hidden/custom.yaml");
+        let second = dir.path().join("other/words.dict.yaml");
+        touch(&first);
+        touch(&second);
+        let mut picker = DirPicker::for_files(dir.path().to_path_buf(), "");
+        assert!(picker.showing_hidden());
+        picker.manual = first.display().to_string();
+        picker.go_manual();
+        assert_eq!(picker.cwd(), first.parent().unwrap());
+        picker.manual = second.display().to_string();
+        picker.go_manual();
+        assert_eq!(picker.cwd(), second.parent().unwrap());
+        assert_eq!(picker.selected_files, BTreeSet::from([first, second]));
+        picker.manual = dir.path().join("missing.yaml").display().to_string();
+        picker.go_manual();
+        assert!(picker.error.is_some());
+        assert_eq!(picker.selected_files.len(), 2);
+
+        let picker = std::cell::RefCell::new(picker);
+        egui::__run_test_ui(|ui| {
+            let _ = picker.borrow_mut().body(ui);
+        });
     }
 
     #[test]

@@ -333,10 +333,9 @@ fn takeover_common(
 pub fn retire(dav: &WebDav, id: &str, password: &str, layout: &Layout) -> Result<Vec<String>> {
     let _owner_lock = identity::OwnerLock::acquire(dav, id)?;
     let owner = Owner::load(dav, id)?.unwrap_or_default();
+    // 从未设密码的 ID 允许直接注销；只有已设密码的 ID 需要验证。
     if owner.has_password() {
         verify(&owner, password)?;
-    } else if !password.is_empty() {
-        // 从未设密码的 ID：允许直接注销，密码参数忽略。
     }
     dav.delete_collection(id)?;
     if layout.device.is_dir() {

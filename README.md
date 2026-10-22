@@ -90,12 +90,15 @@ macOS:   ~/Library/Rime
 Linux 上这个按钮用的是**程序自绘的选择器**，不是系统对话框：RIME 用户目录天生在
 `~/.local/share/fcitx5/rime`、`~/.config/ibus/rime` 这类**隐藏目录**里，而
 xdg-desktop-portal / GTK 的文件对话框都不给调用方「显示隐藏文件」的开关，默认根本看不见
-`.local`，只能手打整条路径（没装 portal 的桌面更是点了没反应）。所以这里：
+`.local`，只能手打整条路径；portal 与 zenity 都不可用时，系统对话框还可能直接返回空。所以这里：
 
 - **隐藏文件与隐藏文件夹默认就列出来**，右上角可勾掉「显示隐藏文件」反过来折叠；
 - 可以直接粘贴路径跳转，支持 `~/`、`%HOME%` 与相对写法，回车生效；
 - 目录里有 `installation.yaml` 的会额外标一个绿色 `RIME`，一眼认出该点哪个；
 - 顶部「常见位置」直接列出自动探测到的候选目录，省掉逐层找 `.local`。
+
+Linux 的「同步文件选择 → 添加文件」也使用这套选择器，支持跨目录多选、显示隐藏文件和
+直接粘贴文件路径；所选文件仍须位于当前 RIME 用户目录内。
 
 ### 2. WebDAV 设置
 
@@ -178,6 +181,9 @@ xdg-desktop-portal / GTK 的文件对话框都不给调用方「显示隐藏文�
 
 这一轮**完全不读、不写 `RIME/` 根目录下的源文件**，所以打字不受影响。
 比对优先用 PROPFIND 的 `getetag`，拿不到就用 `size`+`mtime`，两者都不可信才下载全文比 hash。
+本机排除集同时作用于下载和上传。其他设备快照中的单条非法文件名、下载失败或 hash 不符会
+记录日志并保留已有副本，其余条目及本机上传继续；对端清单只接收 `.userdb.txt` 快照。
+若无法校验本设备的远端身份，本轮搬运直接中止，不下载也不上传。
 
 ### 手动「同步词库」
 
@@ -685,9 +691,9 @@ Linux 输出 `target/release/RimeUserDictSync`（编译需要 GTK3 / XKB 的头�
 
 | 平台 | 产物 |
 | --- | --- |
-| Windows x64 | `RimeUserDictSync-v0.5.0-Windows-x64.exe` |
-| macOS | `RimeUserDictSync-v0.5.0-macOS-*.zip`（ARM64 / Intel / Universal 2） |
-| Linux x86_64 | `RimeUserDictSync-v0.5.0-Linux-x86_64`（单文件，`chmod +x` 后直接运行） |
+| Windows x64 | `RimeUserDictSync-v0.5.1-Windows-x64.exe` |
+| macOS | `RimeUserDictSync-v0.5.1-macOS-*.zip`（ARM64 / Intel / Universal 2） |
+| Linux x86_64 | `RimeUserDictSync-v0.5.1-Linux-x86_64`（单文件，`chmod +x` 后直接运行） |
 
 Linux 构建机额外装 `libgtk-3-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`，
 这是 eframe 与 rfd 编译期需要的 `pkg-config` 条目。
@@ -695,9 +701,9 @@ Linux 构建机额外装 `libgtk-3-dev libxkbcommon-dev libwayland-dev libgl1-me
 发布新版本时，先把 `Cargo.toml` 的版本号改好并提交，再推送匹配的标签：
 
 ```bash
-git tag v0.5.0
+git tag v0.5.1
 git push origin main
-git push origin v0.5.0
+git push origin v0.5.1
 ```
 
 标签必须是 `v` 加 `Cargo.toml` 中的版本号，否则构建会主动失败。
