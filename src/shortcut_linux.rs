@@ -240,7 +240,35 @@ fn exec_quote(value: &str) -> String {
     out
 }
 
+/// `.desktop` 是 GKeyFile：值要先按「string 类型通用转义」写进文件，
+/// 读的时候再按 `Exec` 的引用规则解析。两层都要转义，只做一层会坏事：
+///
+/// - 路径含 `"` 时 `exec_quote` 产出 `\"`，string 层看到的是**非法转义**
+///   → 整个 `Exec` 键失效，菜单项根本不出现；
+/// - 路径含 `\` 时少转一层，读回来会少一半反斜杠。
+///
+/// 规范原文：「the general escape rule … is applied **before** the quoting rule」，
+/// 所以写入顺序是「先 Exec 引用、再 string 转义」。
+fn key_file_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
 fn desktop_entry(exe: &Path, app_dir: &Path, icon: &Path) -> String {
+    let exec = format!(
+        "{} --sync-now --notify --app-dir {}",
+        exec_quote(&exe.to_string_lossy()),
+        exec_quote(&app_dir.to_string_lossy()),
+    );
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -248,15 +276,14 @@ fn desktop_entry(exe: &Path, app_dir: &Path, icon: &Path) -> String {
          Name={SHORTCUT_TITLE}\n\
          Name[en]=RIME Sync\n\
          Comment=拉取 → 合并写回 → 上传 → RIME 同步 → 重新部署\n\
-         Exec={exe} --sync-now --notify --app-dir {app_dir}\n\
+         Exec={exec}\n\
          Icon={icon}\n\
          Terminal=false\n\
          StartupNotify=false\n\
          Categories=Utility;\n\
          {MARKER}\n",
-        exe = exec_quote(&exe.to_string_lossy()),
-        app_dir = exec_quote(&app_dir.to_string_lossy()),
-        icon = icon.to_string_lossy(),
+        exec = key_file_escape(&exec),
+        icon = key_file_escape(&icon.to_string_lossy()),
     )
 }
 
@@ -289,6 +316,35 @@ mod tests {
         assert_eq!(exec_quote("/opt/100%/x"), "/opt/100%%/x");
         assert_eq!(exec_quote("/tmp/a$b"), "\"/tmp/a\\$b\"");
         assert_eq!(exec_quote("/tmp/a\"b"), "\"/tmp/a\\\"b\"");
+    }
+
+    /// 两层转义都要在：`.desktop` 的 string 层看到非法转义会把整个键判废，
+    /// 表现是「说创建成功，但菜单里根本没有这一项」。
+    #[test]
+    fn desktop_values_survive_the_key_file_string_layer() {
+        let entry = desktop_entry(
+            Path::new("/home/me/Rime \"备份\"/RimeUserDictSync"),
+            Path::new("/home/me/Rime Config"),
+            Path::new("/home/me/.local/share/icons/rime-user-dict-sync.png"),
+        );
+        let exec = entry
+            .lines()
+            .find_map(|line| line.strip_prefix("Exec="))
+            .expect("应有 Exec 行");
+        // Exec 层的 `\"` 必须再被 string 层转成 `\\"`。
+        assert!(exec.contains("Rime \\\\\"备份\\\\\""), "实际 Exec：{exec}");
+
+        let backslash = desktop_entry(
+            Path::new("/home/me/a\\b/RimeUserDictSync"),
+            Path::new("/home/me/Rime Config"),
+            Path::new("/tmp/i.png"),
+        );
+        let exec = backslash
+            .lines()
+            .find_map(|line| line.strip_prefix("Exec="))
+            .expect("应有 Exec 行");
+        // 原始 `\` → Exec 层 `\\` → string 层 `\\\\`
+        assert!(exec.contains("a\\\\\\\\b"), "实际 Exec：{exec}");
     }
 
     #[test]

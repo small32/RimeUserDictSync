@@ -7,7 +7,7 @@ use crate::{
         validate_installation_id,
     },
     report::Reporter,
-    state::{IndexEntry, LocalLock, RemoteMark, SnapshotEntry, SnapshotIndex, SyncIndex},
+    state::{IndexEntry, RemoteMark, SnapshotEntry, SnapshotIndex, SyncIndex},
     webdav::{PutOutcome, RemoteEntry, UploadTier},
 };
 use anyhow::{Result, bail};
@@ -46,64 +46,77 @@ impl std::fmt::Display for SessionTakenOver {
 
 impl std::error::Error for SessionTakenOver {}
 
-/// 后台搬运一轮（取锁）。**只搬运文件，不读写 `RIME/` 根目录下的源文件**（§3）。
-pub fn round(
+/// 一轮中的「拉」：远端 `Others/` 与其他设备快照 → 本地。调用方须已持有本地锁。
+pub fn pull_all(
     context: &Context,
+    index: &mut SyncIndex,
     cancel: &AtomicBool,
     report: &dyn Reporter,
-) -> Result<RoundOutcome> {
-    let _lock = LocalLock::acquire(&context.layout.lock_file())?;
-    round_locked(context, cancel, report)
-}
-
-/// 已经持有本地锁时执行一轮搬运（手动同步的第 ① 步会调用它）。
-pub fn round_locked(
-    context: &Context,
-    cancel: &AtomicBool,
-    report: &dyn Reporter,
-) -> Result<RoundOutcome> {
-    let mut outcome = RoundOutcome::default();
-    check_local_identity(context)?;
-    report.progress(5);
-
+) -> Result<usize> {
     check_session(context, report)?;
     check(cancel)?;
 
     // ① 拉：远端 Others/ → 本地 Sync/Others/
     report.log("后台搬运：比对远端 Others/ 与本地共享目录。");
-    let mut index = context.load_index()?;
-    let pulled = pull_others(context, &mut index, report)?;
-    outcome.downloaded += pulled;
-    context.save_index(&index)?;
+    let pulled = pull_others(context, index, report)?;
+    context.save_index(index)?;
     report.progress(35);
     check(cancel)?;
 
     // ② 拉：其他设备 <ID_x>/.index.json → 增量下载 userdb 快照
     report.log("后台搬运：比对其他设备的 userdb 快照清单。");
-    let snapshots = pull_snapshots(context, &mut index, report)?;
-    outcome.downloaded += snapshots;
-    context.save_index(&index)?;
+    let snapshots = pull_snapshots(context, index, report)?;
+    context.save_index(index)?;
     report.progress(60);
+    Ok(pulled + snapshots)
+}
+
+/// 一轮中的「推」：本地 `Others/` 与本机快照 → 远端。调用方须已持有本地锁。
+pub fn push_all(
+    context: &Context,
+    index: &mut SyncIndex,
+    cancel: &AtomicBool,
+    report: &dyn Reporter,
+) -> Result<usize> {
     check(cancel)?;
 
     // ③ 推：本地 Others/ 的变化
     report.log("后台搬运：上传本地 Others/ 的变化。");
-    let uploaded = push_others(context, &mut index, cancel, report)?;
-    outcome.uploaded += uploaded;
-    context.save_index(&index)?;
+    let uploaded = push_others(context, index, cancel, report)?;
+    context.save_index(index)?;
     report.progress(85);
     check(cancel)?;
 
     // ④ 推：本设备 <ID_A>/ 快照 + `.index.json`（§11 P0：本机快照必须上得去）
     report.log("后台搬运：上传本设备的 userdb 快照。");
     let pushed = push_own_snapshot(context, cancel, report)?;
-    outcome.uploaded += pushed;
     touch_owner(context, report)?;
     report.progress(100);
-    outcome.notes.push(format!(
-        "后台搬运完成：下载 {} 项，上传 {} 项。",
-        outcome.downloaded, outcome.uploaded
-    ));
+    Ok(uploaded + pushed)
+}
+
+/// 已经持有本地锁时执行一轮搬运（手动同步的第 ① 步会调用它）。
+///
+/// 只搬运文件：远端 Others/ 与快照的收发。**不含并集合并** ——
+/// 手动同步会在第 ② 步自己做；后台轮次走 [`crate::engine::background_round`]。
+pub fn round_locked(
+    context: &Context,
+    cancel: &AtomicBool,
+    report: &dyn Reporter,
+) -> Result<RoundOutcome> {
+    check_local_identity(context)?;
+    report.progress(5);
+    let mut index = context.load_index()?;
+    let downloaded = pull_all(context, &mut index, cancel, report)?;
+    check(cancel)?;
+    let uploaded = push_all(context, &mut index, cancel, report)?;
+    let outcome = RoundOutcome {
+        downloaded,
+        uploaded,
+        notes: vec![format!(
+            "后台搬运完成：下载 {downloaded} 项，上传 {uploaded} 项。"
+        )],
+    };
     Ok(outcome)
 }
 
@@ -874,6 +887,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     #[derive(Default)]
@@ -1465,6 +1479,150 @@ mod tests {
                 .iter()
                 .filter(|request| request.method == "PUT")
                 .all(|request| request.path.contains("/.last-sync-"))
+        );
+    }
+
+    /// 后台轮次必须把本地源文件的改动并进 `Sync/Others/` 再上传，
+    /// 否则「本机新增词条 → 他机可见」这条链路是断的。
+    #[test]
+    fn background_round_picks_up_local_source_edits() {
+        let owner =
+            serde_json::to_vec(&serde_json::json!({"id":"pc01","session_token":"test-token"}))
+                .unwrap();
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([
+                ("/pc01/owner.json".into(), owner),
+                (
+                    "/Others/custom_phrase.txt".into(),
+                    b"hello\thello\t1\n".to_vec(),
+                ),
+            ]),
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, context) = test_context(&server.url);
+        let mut list = crate::state::SyncList::default();
+        list.register("custom_phrase.txt");
+        context.save_list(&list).unwrap();
+
+        let local = context.layout.local_source("custom_phrase.txt");
+        let others = context.layout.others_path("custom_phrase.txt");
+        let base = "hello\thello\t1\n";
+        fs::write(&local, base).unwrap();
+        fs::write(&others, base).unwrap();
+        let mut index = SyncIndex::default();
+        index.remote.insert(
+            "custom_phrase.txt".into(),
+            RemoteMark {
+                sha256: Some(hash::sha256_hex(base.as_bytes())),
+                ..Default::default()
+            },
+        );
+        context.save_index(&index).unwrap();
+
+        // 用户在本机新增了一条自定义短语。
+        let edited = "hello\thello\t1\nnewphrase\txyz\t2\n";
+        fs::write(&local, edited).unwrap();
+
+        crate::engine::background_round(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+
+        let uploaded =
+            String::from_utf8(state.lock().unwrap().files["/Others/custom_phrase.txt"].clone())
+                .unwrap();
+        assert!(
+            uploaded.contains("newphrase\txyz\t2"),
+            "后台轮次没有把本地新增的词条上传：\n{uploaded}"
+        );
+        // 并集是双向的：本地源文件也应得到远端的其它条目（此处远端无新增，故保持一致）。
+        assert_eq!(fs::read_to_string(&local).unwrap(), edited);
+    }
+
+    /// 稳态（没有任何改动）下再跑一轮必须是空操作：不改写 `RIME/` 源文件、
+    /// 不改写 `Sync/Others/`、也不发包上传。
+    ///
+    /// 这条决定「10 分钟一轮的后台任务」会不会变成反复写盘的负担：
+    /// 并集是幂等的，结果相同就一个字节都不写。
+    #[test]
+    fn background_round_is_a_noop_when_nothing_changed() {
+        let owner =
+            serde_json::to_vec(&serde_json::json!({"id":"pc01","session_token":"test-token"}))
+                .unwrap();
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/pc01/owner.json".into(), owner)]),
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, context) = test_context(&server.url);
+        let mut list = crate::state::SyncList::default();
+        list.register("custom_phrase.txt");
+        context.save_list(&list).unwrap();
+
+        let local = context.layout.local_source("custom_phrase.txt");
+        let others = context.layout.others_path("custom_phrase.txt");
+        let base = "hello\thello\t1\n";
+        fs::write(&local, base).unwrap();
+        fs::write(&others, base).unwrap();
+        let mut index = SyncIndex::default();
+        index.remote.insert(
+            "custom_phrase.txt".into(),
+            RemoteMark {
+                sha256: Some(hash::sha256_hex(base.as_bytes())),
+                ..Default::default()
+            },
+        );
+        context.save_index(&index).unwrap();
+
+        // 第一轮：把本地内容推到远端，进入稳态。
+        crate::engine::background_round(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+
+        // 睡过 mtime 的秒级精度，确保「如果写了」一定能被观测到。
+        std::thread::sleep(Duration::from_millis(1_100));
+        let local_mtime = fs::metadata(&local).unwrap().modified().unwrap();
+        let others_mtime = fs::metadata(&others).unwrap().modified().unwrap();
+
+        // 第二轮：什么都没改。
+        let outcome = crate::engine::background_round(
+            &context,
+            &AtomicBool::new(false),
+            &crate::report::NullReporter,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.uploaded, 0, "稳态下不应上传：{:?}", outcome.notes);
+        assert_eq!(
+            fs::metadata(&local).unwrap().modified().unwrap(),
+            local_mtime,
+            "稳态下不应改写 RIME/ 源文件"
+        );
+        assert_eq!(
+            fs::metadata(&others).unwrap().modified().unwrap(),
+            others_mtime,
+            "稳态下不应改写 Sync/Others/"
+        );
+        // 稳态一轮只剩两个必要的 PUT：`<ID>/.index.json`（快照清单）
+        // 与 `<ID>/.last-sync-*.json`（存活心跳）。绝不能出现词库内容本身。
+        let unexpected: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .map(|request| request.path.clone())
+            .filter(|path| !path.ends_with("/.index.json") && !path.contains("/.last-sync-"))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "稳态一轮不应上传词库内容，实际上传了 {unexpected:?}"
         );
     }
 }

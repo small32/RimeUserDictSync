@@ -6,8 +6,11 @@
 //! 调度刻意不用「睡满整个间隔」的写法，而是每 [`TICK`] 醒一次判断是否到期：
 //! 这样合盖休眠唤醒后会立刻补跑一轮，轮次本身的耗时也不会累积成周期漂移。
 
-use crate::{config::Settings, context::Context, paths, report::Reporter, transport};
+use crate::{config::Settings, context::Context, paths, report::Reporter};
 use anyhow::{Context as _, Result};
+// 只有 Windows 分支（-D warnings 下 macOS 用到反而会是未使用导入）。
+#[cfg(target_os = "windows")]
+use anyhow::bail;
 use std::{
     fs,
     io::Write,
@@ -61,7 +64,11 @@ impl DueAt {
     }
 }
 
-/// 无界面地跑一轮搬运。Windows 服务、后续的 macOS LaunchAgent、手工排查都用它。
+/// 无界面地跑一轮后台同步：拉取 → 并集合并写回 → 上传。
+///
+/// Windows 服务、macOS LaunchAgent、Linux systemd timer、手工排查都用它。
+/// 不做 RIME 的 `/sync` 与 `/deploy`（那两步需要用户登录会话，见
+/// [`crate::engine::background_round`]）。
 pub fn run_once(
     app_dir: &Path,
     ini: &Path,
@@ -73,7 +80,7 @@ pub fn run_once(
     for notice in context.notices() {
         reporter.log(notice);
     }
-    let outcome = transport::round(&context, cancel, reporter)?;
+    let outcome = crate::engine::background_round(&context, cancel, reporter)?;
     Ok(format!(
         "后台搬运完成：下载 {} 项，上传 {} 项。",
         outcome.downloaded, outcome.uploaded
@@ -130,6 +137,34 @@ pub fn rime_sync(
     }
     crate::engine::rime_sync_and_deploy(&context, cancel, reporter)?;
     Ok("RIME 用户资料同步完成，并已重新部署。".to_owned())
+}
+
+/// 菜单栏图标右键的「退出」：连后台搬运一起停掉，且下次登录不再恢复。
+///
+/// 与「隐藏图标」的区别就在后者：隐藏只是终止本进程，后台搬运照旧，
+/// plist 也还在（重新运行 App 就能把图标 kickstart 回来，不必等下次登录）；
+/// 退出则要把定时搬运的任务一并卸载、plist / unit 一起删掉。
+///
+/// 顺带把 ini 的 `[background] enabled` 写回 false，否则 GUI 重启后会显示
+/// 「已开启」，而 launchd / systemd 里其实什么都没有。
+pub fn quit_all(ini: &Path) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    let stopped = crate::agent::uninstall();
+    #[cfg(target_os = "linux")]
+    let stopped = crate::service_linux::uninstall();
+    // Windows 没有菜单栏助手（也不该由它触发）：退出界面用窗口的关闭按钮。
+    #[cfg(target_os = "windows")]
+    let stopped: Result<String> =
+        bail!("Windows 没有菜单栏助手；要停止后台搬运请在界面里点「停止后台服务」。");
+
+    let mut message = stopped?;
+    if let Ok(mut settings) = Settings::load(ini) {
+        settings.background_enabled = false;
+        if let Err(error) = settings.save(ini) {
+            message.push_str(&format!("\n警告：同步已停止，但回写配置失败：{error}"));
+        }
+    }
+    Ok(message)
 }
 
 /// 写日志文件的 [`Reporter`]：无界面模式（服务）使用，日志与 GUI 共用同一个 `RimeSync.log`。

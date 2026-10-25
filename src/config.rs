@@ -108,7 +108,9 @@ impl Settings {
             text.push_str(&self.legacy_sync_files.join(";"));
             text.push('\n');
         }
-        fs::write(path, text).context("保存配置文件失败")
+        // 原子写：`fs::write` 是原地覆写，崩溃会留下半截 INI，
+        // 而这份文件里存着 WebDAV 地址、账号与密码，坏了等于全部设置丢失。
+        crate::hash::write_atomic(path, &text).context("保存配置文件失败")
     }
 
     pub fn webdav_ready(&self) -> bool {
@@ -239,7 +241,7 @@ pub fn set_yaml_scalar(path: &Path, key: &str, value: &str) -> Result<()> {
     } else {
         format!("{}\n{}: '{}'\n", text.trim_end(), key, escaped)
     };
-    fs::write(path, updated)?;
+    crate::hash::write_atomic(path, &updated)?;
     Ok(())
 }
 
@@ -374,11 +376,8 @@ pub fn set_app_dir(path: &Path) -> Result<()> {
     let default = default_app_dir()?;
     fs::create_dir_all(&default)?;
     fs::create_dir_all(path)?;
-    fs::write(
-        default.join("config_dir.txt"),
-        path.to_string_lossy().as_bytes(),
-    )
-    .context("保存 macOS 配置目录失败")
+    crate::hash::write_atomic(&default.join("config_dir.txt"), &path.to_string_lossy())
+        .context("保存 macOS 配置目录失败")
 }
 
 #[cfg(test)]

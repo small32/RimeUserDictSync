@@ -8,7 +8,7 @@ use crate::{
     platform,
     report::Reporter,
     state::SyncList,
-    transport, webdav,
+    webdav,
 };
 use anyhow::{Context as _, Result, bail};
 use eframe::egui;
@@ -146,6 +146,11 @@ pub fn run() -> eframe::Result {
             // 启动时比对一次并重写。同样放后台，别拖慢首帧。
             #[cfg(target_os = "linux")]
             std::thread::spawn(crate::service_linux::heal_after_update);
+            // macOS：右键「隐藏图标」只让助手正常退出，launchd 不会自动把它
+            // 拉回来。重新运行 App 时补一次 kickstart，让图标就地恢复，
+            // 不必等到下次登录。
+            #[cfg(target_os = "macos")]
+            std::thread::spawn(crate::agent::ensure_menubar_running);
             Ok(Box::new(App::new()))
         }),
     )
@@ -234,6 +239,13 @@ struct App {
     service_running: Arc<AtomicBool>,
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     service_text: String,
+    /// 服务是否已安装（只在 Windows 用）。
+    ///
+    /// 单独缓存而不是每帧调 `service::status()`：那是一次
+    /// `OpenSCManager` + `OpenService` + `QueryServiceStatus` 的 SCM 往返，
+    /// 页面以 200ms 重绘，等于每秒 5 次；SCM 卡住时会直接卡住 UI 线程。
+    #[cfg(target_os = "windows")]
+    service_installed: bool,
     /// macOS / Linux：后台线程定期查 launchd / systemd，UI 只读快照。
     ///
     /// 直接在 UI 线程查会 spawn 子进程（`launchctl print` / `systemctl is-active`），
@@ -280,6 +292,14 @@ struct App {
     sync_files_draft: Vec<String>,
 
     cancel: Arc<AtomicBool>,
+    /// 界面已关闭。
+    ///
+    /// 内建后台线程与代理轮询线程都是 `std::thread`（非守护线程）：
+    /// 只要它们还在跑，关掉窗口后 Rust 进程就不会退出。
+    /// 这里给它一个收工信号，让 ⌘W / 关闭窗口后进程能真正结束。
+    /// 注意它**只停 GUI 自己的兜底线程**，launchd / systemd / SCM 服务
+    /// 与菜单栏图标都是独立进程，不受影响。
+    gui_closed: Arc<AtomicBool>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     notice: Option<String>,
@@ -299,7 +319,7 @@ struct AgentSnapshot {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_agent_poller() -> Arc<Mutex<AgentSnapshot>> {
+fn spawn_agent_poller(closed: Arc<AtomicBool>) -> Arc<Mutex<AgentSnapshot>> {
     let snapshot = Arc::new(Mutex::new(AgentSnapshot::default()));
     let shared = snapshot.clone();
     std::thread::spawn(move || {
@@ -309,10 +329,30 @@ fn spawn_agent_poller() -> Arc<Mutex<AgentSnapshot>> {
                 guard.text = text;
                 guard.loaded = loaded;
             }
-            std::thread::sleep(SERVICE_POLL_INTERVAL);
+            if sleep_or_stop(&closed, SERVICE_POLL_INTERVAL) {
+                break;
+            }
         }
     });
     snapshot
+}
+
+/// 睡一小段，期间持续检查关闭信号；返回 true 表示应当收工。
+///
+/// 直接 `sleep(30s)` 的话，界面关掉后进程最多要挂 30 秒才退出。
+/// 切成 250ms 的小片，退出指令 1 秒内就能生效，代价可以忽略。
+fn sleep_or_stop(closed: &AtomicBool, total: Duration) -> bool {
+    const STEP: Duration = Duration::from_millis(250);
+    let mut waited = Duration::ZERO;
+    while waited < total {
+        if closed.load(Ordering::Relaxed) {
+            return true;
+        }
+        let slice = STEP.min(total - waited);
+        std::thread::sleep(slice);
+        waited += slice;
+    }
+    closed.load(Ordering::Relaxed)
 }
 
 /// 查一次「后台搬运装没装、跑没跑」，返回（描述文本, 是否已接管搬运）。
@@ -362,6 +402,7 @@ impl App {
         check_for_update(tx.clone());
         let busy_flag = Arc::new(AtomicBool::new(false));
         let service_running = Arc::new(AtomicBool::new(false));
+        let gui_closed = Arc::new(AtomicBool::new(false));
         let background_paths = Arc::new(Mutex::new(BackgroundPaths {
             base: base.clone(),
             ini: ini.clone(),
@@ -371,9 +412,10 @@ impl App {
             tx.clone(),
             busy_flag.clone(),
             service_running.clone(),
+            gui_closed.clone(),
         );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let agent_snapshot = spawn_agent_poller();
+        let agent_snapshot = spawn_agent_poller(gui_closed.clone());
 
         let mut app = Self {
             base,
@@ -396,6 +438,8 @@ impl App {
             service_running,
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             service_text: String::new(),
+            #[cfg(target_os = "windows")]
+            service_installed: false,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             agent_snapshot,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -429,6 +473,7 @@ impl App {
             exported_text: String::new(),
             sync_files_draft: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            gui_closed,
             tx,
             rx,
             notice: None,
@@ -489,7 +534,12 @@ impl App {
         match build_context(&self.base, &self.ini) {
             Ok(context) => {
                 let notices = context.notices().to_vec();
-                self.device_id_draft = context.device.installation_id.clone();
+                // 只在还没填时灌入：`refresh_context` 在每次手动同步结束、
+                // 每次设备动作之后（**失败也调**）都会跑，无条件覆盖会把用户
+                // 刚敲进去的新设备 ID 抹掉，接着再点一次就提交了另一个 ID。
+                if self.device_id_draft.trim().is_empty() {
+                    self.device_id_draft = context.device.installation_id.clone();
+                }
                 self.context = Some(context);
                 self.context_error = None;
                 self.context_error_logged.clear();
@@ -666,7 +716,12 @@ impl App {
         {
             self.refresh_context();
         }
-        if self.capabilities_dirty && self.capability_retry_at.elapsed() >= Duration::from_secs(2) {
+        // 只有上下文可用时才重试：`cache_capabilities` 在 `installation.yaml` 缺失
+        // 时返回 `Ok(false)`（脏标记保留），没有这一层会变成每 2 秒一次的无限探测。
+        if self.capabilities_dirty
+            && self.context.is_some()
+            && self.capability_retry_at.elapsed() >= Duration::from_secs(2)
+        {
             let _ = self.apply_tested_capabilities();
         }
         self.refresh_service_state();
@@ -701,8 +756,9 @@ impl App {
             return;
         }
         self.service_checked_at = Instant::now();
+        let status = crate::service::status();
         let text = crate::service::describe();
-        let running = crate::service::status() == crate::service::Status::Running;
+        let running = status == crate::service::Status::Running;
         // 状态变化才写日志，避免每 5 秒刷一行。
         if !self.service_text.is_empty() && self.service_text != text {
             self.append(&crate::report::timestamped(&format!(
@@ -710,6 +766,7 @@ impl App {
             )));
         }
         self.service_text = text;
+        self.service_installed = status != crate::service::Status::NotInstalled;
         self.shortcut_text = crate::shortcut::describe(&self.base);
         self.service_running.store(running, Ordering::Relaxed);
     }
@@ -721,12 +778,14 @@ impl App {
         if self.service_checked_at.elapsed() < SERVICE_POLL_INTERVAL {
             return;
         }
-        self.service_checked_at = Instant::now();
         let (text, loaded) = match self.agent_snapshot.lock() {
             Ok(guard) if !guard.text.is_empty() => (guard.text.clone(), guard.loaded),
-            // 后台线程还没跑完第一轮，下一帧再读。
+            // 后台线程还没跑完第一轮。这里**不能**推进时间戳：否则状态行会空白
+            // 一整个轮询周期，`service_running` 也迟迟不置位，内建线程会与已安装的
+            // launchd / systemd 任务白抢一轮。
             _ => return,
         };
+        self.service_checked_at = Instant::now();
         if !self.service_text.is_empty() && self.service_text != text {
             self.append(&crate::report::timestamped(&format!(
                 "后台代理状态变化：{text}"
@@ -997,6 +1056,18 @@ impl App {
         settings.webdav_url = self.dav_url.trim().to_owned();
         settings.username = self.dav_username.trim().to_owned();
         settings.password = self.dav_password.clone();
+        // 先校验再落盘。地址一旦写坏（少写个 `https://`、用户名留空），
+        // 下次 `Context::build` 必然失败，于是同步、设备设置、文件列表全部不可用，
+        // 而对话框已经关掉、日志还写着"已保存" —— 用户只能自己把原地址打回去。
+        if !settings.webdav_url.is_empty() || !settings.username.is_empty() {
+            if settings.webdav_url.is_empty() {
+                bail!("请填写 WebDAV 地址（形如 https://dav.example.com/rime/）");
+            }
+            if settings.username.is_empty() {
+                bail!("请填写 WebDAV 用户名");
+            }
+            webdav::WebDav::new(&settings.webdav_url, &settings.username, &settings.password)?;
+        }
         let changed = settings.webdav_url != self.settings.webdav_url
             || settings.username != self.settings.username
             || settings.password != self.settings.password;
@@ -1323,6 +1394,24 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // macOS 惯例：⌘W 关窗口、⌘Q 退应用。这里只关**界面**：
+        // 后台搬运跑在独立的 launchd / systemd / SCM 任务里，菜单栏图标
+        // 也是独立进程，两者都不该被窗口关闭带走。
+        if ctx.input_mut(|state| state.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // 关闭前给 GUI 的兜底后台线程发收工信号：它们是 `std::thread`
+        // （非守护线程），不停掉的话窗口关了进程也退不出去。
+        // 这一句同时覆盖 ⌘W 与红色关闭按钮两条路径。
+        if ctx.input(|state| state.viewport().close_requested()) {
+            if self.busy {
+                // 正在同步时先不关，免得把这一轮截断在半路。
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.notice = Some("正在同步中，请等这一轮结束后再关闭窗口。".to_owned());
+            } else {
+                self.gui_closed.store(true, Ordering::Relaxed);
+            }
+        }
         self.poll();
         ctx.request_repaint_after(Duration::from_millis(200));
 
@@ -1415,8 +1504,14 @@ impl eframe::App for App {
                     if ui.button("保存间隔").clicked() {
                         if self.config_broken {
                             self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+                        } else if let Err(error) = self.settings.save(&self.ini) {
+                            // 写盘失败时**不要**再去改 launchd / systemd：否则系统里
+                            // 已经是新间隔，配置文件还是旧的，界面、内建线程与
+                            // `--scheduled-round` 会各说各话，重启后滑块还会弹回旧值。
+                            let message = format!("保存间隔失败：{error}");
+                            self.append(&crate::report::timestamped(&message));
+                            self.notice = Some(message);
                         } else {
-                            let _ = self.settings.save(&self.ini);
                             // macOS 的代理间隔写在 plist 里，改完设置要同步过去。
                             #[cfg(target_os = "macos")]
                             match crate::agent::refresh_interval(
@@ -1468,8 +1563,7 @@ impl eframe::App for App {
                         self.refresh_service_state();
                     }
                     ui.label(&self.service_text);
-                    let installed =
-                        crate::service::status() != crate::service::Status::NotInstalled;
+                    let installed = self.service_installed;
                     if ui
                         .add_enabled(!self.busy, egui::Button::new("安装 / 更新后台服务"))
                         .clicked()
@@ -2038,12 +2132,15 @@ fn spawn_background(
     tx: Sender<Event>,
     busy: Arc<AtomicBool>,
     service_running: Arc<AtomicBool>,
+    gui_closed: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut due = daemon::DueAt::now();
         let mut last_error = String::new();
         loop {
-            std::thread::sleep(daemon::TICK);
+            if sleep_or_stop(&gui_closed, daemon::TICK) {
+                break;
+            }
             let Ok(current) = paths.lock().map(|paths| paths.clone()) else {
                 continue;
             };
@@ -2064,7 +2161,10 @@ fn spawn_background(
             let reporter = ChannelReporter { tx: tx.clone() };
             let cancel = AtomicBool::new(false);
             let result = match build_context(&base, &ini) {
-                Ok(context) => transport::round(&context, &cancel, &reporter)
+                // 与 Windows 服务 / LaunchAgent / systemd timer 走同一条路：
+                // 拉取 → 并集合并写回 → 上传。少了合并，本机新增的词条
+                // 就永远进不了 Sync/Others/，也就上不了 WebDAV。
+                Ok(context) => crate::engine::background_round(&context, &cancel, &reporter)
                     .map(|outcome| {
                         format!(
                             "后台搬运完成：下载 {} 项，上传 {} 项。",

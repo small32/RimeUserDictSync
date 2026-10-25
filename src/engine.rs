@@ -6,7 +6,7 @@ use crate::{
     platform,
     report::Reporter,
     state::{IndexEntry, LocalLock, SyncIndex, SyncList},
-    transport,
+    transport::{self, RoundOutcome},
 };
 use anyhow::{Context as _, Result, bail};
 use std::{
@@ -80,27 +80,10 @@ pub fn manual_sync(
     check(cancel)?;
 
     // 2. 只合并本设备 `.sync-list` 里登记的文件（§4.1）。
-    let list = context.load_list()?;
     let mut index = context.load_index()?;
-    report.log(&format!(
-        "步骤 2/6：合并本设备登记的 {} 个同步文件。",
-        list.files.len()
-    ));
-    for file in &list.files {
-        check(cancel)?;
-        match merge_registered(&context.layout, &mut index, &file.path, report) {
-            Ok(FileAction::Unchanged) => {}
-            Ok(FileAction::Conflict(copy)) => {
-                outcome.conflicts.push(copy);
-                outcome.merged += 1;
-            }
-            Ok(_) => outcome.merged += 1,
-            Err(error) => {
-                // 单个文件失败不应中断整轮手动同步（其余文件与 userdb 仍要生效）。
-                report.log(&format!("合并 {} 失败：{error}", file.path));
-            }
-        }
-    }
+    let (merged, conflicts) = merge_registered_files(context, &mut index, cancel, report)?;
+    outcome.merged = merged;
+    outcome.conflicts = conflicts;
     context.save_index(&index)?;
     report.progress(45);
     check(cancel)?;
@@ -165,6 +148,79 @@ pub fn manual_sync(
         outcome.merged, outcome.uploaded
     ));
     Ok(outcome)
+}
+
+/// 把本设备 `.sync-list` 里登记的每个文件与 `Others/` 做并集，并写回两侧。
+///
+/// 返回 `(合并数, 冲突副本列表)`。手动同步的第 ② 步与后台轮次都要调用它：
+/// 少了这一步，「本机新增的词条」只存在于 `RIME/` 源文件里，永远不会进入
+/// `Sync/Others/`，于是既上不了 WebDAV，他机也永远看不到。
+pub fn merge_registered_files(
+    context: &Context,
+    index: &mut SyncIndex,
+    cancel: &AtomicBool,
+    report: &dyn Reporter,
+) -> Result<(usize, Vec<String>)> {
+    let list = context.load_list()?;
+    report.log(&format!(
+        "合并本设备登记的 {} 个同步文件。",
+        list.files.len()
+    ));
+    let mut merged = 0usize;
+    let mut conflicts = Vec::new();
+    for file in &list.files {
+        check(cancel)?;
+        match merge_registered(&context.layout, index, &file.path, report) {
+            Ok(FileAction::Unchanged) => {}
+            Ok(FileAction::Conflict(copy)) => {
+                conflicts.push(copy);
+                merged += 1;
+            }
+            Ok(_) => merged += 1,
+            Err(error) => {
+                // 单个文件失败不应中断整轮同步（其余文件与 userdb 仍要生效）。
+                report.log(&format!("合并 {} 失败：{error}", file.path));
+            }
+        }
+    }
+    Ok((merged, conflicts))
+}
+
+/// 后台一轮：拉取 → 并集合并写回 → 上传。
+///
+/// 与 [`manual_sync`] 唯一的差别是不做 RIME 的 `/sync` 与 `/deploy`：
+/// 它们必须在**用户登录会话**里跑（要读该用户的配置、让正在运行的输入法重载），
+/// Windows 服务的 session 0、launchd / systemd 的无人值守轮次都做不到。
+///
+/// 但文本并集必须照做，否则后台轮次只是在搬运一份永远不更新的 `Others/`，
+/// 多端同步实际上是断的。
+pub fn background_round(
+    context: &Context,
+    cancel: &AtomicBool,
+    report: &dyn Reporter,
+) -> Result<RoundOutcome> {
+    let _lock = LocalLock::acquire(&context.layout.lock_file())?;
+    transport::check_local_identity(context)?;
+    report.progress(5);
+
+    let mut index = context.load_index()?;
+    let downloaded = transport::pull_all(context, &mut index, cancel, report)?;
+    check(cancel)?;
+    report.progress(60);
+
+    // 并入本机源文件的改动，再统一上传；会话被接管时 pull_all 已经报错中止。
+    merge_registered_files(context, &mut index, cancel, report)?;
+    context.save_index(&index)?;
+
+    let uploaded = transport::push_all(context, &mut index, cancel, report)?;
+    context.save_index(&index)?;
+    Ok(RoundOutcome {
+        downloaded,
+        uploaded,
+        notes: vec![format!(
+            "后台搬运完成：下载 {downloaded} 项，上传 {uploaded} 项。"
+        )],
+    })
 }
 
 /// 只补齐后台服务做不到的两步：RIME 自带的用户资料同步与重新部署。
@@ -321,11 +377,13 @@ fn union_file(
                 index.conflicts.remove(relative);
                 return Ok(FileAction::Unchanged);
             }
+            // 写回必须用原子写：RIME/ 源文件是用户词库的唯一来源，
+            // 覆写到一半崩溃会留下截断文件（等于数据丢失）。
             if merged != local_text {
-                fs::write(local, &merged)?;
+                crate::hash::write_atomic(local, &merged)?;
             }
             if merged != others_text {
-                fs::write(others, &merged)?;
+                crate::hash::write_atomic(others, &merged)?;
             }
             record(index, relative, local)?;
             index.conflicts.remove(relative);
@@ -393,14 +451,14 @@ fn newest_file(
 
     match (base.is_some(), local_changed, others_changed) {
         (true, true, false) => {
-            fs::copy(local, others)?;
+            crate::hash::copy_atomic(local, others)?;
             stage_pending(index, relative, local)?;
             index.conflicts.remove(relative);
             report.log(&format!("{relative}：本机较新，已覆盖 Others/。"));
             Ok(FileAction::PushedToOthers)
         }
         (true, false, true) => {
-            fs::copy(others, local)?;
+            crate::hash::copy_atomic(others, local)?;
             record_if_shared_confirmed(index, relative, local)?;
             index.conflicts.remove(relative);
             report.log(&format!("{relative}：他机较新，已覆盖本地源文件。"));

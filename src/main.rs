@@ -52,7 +52,7 @@ RIME 用户词库同步工具
                          → RIME /sync → /deploy
   --rime-sync            只做 RIME 自带的用户资料同步 + 重新部署
                          （桌面快捷方式用的就是它；文件搬运由后台服务负责）
-  --round                只执行一轮后台搬运后退出（不合并、不部署）
+  --round                只执行一轮后台同步后退出：拉取 → 并集 → 上传（不部署）
   --scheduled-round      供 macOS 后台代理调用：后台搬运关闭时跳过，否则跑一轮
   --install-service      安装并启动后台搬运：Windows 为 SCM 服务（需管理员权限），
                          Linux 为 systemd 用户级 timer（不需要提权）
@@ -65,6 +65,7 @@ RIME 用户词库同步工具
   --uninstall-shortcut   删除该快捷方式
   --run-service          由服务控制管理器调用，不应手工执行
   --service-status       打印后台服务状态
+  --quit-all             停止后台搬运并卸载后台任务（菜单栏右键「退出」用）
   --notify               结束时弹消息框（快捷方式用；命令行下不需要）
   --app-dir <目录>       指定配置目录（默认是程序所在目录）
   --help                 显示本帮助
@@ -99,6 +100,7 @@ enum Command {
     UninstallShortcut,
     RunService,
     ServiceStatus,
+    QuitAll,
     Help,
 }
 
@@ -127,6 +129,7 @@ fn parse(arguments: &[String]) -> Result<Options> {
             "--uninstall-shortcut" => command = Some(Command::UninstallShortcut),
             "--run-service" => command = Some(Command::RunService),
             "--service-status" => command = Some(Command::ServiceStatus),
+            "--quit-all" => command = Some(Command::QuitAll),
             "--notify" => notify = true,
             "--help" | "-h" => command = Some(Command::Help),
             "--app-dir" => {
@@ -223,6 +226,8 @@ fn dispatch(command: Command, app_dir: &Path) -> Result<String> {
             daemon::run_once(app_dir, &ini, &cancel, &reporter)
         }
         Command::ServiceStatus => service_status_text(app_dir),
+        // 菜单栏图标右键的「退出」：把后台搬运一并停掉（各平台自己实现）。
+        Command::QuitAll => daemon::quit_all(&ini),
         // 下面这些只在 Windows 上存在。整条 match 分支用 cfg 包住 ——
         // 不能把 `service::…` 塞进闭包再交给一个通用辅助函数：
         // 闭包体在 macOS 上照样要参与编译，而那时 `mod service` 根本不存在。

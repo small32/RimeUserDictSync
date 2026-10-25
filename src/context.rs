@@ -56,15 +56,7 @@ impl DeviceFile {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        let temp = crate::hash::temp_sibling(path);
-        let result = (|| {
-            fs::write(&temp, text)?;
-            fs::rename(&temp, path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result.with_context(|| format!("写入 {} 失败", path.display()))
+        crate::hash::write_atomic(path, &text)
     }
 
     pub fn password_hash(&self) -> Option<PasswordHash> {

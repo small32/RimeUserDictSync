@@ -491,6 +491,43 @@ mod tests {
         }
     }
 
+    /// 后台每 10 分钟会跑一次并集，这里的数字用来回答「会不会卡」。
+    ///
+    /// 手动跑：`cargo test --release -- --ignored --nocapture merge_cost`
+    #[test]
+    #[ignore = "性能基线，不在常规测试里跑"]
+    fn merge_cost_at_realistic_sizes() {
+        fn sample(lines: usize) -> String {
+            let mut out = String::with_capacity(lines * 24);
+            for index in 0..lines {
+                out.push_str(&format!("词条{index}\tdm{index}\t{index}\n"));
+            }
+            out
+        }
+
+        for lines in [10_000usize, 100_000, 500_000] {
+            let text = sample(lines);
+            let kib = text.len() as f64 / 1024.0;
+
+            let started = std::time::Instant::now();
+            let merged =
+                merge_text_for_path("custom_phrase.txt", MergeMode::KeyUnion, &text, &text)
+                    .expect("并集型必须返回结果");
+            let merge_elapsed = started.elapsed();
+
+            // 一轮里还要给本地源文件与 Others/ 各算一次 sha256 做变化判定。
+            let started = std::time::Instant::now();
+            let _ = crate::hash::sha256_hex(text.as_bytes());
+            let hash_elapsed = started.elapsed();
+
+            assert_eq!(merged.lines().count(), lines);
+            println!(
+                "{lines:>7} 行 / {kib:>8.1} KiB：并集 {merge_elapsed:>10.2?}，\
+                 单次 sha256 {hash_elapsed:>10.2?}"
+            );
+        }
+    }
+
     #[test]
     fn dictionary_rows_follow_the_retained_header_when_column_order_differs() {
         let local = "---\nname: words\ncolumns: [text, code, weight]\n...\n甲\tjia\t10\n";

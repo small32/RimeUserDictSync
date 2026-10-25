@@ -19,6 +19,10 @@
 #import <Cocoa/Cocoa.h>
 #include <signal.h>
 
+/// 主程序的 bundle id。必须与被嵌套的主 .app 一致，
+/// 助手才能沿路径上溯找到它（早先放错位置导致"双击主程序没反应"）。
+static NSString *const kMainBundleID = @"com.small32.rime-user-dict-sync";
+
 @interface MenuBarAgent : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSTimer *pollTimer;
@@ -29,6 +33,14 @@
 @property(nonatomic, copy) NSString *appDir;
 @property(nonatomic) BOOL syncing;
 @property(nonatomic, strong) NSTask *activeTask;
+@end
+
+@interface MenuBarAgent (Private)
+/// 所属主 `.app` 的绝对路径，找不到返回 nil。
+- (NSString *)mainAppBundlePath;
+/// 启动一个独立的主程序进程去卸载定时搬运的 LaunchAgent（不等它结束）。
+- (void)startAgentUninstall;
+- (void)menuQuitAll;
 @end
 
 @implementation MenuBarAgent
@@ -142,18 +154,30 @@
   [menu addItem:sync];
   [menu addItem:[NSMenuItem separatorItem]];
 
-  NSMenuItem *open = [[NSMenuItem alloc] initWithTitle:@"打开 RimeUserDictSync"
+  NSMenuItem *open = [[NSMenuItem alloc] initWithTitle:@"打开 App"
                                                 action:@selector(menuOpenApp)
                                          keyEquivalent:@""];
   open.target = self;
   [menu addItem:open];
   [menu addItem:[NSMenuItem separatorItem]];
 
-  NSMenuItem *hide = [[NSMenuItem alloc] initWithTitle:@"隐藏图标（下次登录恢复）"
+  // 「隐藏图标」只终止助手自己：后台搬运照旧，图标下次登录会自己回来。
+  // 不想等下次登录的话，重新运行主程序即可——它在启动时会把这个 job kickstart 起来。
+  NSMenuItem *hide = [[NSMenuItem alloc] initWithTitle:@"隐藏图标"
                                                 action:@selector(menuQuit)
                                          keyEquivalent:@""];
   hide.target = self;
   [menu addItem:hide];
+  [menu addItem:[NSMenuItem separatorItem]];
+
+  // 「退出」放最下面，与「隐藏图标」区分开：
+  // 隐藏只是摘掉本进程的图标（后台搬运照旧）；
+  // 退出要把定时搬运的 LaunchAgent 一并卸载，并且不再恢复。
+  NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"退出"
+                                                action:@selector(menuQuitAll)
+                                         keyEquivalent:@"q"];
+  quit.target = self;
+  [menu addItem:quit];
 
   self.statusItem.menu = menu;
   [self.statusItem.button performClick:nil];
@@ -165,20 +189,67 @@
 }
 
 - (void)menuOpenApp {
-  NSURL *url = [NSURL fileURLWithPath:NSProcessInfo.processInfo.arguments[0]];
-  url = [url URLByResolvingSymlinksInPath];
+  NSString *app = [self mainAppBundlePath];
+  if (app == nil) {
+    [self showError:@"找不到菜单栏助手所属的主应用，请重新安装完整的 RimeUserDictSync.app。"];
+    return;
+  }
+  NSURL *url = [NSURL fileURLWithPath:app];
+  if (![[NSWorkspace sharedWorkspace] openURL:url]) {
+    [self showError:[NSString stringWithFormat:@"打开主程序失败：\n%@", url.path]];
+  }
+}
+
+/// 本助手嵌套在 `RimeUserDictSync.app/Contents/Resources/RimeMenuBar.app`，
+/// 从自己的路径逐级上溯，找到 bundle id 为主程序的那个 `.app`。
+- (NSString *)mainAppBundlePath {
+  NSURL *url = [[NSURL fileURLWithPath:NSProcessInfo.processInfo.arguments[0]]
+      URLByResolvingSymlinksInPath];
   while (url.path.length > 1) {
     if ([url.pathExtension isEqualToString:@"app"] &&
         [[[NSBundle bundleWithURL:url] bundleIdentifier]
-            isEqualToString:@"com.small32.rime-user-dict-sync"]) {
-      if (![[NSWorkspace sharedWorkspace] openURL:url]) {
-        [self showError:[NSString stringWithFormat:@"打开主程序失败：\n%@", url.path]];
-      }
-      return;
+            isEqualToString:kMainBundleID]) {
+      return url.path;
     }
     url = [url URLByDeletingLastPathComponent];
   }
-  [self showError:@"找不到菜单栏助手所属的主应用，请重新安装完整的 RimeUserDictSync.app。"];
+  return nil;
+}
+
+/// 让主程序卸载定时搬运的 LaunchAgent。
+///
+/// **不等待它结束**：主程序收尾时会 `bootout` 掉本进程所属的 `...menubar`
+/// job，那时本进程会收到 SIGTERM 并走 `applicationWillTerminate`。
+/// 若在这里 `waitUntilExit`，就会卡在"等一个正在杀自己的任务"上。
+- (void)startAgentUninstall {
+  NSString *app = [self mainAppBundlePath];
+  if (app == nil) {
+    return;
+  }
+  NSTask *task = [[NSTask alloc] init];
+  task.executableURL = [NSURL
+      fileURLWithPath:[app stringByAppendingPathComponent:@"Contents/MacOS/RimeUserDictSync"]];
+  // 带 --notify：卸载结果由主程序弹系统通知，本进程马上就退出了，等不到结果。
+  task.arguments = @[ @"--quit-all", @"--notify", @"--app-dir", self.appDir ];
+  task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+  task.standardError = [NSFileHandle fileHandleWithNullDevice];
+  [task launchAndReturnError:NULL];
+}
+
+/// 右键菜单的「退出」：连后台搬运一起停掉，且下次登录不再恢复。
+///
+/// 顺序很关键：**先**让主程序把 `...agent`（定时搬运）卸载掉，再退出自己。
+/// 如果反过来，本进程所属的 `...menubar` job 被 bootout 时会立刻收到
+/// SIGTERM，卸载 agent 的代码就再也执行不到了。
+- (void)menuQuitAll {
+  [self startAgentUninstall];
+  // 先摘图标再退出：万一上面启动的主程序要把本 job bootout 掉，
+  // 那时本进程收到 SIGTERM，图标已经不在了，不会留下"幽灵图标"。
+  if (self.statusItem != nil) {
+    [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem];
+    self.statusItem = nil;
+  }
+  [NSApp terminate:nil];
 }
 
 - (void)menuQuit {

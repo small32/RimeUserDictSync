@@ -184,6 +184,26 @@ pub fn uninstall() -> Result<String> {
     Ok("已关闭 Rime词库同步：后台搬运与菜单栏图标均已移除。".to_owned())
 }
 
+/// 主程序启动（或重新打开界面）时把菜单栏助手拉起来。
+///
+/// 为什么需要它：「隐藏图标」只让助手正常退出，plist 还在，但 launchd
+/// **不会**再自动拉它 —— `KeepAlive = { SuccessfulExit: false }` 的语义是
+/// 「只在非正常退出时重启」，正常退出就让它安静地躺着。所以重新运行 App
+/// 时必须显式 `kickstart`，否则用户会发现图标没了，而且无从找回
+/// （除了注销重登或者重新点一次后台开关）。
+pub fn ensure_menubar_running() {
+    // 没装、被用户在「登录与扩展」里关掉、或者已经在跑 —— 都不用管。
+    if !menubar_installed() || is_disabled(MENUBAR_LABEL) || job_running(MENUBAR_LABEL) {
+        return;
+    }
+    let Ok(uid) = uid() else {
+        return;
+    };
+    let service = format!("gui/{uid}/{MENUBAR_LABEL}");
+    // 不带 -k：job 若在跑就原样保留，避免把图标闪一下重启。
+    let _ = launchctl(&["kickstart", &service]);
+}
+
 /// 改间隔：只影响定时搬运的 plist，内容没变就不重新加载。
 pub fn refresh_interval(app_dir: &Path, minutes: u32) -> Result<bool> {
     if !installed() {

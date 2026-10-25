@@ -106,31 +106,47 @@ fn yes_no(value: bool) -> &'static str {
 
 pub struct WebDav {
     root: Url,
+    /// 控制类请求（PROPFIND / DELETE / MOVE / 心跳）：应当快速失败。
     client: Client,
+    /// 传输类请求（GET / PUT 词库正文）：慢速网络上需要更长的时间窗口。
+    transfer_client: Client,
     collection_client: Client,
     username: String,
     password: String,
 }
 
+/// 建连阶段的超时。正常网络几秒内就能连上，30 秒只会让「网络不通」表现成
+/// 「程序卡住」，缩短后错误能立刻显现。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 控制类请求的整包超时。这类请求只有几 KB，慢就是真的不通。
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 传输类请求的整包超时。
+///
+/// 单个大词库文件在慢速网络上确实可能超过 90 秒，所以比控制类长得多；
+/// 但原先的 600 秒与最小轮次间隔（1 分钟）严重不匹配——一个请求就能
+/// 挂满一整轮，期间一直占着本地锁，GUI 的手动同步会被堵住。
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl WebDav {
     pub fn new(url: &str, username: &str, password: &str) -> Result<Self> {
         let root =
             Url::parse(&format!("{}/", url.trim_end_matches('/'))).context("WebDAV 地址无效")?;
-        let build_client = || {
+        let build_client = |timeout: Duration| {
             Client::builder()
-                .connect_timeout(Duration::from_secs(30))
-                // 单个大词库文件在慢速网络上可能远超 90 秒。
-                .timeout(Duration::from_secs(600))
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(timeout)
                 .user_agent(concat!("RimeUserDictSync/", env!("CARGO_PKG_VERSION")))
         };
-        let client = build_client().build()?;
+        let client = build_client(CONTROL_TIMEOUT).build()?;
+        let transfer_client = build_client(TRANSFER_TIMEOUT).build()?;
         // MKCOL 重定向不代表创建成功，也不能跟随到另一个目录执行创建。
-        let collection_client = build_client()
+        let collection_client = build_client(CONTROL_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             root,
             client,
+            transfer_client,
             collection_client,
             username: username.trim().to_owned(),
             password: password.to_owned(),
@@ -140,8 +156,14 @@ impl WebDav {
     fn request(&self, method: &str, url: Url) -> Result<RequestBuilder> {
         let method = Method::from_bytes(method.as_bytes())
             .with_context(|| format!("非法 HTTP 方法 {method}"))?;
-        Ok(self
-            .client
+        // GET / PUT 搬的是词库正文，走单独的超时；其余（PROPFIND / MKCOL /
+        // DELETE / MOVE）都是小请求，用短超时快速暴露网络问题。
+        let client = if method == Method::GET || method == Method::PUT {
+            &self.transfer_client
+        } else {
+            &self.client
+        };
+        Ok(client
             .request(method, url)
             .basic_auth(&self.username, Some(&self.password)))
     }

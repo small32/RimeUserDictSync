@@ -104,7 +104,7 @@ pub fn install(app_dir: &Path, minutes: u32) -> Result<String> {
     write_atomic(&service, &service_unit(&exe, app_dir))?;
     write_atomic(&timer, &timer_unit(minutes))?;
 
-    systemctl(&["daemon-reload"])?;
+    systemctl_checked(&["daemon-reload"])?;
     // `--now` 立刻启动；重复执行等于原地更新，不会报错。
     let output = systemctl(&["enable", "--now", TIMER_NAME])?;
     if !output.status.success() {
@@ -133,14 +133,30 @@ pub fn uninstall() -> Result<String> {
         return Ok(format!("没有开启 {UNIT_TITLE}，无需关闭。"));
     }
     // 先停再删：disable 会顺带移除 timers.target 里的符号链接。
-    let _ = systemctl(&["disable", "--now", TIMER_NAME]);
-    let _ = systemctl(&["stop", SERVICE_NAME]);
+    // 失败不能静默：文件删掉、`installed()` 变 false、界面显示「已移除」，
+    // 但已载入内存的 timer 仍在跑，ExecStart 指向的二进制也还在。
+    let mut problems: Vec<String> = Vec::new();
+    for arguments in [
+        &["disable", "--now", TIMER_NAME][..],
+        &["stop", SERVICE_NAME][..],
+    ] {
+        if let Err(error) = systemctl_checked(arguments) {
+            problems.push(error.to_string());
+        }
+    }
     for path in [&timer, &service] {
         if path.is_file() {
             fs::remove_file(path).with_context(|| format!("删除 {} 失败", path.display()))?;
         }
     }
     let _ = systemctl(&["daemon-reload"]);
+    if !problems.is_empty() {
+        bail!(
+            "单元文件已删除，但 systemd 仍在运行旧任务（{}）。\n\
+             请在图形会话的终端里执行：systemctl --user disable --now {TIMER_NAME}",
+            problems.join("；")
+        );
+    }
     Ok(format!(
         "已关闭 {UNIT_TITLE}：后台搬运的 timer 与 service 均已移除。"
     ))
@@ -162,9 +178,11 @@ pub fn refresh_interval(minutes: u32) -> Result<bool> {
         return Ok(false);
     }
     write_atomic(&path, &text)?;
-    systemctl(&["daemon-reload"])?;
+    systemctl_checked(&["daemon-reload"])?;
     // 只重启 timer 本身，不会打断正在跑的那一轮搬运。
-    let _ = systemctl(&["restart", TIMER_NAME]);
+    // 重启会让 systemd 重算到期时间（`OnStartupSec` 已过期则立刻补跑一轮），
+    // 所以改完间隔可能马上看到一轮搬运，属正常现象。
+    systemctl_checked(&["restart", TIMER_NAME])?;
     Ok(true)
 }
 
@@ -249,11 +267,34 @@ fn systemctl(arguments: &[&str]) -> Result<Output> {
         .context("调用 systemctl 失败（系统里没有 systemd？）")
 }
 
+/// 与 [`systemctl`] 相同，但把**非零退出码**也当成失败。
+///
+/// `Command::output()` 只反映「有没有把 systemctl 跑起来」；unit 不存在、
+/// D-Bus 不可达这类错误都体现在退出码里，光看 `?` 会把它们当成成功。
+fn systemctl_checked(arguments: &[&str]) -> Result<()> {
+    let output = systemctl(arguments)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    bail!(
+        "`systemctl --user {}` 失败：{}",
+        arguments.join(" "),
+        if detail.is_empty() {
+            format!("退出码 {:?}", output.status.code())
+        } else {
+            detail
+        }
+    )
+}
+
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, contents).with_context(|| format!("写入 {} 失败", temp.display()))?;
-    fs::rename(&temp, path).with_context(|| format!("替换 {} 失败", path.display()))?;
-    Ok(())
+    // 用全局唯一的临时名：`with_extension("tmp")` 会让 `.service` 与 `.timer`
+    // 共用同一个 `rime-user-dict-sync.tmp`，并发写时可能把 service 的内容
+    // rename 成 timer，timer 从此永久加载失败。
+    crate::hash::write_atomic(path, contents)
 }
 
 fn interval_minutes(minutes: u32) -> u32 {
@@ -301,8 +342,12 @@ fn timer_unit(minutes: u32) -> String {
          Documentation=https://github.com/small32/RimeUserDictSync\n\
          \n\
          [Timer]\n\
-         # 登录后先等 2 分钟，别和桌面启动抢资源；之后每轮跑完再计一个间隔。\n\
-         OnBootSec=2min\n\
+         # `OnStartupSec` 是「本 user manager 启动后」——恰好在登录时；不能用\n\
+         # `OnBootSec`（那是相对**机器**启动，登录时早已过去，systemd 会立刻\n\
+         # 触发一次，反而和桌面启动抢资源）。\n\
+         OnStartupSec=2min\n\
+         # 从「上一次被激活」起算，不是「跑完」起算；单轮超过间隔时 systemd\n\
+         # 会跳过重叠触发，实际周期会被拉长，这是可接受的。\n\
          OnUnitActiveSec={minutes}min\n\
          AccuracySec=30s\n\
          Unit={SERVICE_NAME}\n\
@@ -343,7 +388,8 @@ fn unquote_first(value: &str) -> Option<String> {
     if let Some(rest) = value.strip_prefix('"') {
         let mut out = String::new();
         let mut escaped = false;
-        for character in rest.chars() {
+        let mut chars = rest.chars().peekable();
+        while let Some(character) = chars.next() {
             if escaped {
                 out.push(character);
                 escaped = false;
@@ -351,6 +397,13 @@ fn unquote_first(value: &str) -> Option<String> {
                 escaped = true;
             } else if character == '"' {
                 return Some(out);
+            } else if character == '%' && chars.peek() == Some(&'%') {
+                // `exec_quote` 把字面 `%` 写成 `%%`（systemd 的说明符前缀）；
+                // 读回必须还原，否则路径里带 `%` 时这里会拿到 `100%%`，
+                // 与 `current_exe()` 永不相等 → 每次启动都重写单元，
+                // 且 `--app-dir` 会一路翻倍成 `%%%%`。
+                chars.next();
+                out.push('%');
             } else {
                 out.push(character);
             }
@@ -384,7 +437,15 @@ mod tests {
     fn timer_repeats_after_each_run_and_is_installable() {
         let unit = timer_unit(10);
         assert!(unit.contains("OnUnitActiveSec=10min"));
-        assert!(unit.contains("OnBootSec=2min"));
+        // 必须是 OnStartupSec（相对 user manager 启动 = 登录时）；
+        // OnBootSec 相对机器启动，登录时早已过去，会立刻触发一轮。
+        assert!(unit.contains("OnStartupSec=2min"));
+        assert!(
+            !unit
+                .lines()
+                .any(|line| line.trim_start().starts_with("OnBootSec")),
+            "不能留下 OnBootSec 指令（注释里提到不算）"
+        );
         assert!(unit.contains("Unit=rime-user-dict-sync.service"));
         assert!(unit.contains("WantedBy=timers.target"));
     }
@@ -424,5 +485,29 @@ mod tests {
             recorded_app_dir(&unit).as_deref(),
             Some("/home/me/Rime Config")
         );
+    }
+
+    /// 路径里带 `%` 时必须**原样读回**：否则 `heal_after_update` 会认为程序
+    /// 换了位置，每次启动都重写单元，并把 `--app-dir` 一路翻倍成 `%%%%`。
+    #[test]
+    fn percent_paths_round_trip_without_doubling() {
+        let program = Path::new("/opt/100% 完整版/RimeUserDictSync");
+        let app_dir = Path::new("/home/me/词库 100%备份");
+        let unit = service_unit(program, app_dir);
+        assert_eq!(
+            exec_program(&unit).as_deref(),
+            Some("/opt/100% 完整版/RimeUserDictSync")
+        );
+        assert_eq!(
+            recorded_app_dir(&unit).as_deref(),
+            Some("/home/me/词库 100%备份")
+        );
+
+        // 用读回的值再生成一次，必须字节级等价（幂等）。
+        let again = service_unit(
+            Path::new(&exec_program(&unit).unwrap()),
+            Path::new(&recorded_app_dir(&unit).unwrap()),
+        );
+        assert_eq!(again, unit);
     }
 }
