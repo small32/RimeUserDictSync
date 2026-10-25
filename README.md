@@ -692,7 +692,7 @@ Linux 输出 `target/release/RimeUserDictSync`（编译需要 GTK3 / XKB 的头�
 | 平台 | 产物 |
 | --- | --- |
 | Windows x64 | `RimeUserDictSync-v0.5.1-Windows-x64.exe` |
-| macOS | `RimeUserDictSync-v0.5.1-macOS-*.zip`（ARM64 / Intel / Universal 2） |
+| macOS | `RimeUserDictSync-v0.5.1-macOS-*.zip`（ARM64 / Intel） |
 | Linux x86_64 | `RimeUserDictSync-v0.5.1-Linux-x86_64`（单文件，`chmod +x` 后直接运行） |
 
 Linux 构建机额外装 `libgtk-3-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`，
