@@ -215,6 +215,19 @@ jobs:
             | xargs -0 sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # RELEASE_NOTES.md 是累计式的（新版本段落加在最上面）。Release 正文只取
+      # 顶部这一段，否则页面上会连带列出 v0.5.1、v0.5.0 等所有历史版本。
+      # 写法约定（四毛定的）：顶部一句「建议所有用户更新」+ 重要修复 / 新增 /
+      # 升级注意三段；BUG 修复不逐条列，一笔「修复了一些BUG」带过。
+      - name: Keep only this version's notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk 'NR > 1 && /^# v/ { exit } { print }' RELEASE_NOTES.md > release-notes.md
+          test -s release-notes.md
+          grep -q '^# v' release-notes.md
+          echo "取到 $(wc -l < release-notes.md) 行：" && head -n 1 release-notes.md
+
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -227,7 +240,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "RimeUserDictSync $RELEASE_TAG" \
-              --notes-file RELEASE_NOTES.md
+              --notes-file release-notes.md
           fi
           gh release upload "$RELEASE_TAG" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
