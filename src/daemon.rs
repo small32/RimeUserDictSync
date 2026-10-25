@@ -8,9 +8,6 @@
 
 use crate::{config::Settings, context::Context, paths, report::Reporter};
 use anyhow::{Context as _, Result};
-// 只有 Windows 分支（-D warnings 下 macOS 用到反而会是未使用导入）。
-#[cfg(target_os = "windows")]
-use anyhow::bail;
 use std::{
     fs,
     io::Write,
@@ -148,16 +145,7 @@ pub fn rime_sync(
 /// 顺带把 ini 的 `[background] enabled` 写回 false，否则 GUI 重启后会显示
 /// 「已开启」，而 launchd / systemd 里其实什么都没有。
 pub fn quit_all(ini: &Path) -> Result<String> {
-    #[cfg(target_os = "macos")]
-    let stopped = crate::agent::uninstall();
-    #[cfg(target_os = "linux")]
-    let stopped = crate::service_linux::uninstall();
-    // Windows 没有菜单栏助手（也不该由它触发）：退出界面用窗口的关闭按钮。
-    #[cfg(target_os = "windows")]
-    let stopped: Result<String> =
-        bail!("Windows 没有菜单栏助手；要停止后台搬运请在界面里点「停止后台服务」。");
-
-    let mut message = stopped?;
+    let mut message = stop_background()?;
     if let Ok(mut settings) = Settings::load(ini) {
         settings.background_enabled = false;
         if let Err(error) = settings.save(ini) {
@@ -165,6 +153,29 @@ pub fn quit_all(ini: &Path) -> Result<String> {
         }
     }
     Ok(message)
+}
+
+/// 停掉本平台的定时搬运任务，返回给界面显示的结果文案。
+///
+/// 三个平台各自实现而不是在 [`quit_all`] 里用 `cfg` 分支：Windows 分支只能
+/// 直接返回错误，写成同一条控制流会让后面的「回写配置」变成不可达代码
+/// （`-D warnings` 下 `unreachable_code` + `diverging_sub_expression` 直接报错）。
+#[cfg(target_os = "macos")]
+fn stop_background() -> Result<String> {
+    crate::agent::uninstall()
+}
+
+#[cfg(target_os = "linux")]
+fn stop_background() -> Result<String> {
+    crate::service_linux::uninstall()
+}
+
+/// Windows 没有菜单栏助手（也不该由它触发）：退出界面用窗口的关闭按钮。
+#[cfg(target_os = "windows")]
+fn stop_background() -> Result<String> {
+    Err(anyhow::anyhow!(
+        "Windows 没有菜单栏助手；要停止后台搬运请在界面里点「停止后台服务」。"
+    ))
 }
 
 /// 写日志文件的 [`Reporter`]：无界面模式（服务）使用，日志与 GUI 共用同一个 `RimeSync.log`。
