@@ -41,7 +41,30 @@ fn same_sync_path(left: &str, right: &str) -> bool {
 
 impl SyncList {
     pub fn load(path: &Path) -> Result<Self> {
-        load_json(path)
+        Self::load_with_notices(path).map(|(list, _)| list)
+    }
+
+    /// 旧版允许登记私有状态与活跃 userdb；读取时跳过这些项，不能让它们写回源文件。
+    /// 返回提示供 Context 在保存清理后的清单时展示，保留其余正常同步项。
+    pub fn load_with_notices(path: &Path) -> Result<(Self, Vec<String>)> {
+        let mut list: Self = load_json(path)?;
+        let mut notices = Vec::new();
+        list.files.retain_mut(
+            |file| match crate::paths::validate_sync_file_path(&file.path) {
+                Ok(relative) => {
+                    file.path = relative;
+                    true
+                }
+                Err(error) => {
+                    notices.push(format!(
+                        "已移除不允许的同步项 {}：{error}；本地文件未删除。",
+                        file.path
+                    ));
+                    false
+                }
+            },
+        );
+        Ok((list, notices))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -307,6 +330,34 @@ mod tests {
         list.register("my_words.dict.yaml");
         list.save(&path).unwrap();
         assert_eq!(SyncList::load(&path).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn old_lists_skip_unsafe_entries_without_losing_normal_files_or_blocking_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-list.json");
+        let text = r#"{"files":[{"path":".rime-sync/device.json"},{"path":"words.userdb/CURRENT"},{"path":"words.userdb.txt"},{"path":"user.yaml"},{"path":"cn_dicts/mine.dict.yaml"},{"path":"opencc/custom.txt"},{"path":"lua/custom.lua"}],"excluded":["disabled.yaml"]}"#;
+        fs::write(&path, text).unwrap();
+        let (list, notices) = SyncList::load_with_notices(&path).unwrap();
+        assert_eq!(
+            list.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "cn_dicts/mine.dict.yaml",
+                "opencc/custom.txt",
+                "lua/custom.lua"
+            ]
+        );
+        assert_eq!(notices.len(), 4);
+        assert_eq!(list.excluded, ["disabled.yaml"]);
+        assert_eq!(SyncList::load(&path).unwrap().files, list.files);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            text,
+            "普通读取不应修改原清单"
+        );
     }
 
     #[test]

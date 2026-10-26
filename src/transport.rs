@@ -12,6 +12,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -167,6 +168,15 @@ fn check(cancel: &AtomicBool) -> Result<()> {
 fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) -> Result<usize> {
     let list = context.load_list()?;
     let entries = context.dav.list_tree(OTHERS_DIR_NAME)?;
+    // 只在完整成功的列表后失效旧观测；远端已缺失的文件必须允许重新创建。
+    let present: BTreeSet<&str> = entries
+        .iter()
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| strip_dir(&entry.relative, OTHERS_DIR_NAME))
+        .collect();
+    index
+        .remote
+        .retain(|relative, _| present.contains(relative.as_str()));
     let mut downloaded = 0;
     for entry in entries.iter().filter(|entry| !entry.is_dir) {
         let Some(relative) = strip_dir(&entry.relative, OTHERS_DIR_NAME) else {
@@ -192,7 +202,7 @@ fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) 
         if mark_matches_entry(&mark, entry) && target.is_file() {
             continue;
         }
-        context.dav.get(&entry.relative, &target, entry.modified)?;
+        let downloaded_entry = context.dav.get(&entry.relative, &target, entry.modified)?;
         let local_hash = hash::sha256_file(&target)?;
         if mark.sha256.as_deref() == Some(local_hash.as_str()) {
             // 只有元数据变化，内容其实一样。
@@ -204,9 +214,9 @@ fn pull_others(context: &Context, index: &mut SyncIndex, report: &dyn Reporter) 
         index.remote.insert(
             relative.to_owned(),
             RemoteMark {
-                etag: entry.etag.clone(),
-                size: entry.length,
-                mtime: entry.modified_secs(),
+                etag: downloaded_entry.etag.clone(),
+                size: downloaded_entry.length,
+                mtime: downloaded_entry.modified_secs(),
                 sha256: Some(local_hash),
             },
         );
@@ -266,6 +276,7 @@ pub fn push_others(
             &remote_relative,
             &path,
             mark.etag.as_deref(),
+            mark.sha256.as_deref(),
             report,
         )? {
             UploadOutcome::Uploaded { etag, sha256 } => {
@@ -314,6 +325,7 @@ fn upload(
     remote_relative: &str,
     local: &Path,
     seen_etag: Option<&str>,
+    seen_sha256: Option<&str>,
     report: &dyn Reporter,
 ) -> Result<UploadOutcome> {
     let dav = &context.dav;
@@ -323,9 +335,26 @@ fn upload(
     let sha256 = hash::sha256_hex(&bytes);
     let etag = match capabilities.tier() {
         UploadTier::Conditional => {
-            let result = match seen_etag {
+            let result = match seen_etag.filter(|etag| !etag.starts_with("W/")) {
                 Some(etag) => dav.put_bytes(remote_relative, bytes, Some(etag))?,
-                None => dav.put_bytes_if_absent(remote_relative, bytes)?,
+                None => match dav.try_get_bytes_with_etag(remote_relative)? {
+                    None => dav.put_bytes_if_absent(remote_relative, bytes)?,
+                    Some((current, etag)) => {
+                        let current_hash = hash::sha256_hex(&current);
+                        if current_hash == sha256 {
+                            return Ok(UploadOutcome::Uploaded { etag, sha256 });
+                        }
+                        if Some(current_hash.as_str()) != seen_sha256 {
+                            return Ok(UploadOutcome::PreconditionFailed);
+                        }
+                        let Some(etag) = etag.filter(|etag| !etag.starts_with("W/")) else {
+                            bail!(
+                                "{remote_relative} 已存在但没有可用的 ETag，未覆盖远端内容；请重新测试连接以更新服务端能力"
+                            );
+                        };
+                        dav.put_bytes(remote_relative, bytes, Some(&etag))?
+                    }
+                },
             };
             match result {
                 PutOutcome::PreconditionFailed => return Ok(UploadOutcome::PreconditionFailed),
@@ -334,8 +363,10 @@ fn upload(
         }
         UploadTier::EtagOnly => {
             // 上传前重取一次 ETag，与本轮开始时读到的不同就不传（§4.4 B 档）。
-            let current = dav.stat(remote_relative)?.and_then(|entry| entry.etag);
-            if current.as_deref() != seen_etag {
+            let current = dav.try_get_bytes_with_etag(remote_relative)?;
+            let current_etag = current.as_ref().and_then(|(_, etag)| etag.as_deref());
+            let current_hash = current.as_ref().map(|(bytes, _)| hash::sha256_hex(bytes));
+            if current_etag != seen_etag || current_hash.as_deref() != seen_sha256 {
                 return Ok(UploadOutcome::PreconditionFailed);
             }
             match dav.put_bytes(remote_relative, bytes, None)? {
@@ -628,7 +659,10 @@ fn download_snapshot(
 ) -> Result<()> {
     let temp = hash::temp_sibling(target);
     let modified = (entry.mtime > 0)
-        .then(|| std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime as u64));
+        .then_some(entry.mtime as u64)
+        .and_then(|seconds| {
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))
+        });
     let result = (|| -> Result<()> {
         dav.get(relative, &temp, modified)?;
         if hash::sha256_file(&temp)? != entry.sha256 {
@@ -656,13 +690,18 @@ pub fn push_own_snapshot(
     snapshot_index.installation_id = context.layout.installation_id.clone();
     // 远端清单只花一次 GET，就能判断本机全部快照是否需要上传（§10 风险 10）。
     let remote_relative_index = format!("{}/{SNAPSHOT_INDEX_FILE}", context.layout.installation_id);
-    let (remote_index, remote_index_etag): (SnapshotIndex, _) = match context
-        .dav
-        .try_get_bytes_with_etag(&remote_relative_index)?
-    {
-        Some((bytes, etag)) => (serde_json::from_slice(&bytes)?, etag),
-        None => (SnapshotIndex::default(), None),
-    };
+    let (remote_index, remote_index_etag, remote_index_sha256): (SnapshotIndex, _, _) =
+        match context
+            .dav
+            .try_get_bytes_with_etag(&remote_relative_index)?
+        {
+            Some((bytes, etag)) => (
+                serde_json::from_slice(&bytes)?,
+                etag,
+                Some(hash::sha256_hex(&bytes)),
+            ),
+            None => (SnapshotIndex::default(), None, None),
+        };
     restore_own_from_index(&context.dav, &context.layout, &remote_index, true)?;
     let mut uploaded = 0;
     let mut skipped: Vec<String> = Vec::new();
@@ -707,15 +746,15 @@ pub fn push_own_snapshot(
         check(cancel)?;
         // B 档要求「本轮开始时的 ETag」作基准；本机快照目录只有本机写，
         // 上传前先取一次即可，传 None 会被当成"远端不存在"而永远拒绝更新（§11 P0）。
-        let seen_etag = context
-            .dav
-            .stat(&remote_relative)?
-            .and_then(|entry| entry.etag);
+        let current = context.dav.try_get_bytes_with_etag(&remote_relative)?;
+        let seen_etag = current.as_ref().and_then(|(_, etag)| etag.as_deref());
+        let seen_sha256 = current.as_ref().map(|(bytes, _)| hash::sha256_hex(bytes));
         match upload(
             context,
             &remote_relative,
             &file_path,
-            seen_etag.as_deref(),
+            seen_etag,
+            seen_sha256.as_deref(),
             report,
         )? {
             UploadOutcome::Uploaded { sha256, .. } => {
@@ -741,22 +780,15 @@ pub fn push_own_snapshot(
     snapshot_index.generated_at = identity::now_stamp();
     snapshot_index.save(&path)?;
     // 清单本身最后上传，保证别人读到的清单一定有对应的文件。
-    let manifest = fs::read(&path)?;
-    let result = if context.device.capabilities.if_match {
-        match remote_index_etag.as_deref() {
-            Some(etag) => context
-                .dav
-                .put_bytes(&remote_relative_index, manifest, Some(etag))?,
-            None => context
-                .dav
-                .put_bytes_if_absent(&remote_relative_index, manifest)?,
-        }
-    } else {
-        context
-            .dav
-            .put_bytes(&remote_relative_index, manifest, None)?
-    };
-    if matches!(result, PutOutcome::PreconditionFailed) {
+    let result = upload(
+        context,
+        &remote_relative_index,
+        &path,
+        remote_index_etag.as_deref(),
+        remote_index_sha256.as_deref(),
+        report,
+    )?;
+    if matches!(result, UploadOutcome::PreconditionFailed) {
         bail!("本设备快照清单已被其他同步更新，本轮不再覆盖，下轮重新比对");
     }
 
@@ -896,6 +928,10 @@ mod tests {
         fail_move: bool,
         reject_manifest: bool,
         concurrent_write: bool,
+        omit_propfind_etag: bool,
+        omit_http_etag: bool,
+        reject_all_if_match: bool,
+        peer_listing_error: Option<(u16, bool)>,
     }
 
     fn memory_server(state: Arc<Mutex<MemoryDav>>) -> Server {
@@ -906,12 +942,18 @@ mod tests {
                 .get(&request.path)
                 .map(|bytes| format!("\"{}\"", hash::sha256_hex(bytes)));
             match request.method.as_str() {
-                "GET" => state
-                    .files
-                    .get(&request.path)
-                    .cloned()
-                    .map(Reply::versioned)
-                    .unwrap_or_else(|| Reply::new(404, Vec::new())),
+                "GET" => {
+                    let mut reply = state
+                        .files
+                        .get(&request.path)
+                        .cloned()
+                        .map(Reply::versioned)
+                        .unwrap_or_else(|| Reply::new(404, Vec::new()));
+                    if state.omit_http_etag {
+                        reply.etag = None;
+                    }
+                    reply
+                }
                 "PUT" => {
                     if request
                         .headers
@@ -923,6 +965,7 @@ mod tests {
                             .get("if-match")
                             .is_some_and(|value| Some(value) != etag.as_ref())
                         || state.reject_manifest && request.path.ends_with("/.index.json")
+                        || state.reject_all_if_match && request.headers.contains_key("if-match")
                     {
                         return Reply::new(412, Vec::new());
                     }
@@ -930,6 +973,9 @@ mod tests {
                         .files
                         .insert(request.path.clone(), request.body.clone());
                     let mut reply = Reply::versioned(request.body.clone());
+                    if state.omit_http_etag {
+                        reply.etag = None;
+                    }
                     reply.status = 201;
                     if state.concurrent_write && request.path == "/Others/a.custom.yaml" {
                         state
@@ -967,9 +1013,29 @@ mod tests {
                         } else if path != &request.path {
                             continue;
                         }
-                        xml.push_str(&format!("<d:response><d:href>{path}</d:href><d:propstat><d:prop><d:getetag>\"{}\"</d:getetag><d:getcontentlength>{}</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>", hash::sha256_hex(bytes), bytes.len()));
+                        let etag = if state.omit_propfind_etag {
+                            String::new()
+                        } else {
+                            format!("<d:getetag>\"{}\"</d:getetag>", hash::sha256_hex(bytes))
+                        };
+                        xml.push_str(&format!("<d:response><d:href>{path}</d:href><d:propstat><d:prop><d:resourcetype/>{etag}<d:getcontentlength>{}</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>", bytes.len()));
                     }
                     for dir in dirs {
+                        if dir == "/pc02/"
+                            && let Some((status, propstat)) = state.peer_listing_error
+                        {
+                            let detail = if propstat {
+                                format!(
+                                    "<d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 {status} Failed</d:status></d:propstat>"
+                                )
+                            } else {
+                                format!("<d:status>HTTP/1.1 {status} Failed</d:status>")
+                            };
+                            xml.push_str(&format!(
+                                "<d:response><d:href>{dir}</d:href>{detail}</d:response>"
+                            ));
+                            continue;
+                        }
                         xml.push_str(&format!("<d:response><d:href>{dir}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
                     }
                     xml.push_str("</d:multistatus>");
@@ -1017,6 +1083,302 @@ mod tests {
         assert_eq!(strip_dir("Others/a.txt", "Others"), Some("a.txt"));
         assert_eq!(strip_dir("Others/cn/b.yaml", "Others"), Some("cn/b.yaml"));
         assert_eq!(strip_dir("Other/a.txt", "Others"), None);
+    }
+
+    #[test]
+    fn get_etag_without_propfind_etag_updates_existing_files_across_rounds() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/a.custom.yaml".into(), b"base".to_vec())]),
+            omit_propfind_etag: true,
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities = context.dav.probe_capabilities();
+        assert!(context.device.capabilities.if_match);
+        assert_eq!(context.device.capabilities.tier(), UploadTier::Conditional);
+        let mut index = SyncIndex::default();
+        for body in [b"first edit".as_slice(), b"second edit".as_slice()] {
+            pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+            assert!(index.remote["a.custom.yaml"].etag.is_some());
+            fs::write(context.layout.others.join("a.custom.yaml"), body).unwrap();
+            assert_eq!(
+                push_others(
+                    &context,
+                    &mut index,
+                    &AtomicBool::new(false),
+                    &crate::report::NullReporter
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(state.lock().unwrap().files["/Others/a.custom.yaml"], body);
+        }
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "PUT" && request.path == "/Others/a.custom.yaml")
+                .all(|request| request.headers.contains_key("if-match"))
+        );
+    }
+
+    #[test]
+    fn conditional_update_recovers_missing_etag_but_preserves_a_newer_remote_writer() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/a.custom.yaml".into(), b"base".to_vec())]),
+            omit_propfind_etag: true,
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities.if_match = true;
+        context.device.capabilities.etag = true;
+        let path = context.layout.others.join("a.custom.yaml");
+        fs::write(&path, b"first edit").unwrap();
+        let mut index = SyncIndex::default();
+        index.remote.insert(
+            "a.custom.yaml".into(),
+            RemoteMark {
+                sha256: Some(hash::sha256_hex(b"base")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            push_others(
+                &context,
+                &mut index,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .unwrap(),
+            1
+        );
+        index.remote.get_mut("a.custom.yaml").unwrap().etag = None;
+        state
+            .lock()
+            .unwrap()
+            .files
+            .insert("/Others/a.custom.yaml".into(), b"other writer".to_vec());
+        fs::write(&path, b"second edit").unwrap();
+        assert_eq!(
+            push_others(
+                &context,
+                &mut index,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            state.lock().unwrap().files["/Others/a.custom.yaml"],
+            b"other writer"
+        );
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn etag_only_updates_use_get_versions_and_preserve_concurrent_writes() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/a.custom.yaml".into(), b"base".to_vec())]),
+            omit_propfind_etag: true,
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities.etag = true;
+        let mut index = SyncIndex::default();
+        pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+        let path = context.layout.others.join("a.custom.yaml");
+        fs::write(&path, b"first edit").unwrap();
+        assert_eq!(
+            push_others(
+                &context,
+                &mut index,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            state.lock().unwrap().files["/Others/a.custom.yaml"],
+            b"first edit"
+        );
+        pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+        fs::write(&path, b"second edit").unwrap();
+        state
+            .lock()
+            .unwrap()
+            .files
+            .insert("/Others/a.custom.yaml".into(), b"other writer".to_vec());
+        assert_eq!(
+            push_others(
+                &context,
+                &mut index,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            state.lock().unwrap().files["/Others/a.custom.yaml"],
+            b"other writer"
+        );
+    }
+
+    #[test]
+    fn servers_without_etags_stay_in_fallback_and_update_existing_files() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/a.custom.yaml".into(), b"base".to_vec())]),
+            omit_propfind_etag: true,
+            omit_http_etag: true,
+            reject_all_if_match: true,
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities = context.dav.probe_capabilities();
+        assert!(!context.device.capabilities.etag);
+        assert!(!context.device.capabilities.if_match);
+        assert_eq!(context.device.capabilities.tier(), UploadTier::MetadataOnly);
+        // 升级前可能已缓存错误的 if_match=true；没有 ETag 时仍必须走 C 档。
+        context.device.capabilities.if_match = true;
+        assert_eq!(context.device.capabilities.tier(), UploadTier::MetadataOnly);
+        let mut index = SyncIndex::default();
+        for body in [b"first edit".as_slice(), b"second edit".as_slice()] {
+            pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+            fs::write(context.layout.others.join("a.custom.yaml"), body).unwrap();
+            assert_eq!(
+                push_others(
+                    &context,
+                    &mut index,
+                    &AtomicBool::new(false),
+                    &crate::report::NullReporter
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(state.lock().unwrap().files["/Others/a.custom.yaml"], body);
+            push_own_snapshot(
+                &context,
+                &AtomicBool::new(false),
+                &crate::report::NullReporter,
+            )
+            .unwrap();
+        }
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .files
+                .contains_key("/pc01/.index.json")
+        );
+    }
+
+    #[test]
+    fn missing_remote_files_invalidate_old_hashes_and_are_recreated() {
+        let state = Arc::new(Mutex::new(MemoryDav {
+            files: BTreeMap::from([("/Others/a.custom.yaml".into(), b"base".to_vec())]),
+            ..Default::default()
+        }));
+        let server = memory_server(state.clone());
+        let (_dir, mut context) = test_context(&server.url);
+        context.device.capabilities.if_match = true;
+        context.device.capabilities.etag = true;
+        let mut index = SyncIndex::default();
+        pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+        for _ in 0..2 {
+            state.lock().unwrap().files.remove("/Others/a.custom.yaml");
+            pull_others(&context, &mut index, &crate::report::NullReporter).unwrap();
+            assert!(!index.remote.contains_key("a.custom.yaml"));
+            assert_eq!(
+                push_others(
+                    &context,
+                    &mut index,
+                    &AtomicBool::new(false),
+                    &crate::report::NullReporter
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                state.lock().unwrap().files["/Others/a.custom.yaml"],
+                b"base"
+            );
+        }
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .all(|request| request
+                    .headers
+                    .get("if-none-match")
+                    .is_some_and(|value| value == "*"))
+        );
+    }
+
+    #[test]
+    fn failed_propfind_substatuses_preserve_existing_peer_snapshots() {
+        for error in [(403, true), (503, false), (404, true)] {
+            let state = Arc::new(Mutex::new(MemoryDav {
+                files: BTreeMap::from([(
+                    "/pc02/.index.json".into(),
+                    serde_json::to_vec(&SnapshotIndex::default()).unwrap(),
+                )]),
+                peer_listing_error: Some(error),
+                ..Default::default()
+            }));
+            let server = memory_server(state);
+            let (_dir, context) = test_context(&server.url);
+            let peer = context.layout.sync.join("pc02/words.userdb.txt");
+            fs::create_dir_all(peer.parent().unwrap()).unwrap();
+            fs::write(&peer, b"unmerged words").unwrap();
+            let mut index = SyncIndex::default();
+            index.snapshots.insert(
+                "pc02".into(),
+                BTreeMap::from([("words.userdb.txt".into(), "old hash".into())]),
+            );
+            assert!(pull_snapshots(&context, &mut index, &crate::report::NullReporter).is_err());
+            assert_eq!(fs::read(&peer).unwrap(), b"unmerged words");
+            assert!(index.snapshots.contains_key("pc02"));
+        }
+    }
+
+    #[test]
+    fn extreme_snapshot_mtime_does_not_panic_or_discard_valid_content() {
+        let state = remote_snapshot(b"valid words");
+        let server = memory_server(state);
+        let (_dir, context) = test_context(&server.url);
+        let target = context.layout.sync.join("pc02/words.userdb.txt");
+        download_snapshot(
+            &context.dav,
+            "pc01/words.userdb.txt",
+            &target,
+            &SnapshotEntry {
+                sha256: hash::sha256_hex(b"valid words"),
+                size: 11,
+                mtime: i64::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"valid words");
     }
 
     #[test]
@@ -1355,6 +1717,7 @@ mod tests {
         let server = memory_server(state.clone());
         let (_dir, mut context) = test_context(&server.url);
         context.device.capabilities.if_match = true;
+        context.device.capabilities.etag = true;
         fs::write(context.layout.device.join("words.userdb.txt"), b"new words").unwrap();
         assert!(
             push_own_snapshot(
@@ -1390,6 +1753,7 @@ mod tests {
         let server = memory_server(state);
         let (_dir, mut context) = test_context(&server.url);
         context.device.capabilities.if_match = true;
+        context.device.capabilities.etag = true;
         let other = context.layout.others.join("a.custom.yaml");
         fs::write(&other, b"local-v2").unwrap();
         let mut index = SyncIndex::default();
@@ -1584,6 +1948,11 @@ mod tests {
             &crate::report::NullReporter,
         )
         .unwrap();
+        assert_eq!(
+            state.lock().unwrap().files["/Others/custom_phrase.txt"],
+            base.as_bytes()
+        );
+        let request_start = server.requests.lock().unwrap().len();
 
         // 睡过 mtime 的秒级精度，确保「如果写了」一定能被观测到。
         std::thread::sleep(Duration::from_millis(1_100));
@@ -1616,6 +1985,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
+            .skip(request_start)
             .filter(|request| request.method == "PUT")
             .map(|request| request.path.clone())
             .filter(|path| !path.ends_with("/.index.json") && !path.contains("/.last-sync-"))

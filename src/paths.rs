@@ -204,7 +204,8 @@ pub fn validate_sync_file_path(value: &str) -> Result<String> {
     if trimmed.contains(';') {
         bail!("同步文件路径不能包含分号: {value}");
     }
-    let path = Path::new(trimmed);
+    // 保留末尾空格交给逐组件检查，不能在检查 Windows 别名前先 trim 掉。
+    let path = Path::new(normalized.trim_start());
     if path.is_absolute() {
         bail!("同步文件路径必须是相对于 RIME 用户目录的相对路径: {value}");
     }
@@ -220,9 +221,24 @@ pub fn validate_sync_file_path(value: &str) -> Result<String> {
                 if name.contains(':') {
                     bail!("同步文件路径不能包含冒号: {value}");
                 }
+                if name.ends_with('.') || name.ends_with(' ') {
+                    bail!("同步路径的分量末尾不能有点或空格: {value}");
+                }
+                if name.to_ascii_lowercase().ends_with(".userdb") {
+                    bail!("活跃 userdb 目录不能加入同步列表: {value}");
+                }
             }
             _ => bail!("同步文件路径不能包含 . 或 .. : {value}"),
         }
+    }
+    if is_reserved_sync_domain(trimmed) {
+        bail!("程序保留目录不能加入同步列表: {value}");
+    }
+    if is_forbidden_in_others(trimmed) {
+        bail!("userdb 快照由 RIME 自身同步，不能加入文件同步列表: {value}");
+    }
+    if is_private_in_others(trimmed) {
+        bail!("设备私有配置不能加入同步列表: {value}");
     }
     Ok(trimmed.to_owned())
 }
@@ -234,13 +250,36 @@ pub fn is_forbidden_in_others(relative: &str) -> bool {
         .ends_with(FORBIDDEN_OTHERS_SUFFIX)
 }
 
-/// `Others/` 里的「设备私有」文件：旧版迁移残留的 `installation.yaml`。
+/// 根目录的工具状态、构建产物，以及任意层的活跃 userdb 都不属于共享文件。
+fn is_reserved_sync_domain(relative: &str) -> bool {
+    let mut parts = relative
+        .split('/')
+        .map(|part| part.trim_end_matches(['.', ' ']))
+        .filter(|part| !part.is_empty());
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    [SYNC_DIR_NAME, META_DIR_NAME, "build"]
+        .iter()
+        .any(|reserved| first.eq_ignore_ascii_case(reserved))
+        || first.to_ascii_lowercase().ends_with(".userdb")
+        || parts.any(|part| part.to_ascii_lowercase().ends_with(".userdb"))
+}
+
+/// `Others/` 里的设备私有路径：安装/用户状态、工具目录与活跃 userdb。
 ///
 /// 它记录的是某台机器的 installation_id / sync_dir，同步给别人毫无意义，
 /// 还会让对方的工具误以为自己换过设备。发现即跳过，不再上传/下载。
 pub fn is_private_in_others(relative: &str) -> bool {
-    let name = relative.rsplit('/').next().unwrap_or(relative);
-    name.eq_ignore_ascii_case("installation.yaml")
+    let normalized = relative.replace('\\', "/");
+    let name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .trim_end_matches(['.', ' ']);
+    is_reserved_sync_domain(&normalized)
+        || name.eq_ignore_ascii_case("installation.yaml")
+        || name.eq_ignore_ascii_case("user.yaml")
 }
 
 /// 方案自带的二进制资源（万象 `.gram`、模型等）：§8.2 明确不同步。
@@ -280,16 +319,44 @@ pub fn quarantine_forbidden_others(layout: &Layout) -> Result<Vec<String>> {
             continue;
         }
         let target = layout.meta.join("quarantine").join(&relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(entry.path(), &target).or_else(|_| {
-            fs::copy(entry.path(), &target)?;
-            fs::remove_file(entry.path())
-        })?;
+        copy_to_unique(entry.path(), &target, "quarantine")?;
+        fs::remove_file(entry.path())?;
         moved.push(relative);
     }
     Ok(moved)
+}
+
+/// 备份已有目标时另取名字；create_new 确保任何一次复制都不会覆盖旧版本。
+pub(crate) fn copy_to_unique(source: &Path, target: &Path, label: &str) -> Result<PathBuf> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = target.file_name().context("备份路径缺少文件名")?;
+    let mut candidate = target.to_path_buf();
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                drop(file);
+                if let Err(error) = fs::copy(source, &candidate) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error).context("复制备份失败，原文件已保留");
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = target.with_file_name(format!(
+                    "{}.{label}-{}",
+                    name.to_string_lossy(),
+                    crate::identity::new_path_token(12)
+                ));
+            }
+            Err(error) => return Err(error).context("无法创建备份文件"),
+        }
+    }
 }
 
 /// 目录体检：返回需要提示用户的问题列表（§2.2、§10 风险 12/13/14）。
@@ -403,6 +470,41 @@ mod tests {
     }
 
     #[test]
+    fn sync_paths_reject_runtime_state_and_live_userdb_but_allow_user_resources() {
+        for path in [
+            ".rime-sync/device.json",
+            ".RIME-SYNC/sync-index.json",
+            "Sync/Others/custom_phrase.txt",
+            r"sync\pc01\words.userdb.txt",
+            "build/default.yaml",
+            "BUILD/lua/state.lua",
+            "words.userdb/CURRENT",
+            "nested/WORDS.USERDB/MANIFEST-000002",
+            "words.userdb.txt",
+            "nested/WORDS.USERDB.TXT",
+            "installation.yaml",
+            "USER.YAML",
+            "nested/installation.yaml",
+            "nested/user.yaml",
+            "words.userdb./CURRENT",
+            "Sync./Others/custom_phrase.txt",
+            ".rime-sync./device.json",
+        ] {
+            assert!(validate_sync_file_path(path).is_err(), "accepted {path}");
+        }
+        for path in [
+            "custom_phrase.txt",
+            "cn_dicts/my_words.dict.yaml",
+            "cn_dicts/build.dict.yaml",
+            "opencc/user.txt",
+            "lua/user.lua",
+            "default.custom.yaml",
+        ] {
+            assert_eq!(validate_sync_file_path(path).unwrap(), path);
+        }
+    }
+
+    #[test]
     fn layout_places_private_state_outside_sync() {
         let layout = Layout::new("Rime", "pc01");
         assert!(layout.index_file().starts_with(&layout.meta));
@@ -416,6 +518,33 @@ mod tests {
         assert!(is_private_in_others("cn/Installation.YAML"));
         assert!(!is_private_in_others("custom_phrase.txt"));
         assert!(!is_private_in_others("installation.yaml.bak"));
+        assert!(is_private_in_others("user.yaml"));
+    }
+
+    #[test]
+    fn private_legacy_mirrors_are_skipped_without_excluding_normal_resource_folders() {
+        for path in [
+            ".rime-sync/device.json",
+            "./.RIME-SYNC/sync-index.json",
+            r".rime-sync\device.json",
+            "Sync/Others/custom_phrase.txt",
+            "build/default.yaml",
+            "words.userdb/CURRENT",
+            "nested/WORDS.USERDB/MANIFEST-000002",
+            "words.userdb./CURRENT",
+            "Sync./Others/custom_phrase.txt",
+            ".rime-sync./device.json",
+        ] {
+            assert!(is_private_in_others(path), "would transfer {path}");
+        }
+        for path in [
+            "cn_dicts/mine.dict.yaml",
+            "cn_dicts/build.dict.yaml",
+            "opencc/user.txt",
+            "lua/user.lua",
+        ] {
+            assert!(!is_private_in_others(path), "excluded {path}");
+        }
     }
 
     #[test]
@@ -435,5 +564,38 @@ mod tests {
         assert!(!layout.others.join("nested/x.userdb.txt").exists());
         assert!(layout.others.join("custom_phrase.txt").exists());
         assert!(layout.meta.join("quarantine/nested/x.userdb.txt").is_file());
+    }
+
+    #[test]
+    fn quarantine_keeps_every_version_of_a_repeated_snapshot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        let source = layout.others.join("words.userdb.txt");
+        for bytes in [
+            b"first snapshot".as_slice(),
+            b"second snapshot",
+            b"third snapshot",
+        ] {
+            fs::write(&source, bytes).unwrap();
+            assert_eq!(
+                quarantine_forbidden_others(&layout).unwrap(),
+                ["words.userdb.txt"]
+            );
+            assert!(!source.exists());
+        }
+        let mut saved: Vec<Vec<u8>> = fs::read_dir(layout.meta.join("quarantine"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        saved.sort();
+        assert_eq!(
+            saved,
+            [
+                b"first snapshot".to_vec(),
+                b"second snapshot".to_vec(),
+                b"third snapshot".to_vec()
+            ]
+        );
     }
 }

@@ -473,6 +473,43 @@ mod tests {
     }
 
     #[test]
+    fn import_rejects_private_paths_without_replacing_the_existing_sync_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        let mut original = SyncList::default();
+        original.register("custom_phrase.txt");
+        original.save(&layout.list_file()).unwrap();
+        let before = fs::read(layout.list_file()).unwrap();
+        for path in [
+            ".rime-sync/device.json",
+            "words.userdb/CURRENT",
+            "Sync/pc01/words.userdb.txt",
+            "installation.yaml",
+            "user.yaml",
+        ] {
+            let exported = identity::ExportedDevice {
+                id: "pc01".into(),
+                session_token: "token".into(),
+                webdav_url: String::new(),
+                sync_files: vec![path.into()],
+                excluded: Vec::new(),
+            };
+            assert!(
+                import(
+                    &exported,
+                    &mut DeviceFile::default(),
+                    &mut crate::config::Settings::default(),
+                    &layout
+                )
+                .is_err(),
+                "imported {path}"
+            );
+            assert_eq!(fs::read(layout.list_file()).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn minutes_since_last_sync_parses_stamp() {
         let owner = Owner {
             last_sync: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),

@@ -184,7 +184,7 @@ impl Context {
         notices.extend(paths::audit_sync_root(&layout));
 
         let mut settings_cleanup = settings.clone();
-        ensure_sync_list(&layout, &mut settings_cleanup, ini)?;
+        notices.extend(ensure_sync_list(&layout, &mut settings_cleanup, ini)?);
         if settings_cleanup.legacy_sync_files != settings.legacy_sync_files {
             *settings = settings_cleanup;
         }
@@ -305,15 +305,19 @@ pub fn reconcile_installation_yaml(
 }
 
 /// 首次运行时把 v0.2.5 的 INI 同步列表迁移进 `sync-list.json`。
-fn ensure_sync_list(layout: &Layout, settings: &mut Settings, ini: &Path) -> Result<()> {
+fn ensure_sync_list(layout: &Layout, settings: &mut Settings, ini: &Path) -> Result<Vec<String>> {
     let path = layout.list_file();
     if path.is_file() {
+        let (list, notices) = SyncList::load_with_notices(&path)?;
+        if !notices.is_empty() {
+            list.save(&path)?;
+        }
         // 迁移已完成：清掉 INI 里的旧字段，避免两处真相。
         if !settings.legacy_sync_files.is_empty() {
             settings.legacy_sync_files.clear();
             let _ = settings.save(ini);
         }
-        return Ok(());
+        return Ok(notices);
     }
     let list = if settings.legacy_sync_files.is_empty() {
         default_sync_list()
@@ -325,7 +329,7 @@ fn ensure_sync_list(layout: &Layout, settings: &mut Settings, ini: &Path) -> Res
         settings.legacy_sync_files.clear();
         let _ = settings.save(ini);
     }
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// §8.2 的默认清单：只勾选用户自己产生/修改过的文件。
@@ -362,10 +366,16 @@ pub fn migrate_legacy_layout(
             .join("legacy-backup")
             .join(format!("WebDAV-{}", identity::new_path_token(12)));
         copy_tree(&local_legacy, &backup, false)?;
-        let copied = copy_tree(&local_legacy, &layout.others, true)?;
+        let (copied, conflicts) = copy_tree(&local_legacy, &layout.others, true)?;
         if copied > 0 {
             notices.push(format!(
                 "已把旧版 Sync/WebDAV/ 中的 {copied} 个文件迁移到 Sync/Others/。"
+            ));
+        }
+        for path in conflicts {
+            notices.push(format!(
+                "Others/ 已有不同内容，现有文件保持不变，旧版副本另存为 {}，请比较后保留需要的内容。",
+                path.display()
             ));
         }
         fs::remove_dir_all(&local_legacy)?;
@@ -466,16 +476,27 @@ fn publish_legacy_file(
     bytes: &[u8],
     log: &dyn Fn(&str),
 ) -> Result<bool> {
-    let relative = paths::validate_sync_file_path(relative)?;
-    if paths::is_private_in_others(&relative) {
-        return Ok(true);
+    if paths::is_private_in_others(relative) {
+        log(&format!(
+            "保留旧远端 {relative}：设备私有状态不迁入 Others/，本地已有完整备份。"
+        ));
+        return Ok(false);
     }
-    if paths::is_forbidden_in_others(&relative) || paths::is_binary_scheme_resource(&relative) {
+    if paths::is_forbidden_in_others(relative) || paths::is_binary_scheme_resource(relative) {
         log(&format!(
             "保留旧远端 {relative}：快照或二进制资源不迁入 Others/，本地已有完整备份。"
         ));
         return Ok(false);
     }
+    let relative = match paths::validate_sync_file_path(relative) {
+        Ok(relative) => relative,
+        Err(error) => {
+            log(&format!(
+                "保留旧远端 {relative}：{error}；本地已有完整备份。"
+            ));
+            return Ok(false);
+        }
+    };
     let target = crate::webdav::safe_local(&layout.others, &relative)?;
     let remote = format!("{OTHERS_DIR_NAME}/{relative}");
     let existing = dav.try_get_bytes_with_etag(&remote)?;
@@ -531,8 +552,13 @@ pub fn persist_device(rime_dir: &Path, device: &DeviceFile) -> Result<Vec<String
     reconcile_installation_yaml(&layout.installation_file(), device)
 }
 
-fn copy_tree(source: &Path, target: &Path, skip_installation: bool) -> Result<usize> {
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    skip_installation: bool,
+) -> Result<(usize, Vec<PathBuf>)> {
     let mut copied = 0;
+    let mut conflicts = Vec::new();
     for entry in walkdir::WalkDir::new(source) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -542,21 +568,22 @@ fn copy_tree(source: &Path, target: &Path, skip_installation: bool) -> Result<us
         // installation.yaml 是旧版镜像的占位文件；*.userdb.txt 则绝不能进 Others/
         // （§2.2 红线），它该待在 Sync/<ID>/ 里由 librime 自己合并。
         if skip_installation
-            && (relative
-                .file_name()
-                .is_some_and(|name| name == "installation.yaml")
-                || paths::is_forbidden_in_others(&relative.to_string_lossy()))
+            && (paths::is_private_in_others(&relative.to_string_lossy())
+                || paths::validate_sync_file_path(&relative.to_string_lossy()).is_err())
         {
             continue;
         }
         let destination = target.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+        if destination.is_file() && fs::read(entry.path())? == fs::read(&destination)? {
+            continue;
         }
-        fs::copy(entry.path(), &destination)?;
+        let saved = paths::copy_to_unique(entry.path(), &destination, "legacy-conflict")?;
+        if saved != destination {
+            conflicts.push(saved);
+        }
         copied += 1;
     }
-    Ok(copied)
+    Ok((copied, conflicts))
 }
 
 #[cfg(test)]
@@ -656,6 +683,119 @@ mod tests {
                 .any(|entry| entry.file_name() == "only.userdb.txt")
         );
         assert!(notices.iter().any(|notice| notice.contains("Sync/WebDAV/")));
+    }
+
+    #[test]
+    fn legacy_migration_keeps_existing_text_and_json_and_preserves_conflicting_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        let legacy = layout.sync.join("WebDAV");
+        fs::create_dir_all(&legacy).unwrap();
+        for (name, old, current) in [
+            ("custom_phrase.txt", "old\tcode\n", "new\tcode\n"),
+            ("custom.json", r#"{"old":true}"#, r#"{"new":true}"#),
+        ] {
+            fs::write(legacy.join(name), old).unwrap();
+            fs::write(layout.others.join(name), current).unwrap();
+        }
+        let notices = migrate_legacy_layout(&layout, None, &|_| {}).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read_to_string(layout.others.join("custom_phrase.txt")).unwrap(),
+            "new\tcode\n"
+        );
+        assert_eq!(
+            fs::read_to_string(layout.others.join("custom.json")).unwrap(),
+            r#"{"new":true}"#
+        );
+        for (name, old) in [
+            ("custom_phrase.txt", "old\tcode\n"),
+            ("custom.json", r#"{"old":true}"#),
+        ] {
+            assert!(fs::read_dir(&layout.others).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{name}.legacy-conflict-"))
+                    && fs::read_to_string(entry.path()).unwrap() == old
+            }));
+            assert!(
+                walkdir::WalkDir::new(layout.meta.join("legacy-backup"))
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name() == name
+                        && fs::read_to_string(entry.path()).unwrap() == old)
+            );
+        }
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("旧版副本另存为"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn context_cleans_unsafe_old_sync_list_with_a_visible_notice_and_keeps_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path(), "pc01");
+        layout.ensure_dirs().unwrap();
+        fs::write(layout.installation_file(), "installation_id: pc01\n").unwrap();
+        fs::create_dir_all(dir.path().join("words.userdb")).unwrap();
+        let current = dir.path().join("words.userdb/CURRENT");
+        fs::write(&current, "MANIFEST-000002\n").unwrap();
+        DeviceFile {
+            installation_id: "pc01".into(),
+            session_token: "token".into(),
+            ..Default::default()
+        }
+        .save(&layout.device_file())
+        .unwrap();
+        fs::write(layout.list_file(), r#"{"files":[{"path":"words.userdb/CURRENT"},{"path":".rime-sync/device.json"},{"path":"custom_phrase.txt"},{"path":"lua/custom.lua"}]}"#).unwrap();
+        let mut settings = Settings {
+            user_data_dir: dir.path().to_string_lossy().into(),
+            webdav_url: "https://example.invalid/".into(),
+            username: "user".into(),
+            ..Default::default()
+        };
+        let ini = dir.path().join("settings.ini");
+        let context = Context::build(dir.path(), &ini, &mut settings).unwrap();
+        assert!(
+            context
+                .notices()
+                .iter()
+                .any(|notice| notice.contains("words.userdb/CURRENT"))
+        );
+        assert!(
+            context
+                .notices()
+                .iter()
+                .any(|notice| notice.contains(".rime-sync/device.json"))
+        );
+        let list = context.load_list().unwrap();
+        assert_eq!(
+            list.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["custom_phrase.txt", "lua/custom.lua"]
+        );
+        assert_eq!(fs::read_to_string(&current).unwrap(), "MANIFEST-000002\n");
+        assert!(
+            DeviceFile::load(&layout.device_file())
+                .unwrap()
+                .has_session()
+        );
+        let rebuilt = Context::build(dir.path(), &ini, &mut settings).unwrap();
+        assert!(
+            !rebuilt
+                .notices()
+                .iter()
+                .any(|notice| notice.contains("已移除不允许的同步项"))
+        );
     }
 
     struct LegacyServer {

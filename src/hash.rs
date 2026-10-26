@@ -13,15 +13,36 @@ use std::{
 /// `RIME/custom_phrase.txt` 是用户自定义短语的唯一来源，一旦写坏就是数据丢失，
 /// 所以凡写回用户词库都必须走这里。
 pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    #[cfg(unix)]
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("读取原文件权限失败"),
+    };
     let temp = temp_sibling(path);
+    let mut created = false;
     let result = (|| -> Result<()> {
-        let mut file = fs::File::create(&temp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(permissions) = &permissions {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // 创建时就使用原权限，不能先按默认权限写入密码再收紧。
+            options.mode(permissions.mode());
+        }
+        let mut file = options.open(&temp)?;
+        created = true;
         file.write_all(text.as_bytes())?;
+        #[cfg(unix)]
+        if let Some(permissions) = &permissions {
+            // 创建时受 umask 影响，这里恢复目标原有的精确权限。
+            file.set_permissions(permissions.clone())?;
+        }
         file.sync_all()?;
         drop(file);
         Ok(fs::rename(&temp, path)?)
     })();
-    if result.is_err() {
+    if result.is_err() && created {
         let _ = fs::remove_file(&temp);
     }
     result.with_context(|| format!("写入 {} 失败", path.display()))
@@ -122,6 +143,27 @@ pub fn short(hash: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_settings_save_keeps_restrictive_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.ini");
+        fs::write(&target, "old secret").unwrap();
+        for mode in [0o600, 0o640, 0o660] {
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+            write_atomic(&target, "password_base64=c2VjcmV0\n").unwrap();
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                "password_base64=c2VjcmV0\n"
+            );
+        }
+    }
 
     /// 原子写必须只留下目标文件本身：临时文件不能残留在 `RIME/` 或 `Others/` 里，
     /// 否则下一轮会被当成正常的词库文件搬来搬去。

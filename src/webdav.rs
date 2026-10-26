@@ -58,7 +58,7 @@ pub struct Capabilities {
 impl Capabilities {
     /// 按服务端能力选择上传校验档位（§4.4）。
     pub fn tier(&self) -> UploadTier {
-        if self.if_match {
+        if self.if_match && self.etag {
             UploadTier::Conditional
         } else if self.etag {
             UploadTier::EtagOnly
@@ -102,6 +102,15 @@ impl UploadTier {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "支持" } else { "不支持" }
+}
+
+fn dav_status_code(status: &str) -> Result<u16> {
+    status
+        .split_whitespace()
+        .nth(1)
+        .context("WebDAV 响应状态码缺失")?
+        .parse()
+        .context("WebDAV 响应状态码无效")
 }
 
 pub struct WebDav {
@@ -218,6 +227,9 @@ impl WebDav {
             .body(Self::propfind_body())
             .send()?;
         if response.status() == StatusCode::NOT_FOUND {
+            if relative.trim_matches('/').is_empty() {
+                bail!("WebDAV 同步根目录不存在（HTTP 404），未清理本地镜像");
+            }
             return Ok(Vec::new());
         }
         let entries = self.parse_propfind(Self::ok(response, "列出 WebDAV 目录")?)?;
@@ -278,27 +290,75 @@ impl WebDav {
         // 部分服务端声明了错误的 charset；XML 元素名是 ASCII，有损解码更稳。
         let text = String::from_utf8_lossy(&bytes);
         let doc = Document::parse(&text).context("解析 WebDAV XML 失败")?;
+        if !doc.root_element().has_tag_name(("DAV:", "multistatus")) {
+            bail!("WebDAV 未返回有效的目录清单，未清理本地镜像");
+        }
         let mut out = Vec::new();
         for node in doc
             .descendants()
             .filter(|node| node.has_tag_name(("DAV:", "response")))
         {
             let href = node
-                .descendants()
+                .children()
                 .find(|node| node.has_tag_name(("DAV:", "href")))
                 .and_then(|node| node.text())
-                .unwrap_or("");
+                .filter(|href| !href.trim().is_empty())
+                .context("WebDAV 条目缺少 href，未清理本地镜像")?;
             let Ok(relative) = self.relative_from_href(href) else {
                 continue;
             };
+            if let Some(status) = node
+                .children()
+                .find(|child| child.has_tag_name(("DAV:", "status")))
+            {
+                let code = dav_status_code(status.text().unwrap_or(""))?;
+                if !(200..300).contains(&code) {
+                    bail!("读取 WebDAV 条目 {relative} 失败: HTTP {code}（未清理本地镜像）");
+                }
+            }
+            let mut props = Vec::new();
+            for propstat in node
+                .children()
+                .filter(|child| child.has_tag_name(("DAV:", "propstat")))
+            {
+                let status = propstat
+                    .children()
+                    .find(|child| child.has_tag_name(("DAV:", "status")))
+                    .and_then(|child| child.text())
+                    .context("WebDAV 属性响应缺少状态码")?;
+                let code = dav_status_code(status)?;
+                let prop = propstat
+                    .children()
+                    .find(|child| child.has_tag_name(("DAV:", "prop")))
+                    .context("WebDAV 属性响应缺少 prop")?;
+                if !(200..300).contains(&code) {
+                    // ETag/时间等可选属性可能不存在；资源类型失败则不能把集合猜成文件。
+                    if code == 404
+                        && !prop
+                            .children()
+                            .any(|child| child.has_tag_name(("DAV:", "resourcetype")))
+                    {
+                        continue;
+                    }
+                    bail!("读取 WebDAV 条目 {relative} 的属性失败: HTTP {code}（未清理本地镜像）");
+                }
+                props.extend(prop.children().filter(|child| child.is_element()));
+            }
             if relative.is_empty() {
                 continue;
             }
-            let is_dir = node
-                .descendants()
-                .any(|node| node.has_tag_name(("DAV:", "collection")));
+            let kind = props
+                .iter()
+                .find(|prop| prop.has_tag_name(("DAV:", "resourcetype")))
+                .context(format!(
+                    "WebDAV 条目 {relative} 缺少资源类型，未清理本地镜像"
+                ))?;
+            let is_dir = kind
+                .children()
+                .any(|child| child.has_tag_name(("DAV:", "collection")));
             let text_of = |name: &str| {
-                node.descendants()
+                props
+                    .iter()
                     .find(|node| node.has_tag_name(("DAV:", name)))
                     .and_then(|node| node.text())
             };
@@ -338,7 +398,7 @@ impl WebDav {
         relative: &str,
         target: &Path,
         fallback_mtime: Option<SystemTime>,
-    ) -> Result<()> {
+    ) -> Result<RemoteEntry> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -351,24 +411,41 @@ impl WebDav {
             .get(header::LAST_MODIFIED)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| httpdate::parse_http_date(value).ok());
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let temp = crate::hash::temp_sibling(target);
         // 下载失败必须把半截临时文件删掉：它落在 Others/ 里，下一轮会被
         // 当成正常文件上传，把残缺内容扩散到所有设备。
-        let written = (|| -> Result<()> {
+        let written = (|| -> Result<u64> {
             let mut file = fs::File::create(&temp)?;
-            std::io::copy(&mut response, &mut file)?;
+            let length = std::io::copy(&mut response, &mut file)?;
             file.sync_all()?;
-            Ok(())
+            Ok(length)
         })();
-        if let Err(error) = written {
-            let _ = fs::remove_file(&temp);
-            return Err(error.context(format!("下载 {relative} 失败")));
-        }
-        if let Some(time) = fallback_mtime.or(header_time) {
+        let length = match written {
+            Ok(length) => length,
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error.context(format!("下载 {relative} 失败")));
+            }
+        };
+        let modified = header_time.or(fallback_mtime);
+        if let Some(time) = modified {
             let _ = filetime::set_file_mtime(&temp, filetime::FileTime::from_system_time(time));
         }
         fs::rename(&temp, target).with_context(|| format!("写入 {} 失败", target.display()))?;
-        Ok(())
+        Ok(RemoteEntry {
+            relative: relative.to_owned(),
+            is_dir: false,
+            etag,
+            length: Some(length),
+            modified,
+        })
     }
 
     pub fn get_bytes(&self, relative: &str) -> Result<Vec<u8>> {
@@ -662,11 +739,29 @@ impl WebDav {
             caps.mkcol = true;
             let probe_file = format!("{probe_dir}/a.txt");
             let moved = format!("{probe_dir}/b.txt");
-            if let Ok(PutOutcome::Uploaded { etag }) =
+            if let Ok(PutOutcome::Uploaded { etag: put_etag }) =
                 self.put_bytes(&probe_file, b"x".to_vec(), None)
-                && etag.is_some()
             {
-                caps.etag = true;
+                let current_etag = self
+                    .try_get_bytes_with_etag(&probe_file)
+                    .ok()
+                    .flatten()
+                    .filter(|(bytes, _)| bytes == b"x")
+                    .and_then(|(_, etag)| etag.or(put_etag));
+                caps.etag |= current_etag.is_some();
+                // 必须在现有文件上同时验证「错误 tag 被拒绝、正确 tag 能更新」。
+                // 不存在的资源上返回 412，并不能证明有可用的 ETag 条件更新。
+                if let Some(etag) = current_etag.filter(|etag| !etag.starts_with("W/")) {
+                    let rejects_stale = matches!(
+                        self.put_bytes(&probe_file, b"x".to_vec(), Some("\"does-not-exist\"")),
+                        Ok(PutOutcome::PreconditionFailed)
+                    );
+                    caps.if_match = rejects_stale
+                        && matches!(
+                            self.put_bytes(&probe_file, b"x".to_vec(), Some(&etag)),
+                            Ok(PutOutcome::Uploaded { .. })
+                        );
+                }
             }
             // 先 MOVE 再删：源文件必须先存在，否则 MOVE 恒 404，move_supported 永远是 false。
             caps.move_supported = self.move_entry(&probe_file, &moved).unwrap_or(false);
@@ -676,11 +771,6 @@ impl WebDav {
             } else {
                 self.delete(&probe_file).is_ok()
             };
-            // If-Match 用必然不存在的 ETag 探测：期望 412，返回 200 说明被忽略。
-            caps.if_match = matches!(
-                self.put_bytes(&probe_file, b"y".to_vec(), Some("\"does-not-exist\"")),
-                Ok(PutOutcome::PreconditionFailed)
-            );
             let _ = self.delete(&probe_file);
             let _ = self.delete_collection(&probe_dir);
         }
@@ -895,6 +985,44 @@ mod tests {
         assert_eq!(caps.tier(), UploadTier::EtagOnly);
         caps.if_match = true;
         assert_eq!(caps.tier(), UploadTier::Conditional);
+        caps.etag = false;
+        assert_eq!(caps.tier(), UploadTier::MetadataOnly);
+    }
+
+    #[test]
+    fn optional_propfind_metadata_404_is_allowed_when_resource_type_succeeded() {
+        use super::test_support::{Reply, serve_raw};
+        let server = serve_raw(|_| {
+            Reply::new(207, br#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/pc02/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><d:getetag/><d:getlastmodified/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>"#.to_vec())
+        });
+        let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+        let entries = dav.list("").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_dir);
+        assert!(entries[0].etag.is_none());
+    }
+
+    #[test]
+    fn missing_sync_root_is_an_error_instead_of_an_empty_successful_listing() {
+        use super::test_support::{Reply, serve_raw};
+        let server = serve_raw(|_| Reply::new(404, Vec::new()));
+        let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+        assert!(dav.list("").is_err());
+        assert!(dav.list("Others").unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_propfind_documents_are_not_successful_empty_listings() {
+        use super::test_support::{Reply, serve_raw};
+        for body in [
+            "<html><body>Sign in</body></html>",
+            r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#,
+        ] {
+            let server = serve_raw(move |_| Reply::new(207, body.as_bytes().to_vec()));
+            let dav = WebDav::new(&server.url, "user", "pass").unwrap();
+            let error = dav.list("").unwrap_err().to_string();
+            assert!(error.contains("未清理本地镜像"), "{error}");
+        }
     }
 
     fn collection_xml(href: &str, collection: bool, status: u16) -> Vec<u8> {
@@ -940,6 +1068,9 @@ mod tests {
     fn unsupported_mkcol_is_not_reported_as_a_busy_device_or_supported_capability() {
         use super::test_support::{Reply, serve_raw};
         let server = serve_raw(|request| {
+            if request.method == "PROPFIND" && request.path == "/" {
+                return Reply::new(207, b"<d:multistatus xmlns:d=\"DAV:\"/>".to_vec());
+            }
             Reply::new(
                 if request.method == "MKCOL" { 405 } else { 404 },
                 Vec::new(),

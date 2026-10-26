@@ -167,23 +167,38 @@ pub fn refresh_interval(minutes: u32) -> Result<bool> {
     let Ok(path) = timer_path() else {
         return Ok(false);
     };
+    refresh_interval_at(&path, minutes, apply_timer_interval)
+}
+
+fn refresh_interval_at(
+    path: &Path,
+    minutes: u32,
+    apply: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
     let text = timer_unit(minutes);
-    if fs::read_to_string(&path)
-        .map(|old| old == text)
-        .unwrap_or(false)
-    {
+    let previous =
+        fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    if previous == text {
         return Ok(false);
     }
-    write_atomic(&path, &text)?;
+    write_atomic(path, &text)?;
+    if let Err(error) = apply() {
+        // 不能把尚未应用的新内容留作「已成功」基线，否则再次保存相同间隔
+        // 会在上面的比较处提前返回，永远不再尝试 reload/restart。
+        write_atomic(path, &previous)
+            .with_context(|| format!("应用新间隔失败（{error:#}），恢复原 timer 内容也失败"))?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn apply_timer_interval() -> Result<()> {
     systemctl_checked(&["daemon-reload"])?;
     // 只重启 timer 本身，不会打断正在跑的那一轮搬运。
-    // 重启会让 systemd 重算到期时间（`OnStartupSec` 已过期则立刻补跑一轮），
-    // 所以改完间隔可能马上看到一轮搬运，属正常现象。
-    systemctl_checked(&["restart", TIMER_NAME])?;
-    Ok(true)
+    systemctl_checked(&["restart", TIMER_NAME])
 }
 
 /// 立刻跑一轮：直接启动 oneshot service。
@@ -417,6 +432,32 @@ fn unquote_first(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interval_retry_reapplies_after_a_failed_reload_or_restart() {
+        for failure in ["daemon-reload", "restart"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.timer");
+            let previous = timer_unit(10);
+            fs::write(&path, &previous).unwrap();
+            let error = refresh_interval_at(&path, 20, || bail!("simulated {failure} failure"))
+                .unwrap_err();
+            assert!(error.to_string().contains(failure));
+            assert_eq!(fs::read_to_string(&path).unwrap(), previous);
+
+            let mut applied = false;
+            assert!(
+                refresh_interval_at(&path, 20, || {
+                    applied = true;
+                    Ok(())
+                })
+                .unwrap()
+            );
+            assert!(applied, "同间隔重试必须真正应用 timer");
+            assert_eq!(fs::read_to_string(&path).unwrap(), timer_unit(20));
+            assert!(!refresh_interval_at(&path, 20, || panic!("已成功的间隔无需重启")).unwrap());
+        }
+    }
 
     #[test]
     fn service_runs_the_scheduled_round_with_the_app_dir() {

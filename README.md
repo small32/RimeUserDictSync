@@ -167,6 +167,9 @@ Linux 的「同步文件选择 → 添加文件」也使用这套选择器，支
 **不要同步**：没改过的方案原版文件（避免版本漂移）、`*.userdb/`（leveldb 目录）、
 `build/`、`installation.yaml`、`user.yaml`、万象 `.gram` 与模型文件。
 
+程序会拒绝把活跃 `*.userdb/`、`Sync/`、`.rime-sync/`、`build/` 和设备私有配置加入同步列表。
+旧清单中的这些项会被移除并提示，原文件保留；正常的 `cn_dicts/`、`opencc/`、`lua/` 文件仍可同步。
+
 ## 使用方法
 
 ### 后台搬运

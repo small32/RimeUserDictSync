@@ -218,6 +218,8 @@ struct App {
     background_paths: Arc<Mutex<BackgroundPaths>>,
     log_path: PathBuf,
     settings: Settings,
+    settings_checked_at: std::time::Instant,
+    background_minutes_draft: u32,
     context: Option<Context>,
     context_error: Option<String>,
     /// 已经写进日志的那条 context 错误。
@@ -425,7 +427,9 @@ impl App {
             dav_url: settings.webdav_url.clone(),
             dav_username: settings.username.clone(),
             dav_password: settings.password.clone(),
+            background_minutes_draft: settings.background_minutes,
             settings,
+            settings_checked_at: std::time::Instant::now(),
             context: None,
             context_error: None,
             context_error_logged: String::new(),
@@ -693,6 +697,13 @@ impl App {
                 }
                 Event::Device { result, exported } => {
                     self.set_busy(false);
+                    if result.is_ok()
+                        && let Err(error) = self.reload_saved_settings()
+                    {
+                        self.append(&crate::report::timestamped(&format!(
+                            "设备设置已完成，但重新读取配置失败：{error}"
+                        )));
+                    }
                     self.notice = Some(match result {
                         Ok(text) if exported => {
                             self.exported_text = text;
@@ -705,6 +716,25 @@ impl App {
                     self.refresh_context();
                 }
                 Event::UpdateChecked(update) => self.available_update = update,
+            }
+        }
+        // 菜单栏的 --quit-all 和设备导入会从其他线程/进程修改 INI。
+        // 已保存值及时跟随磁盘；用户仍在编辑的输入框则原样保留。
+        if !self.busy
+            && !self.config_broken
+            && self.settings_checked_at.elapsed() >= Duration::from_secs(2)
+        {
+            self.settings_checked_at = std::time::Instant::now();
+            match self.reload_saved_settings() {
+                Ok(true) => self.refresh_context(),
+                Ok(false) => {}
+                Err(error) => {
+                    self.config_broken = true;
+                    self.append(&crate::report::timestamped(&format!(
+                        "重新读取配置失败，已禁用保存：{error}"
+                    )));
+                    self.notice = Some(CONFIG_BROKEN_NOTICE.into());
+                }
             }
         }
         if self.context.is_none()
@@ -725,6 +755,39 @@ impl App {
             let _ = self.apply_tested_capabilities();
         }
         self.refresh_service_state();
+    }
+
+    fn adopt_saved_settings(&mut self, saved: Settings) {
+        adopt_saved_settings(
+            &mut self.settings,
+            &mut self.dav_url,
+            &mut self.dav_username,
+            &mut self.dav_password,
+            &mut self.background_minutes_draft,
+            saved,
+        );
+    }
+
+    fn reload_saved_settings(&mut self) -> Result<bool> {
+        let saved = Settings::load(&self.ini)?;
+        let changed = saved.user_data_dir != self.settings.user_data_dir
+            || saved.deployer_path != self.settings.deployer_path
+            || saved.webdav_url != self.settings.webdav_url
+            || saved.username != self.settings.username
+            || saved.password != self.settings.password;
+        self.adopt_saved_settings(saved);
+        Ok(changed)
+    }
+
+    fn save_background_interval(&mut self) -> Result<()> {
+        if self.config_broken {
+            bail!("{CONFIG_BROKEN_NOTICE}");
+        }
+        let mut saved = self.settings.clone();
+        save_background_minutes(&mut saved, &self.ini, self.background_minutes_draft)?;
+        self.adopt_saved_settings(saved);
+        self.background_minutes_draft = self.settings.background_minutes;
+        Ok(())
     }
 
     fn apply_tested_capabilities(&mut self) -> Result<()> {
@@ -845,7 +908,7 @@ impl App {
                 return;
             }
             if let Ok(settings) = Settings::load(&self.ini) {
-                self.settings = settings;
+                self.adopt_saved_settings(settings);
             }
         }
         let mut arguments = vec![if uninstall {
@@ -1052,7 +1115,10 @@ impl App {
         if self.config_broken {
             bail!("{CONFIG_BROKEN_NOTICE}");
         }
-        let mut settings = self.settings.clone();
+        let mut settings = Settings::load(&self.ini)?;
+        let previous_url = settings.webdav_url.clone();
+        let previous_username = settings.username.clone();
+        let previous_password = settings.password.clone();
         settings.webdav_url = self.dav_url.trim().to_owned();
         settings.username = self.dav_username.trim().to_owned();
         settings.password = self.dav_password.clone();
@@ -1068,15 +1134,15 @@ impl App {
             }
             webdav::WebDav::new(&settings.webdav_url, &settings.username, &settings.password)?;
         }
-        let changed = settings.webdav_url != self.settings.webdav_url
-            || settings.username != self.settings.username
-            || settings.password != self.settings.password;
+        let changed = settings.webdav_url != previous_url
+            || settings.username != previous_username
+            || settings.password != previous_password;
         if changed {
             // 不能把上一个地址或账号的能力套到新连接上。
             cache_capabilities(&settings, webdav::Capabilities::default())?;
         }
         settings.save(&self.ini)?;
-        self.settings = settings;
+        self.adopt_saved_settings(settings);
         self.update_background_paths()?;
         self.capabilities_dirty = self
             .tested_connection
@@ -1146,10 +1212,18 @@ impl App {
             ));
             return;
         }
-        self.settings.user_data_dir = dir.to_string_lossy().into_owned();
-        if let Err(error) = self.settings.save(&self.ini) {
-            self.notice = Some(error.to_string());
-            return;
+        let saved = (|| -> Result<Settings> {
+            let mut saved = Settings::load(&self.ini)?;
+            saved.user_data_dir = dir.to_string_lossy().into_owned();
+            saved.save(&self.ini)?;
+            Ok(saved)
+        })();
+        match saved {
+            Ok(saved) => self.adopt_saved_settings(saved),
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
         }
         // sync_dir 由 device.json 权威接管，这里只提示一次。
         if let Some(id) = config::yaml_scalar_opt(&installation, "installation_id") {
@@ -1340,7 +1414,9 @@ impl App {
         if self.config_broken {
             bail!("{CONFIG_BROKEN_NOTICE}");
         }
-        save_background_enabled(&mut self.settings, &self.ini, enabled)?;
+        let mut saved = self.settings.clone();
+        save_background_enabled(&mut saved, &self.ini, enabled)?;
+        self.adopt_saved_settings(saved);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.service_checked_at = Instant::now() - SERVICE_POLL_INTERVAL;
@@ -1375,13 +1451,15 @@ impl App {
             fs::copy(&self.log_path, target.join("RimeSync.log"))?;
         }
         let ini = target.join("RimeUserDictSync.ini");
-        self.settings.save(&ini)?;
+        let saved = Settings::load(&self.ini)?;
+        saved.save(&ini)?;
         if crate::agent::installed() {
-            crate::agent::install(&target, self.settings.background_minutes)?;
+            crate::agent::install(&target, saved.background_minutes)?;
         }
         config::set_app_dir(&target)?;
         self.base = target.clone();
         self.ini = ini;
+        self.adopt_saved_settings(saved);
         self.log_path = target.join("RimeSync.log");
         self.config_dir_draft = target.to_string_lossy().into_owned();
         self.log_offset = 0;
@@ -1498,13 +1576,12 @@ impl eframe::App for App {
                     }
                     ui.add_enabled(
                         !self.busy && self.settings.background_enabled,
-                        egui::Slider::new(&mut self.settings.background_minutes, 1..=240)
-                            .text("分钟"),
+                        egui::Slider::new(&mut self.background_minutes_draft, 1..=240).text("分钟"),
                     );
                     if ui.button("保存间隔").clicked() {
                         if self.config_broken {
                             self.notice = Some(CONFIG_BROKEN_NOTICE.into());
-                        } else if let Err(error) = self.settings.save(&self.ini) {
+                        } else if let Err(error) = self.save_background_interval() {
                             // 写盘失败时**不要**再去改 launchd / systemd：否则系统里
                             // 已经是新间隔，配置文件还是旧的，界面、内建线程与
                             // `--scheduled-round` 会各说各话，重启后滑块还会弹回旧值。
@@ -2467,15 +2544,45 @@ fn available_release(tag: &str, url: &str, current: &str) -> Result<Option<Updat
     }))
 }
 
-/// 配置写入失败时恢复内存中的开关，避免界面显示成已经保存。
+/// 只改指定字段，其余值以磁盘为准，避免旧 GUI 覆盖导入或 --quit-all 的结果。
 fn save_background_enabled(settings: &mut Settings, ini: &Path, enabled: bool) -> Result<()> {
-    let previous = settings.background_enabled;
-    settings.background_enabled = enabled;
-    if let Err(error) = settings.save(ini) {
-        settings.background_enabled = previous;
-        return Err(error);
-    }
+    let mut saved = Settings::load(ini)?;
+    saved.background_enabled = enabled;
+    saved.save(ini)?;
+    *settings = saved;
     Ok(())
+}
+
+fn save_background_minutes(settings: &mut Settings, ini: &Path, minutes: u32) -> Result<()> {
+    let mut saved = Settings::load(ini)?;
+    saved.background_minutes = minutes.clamp(1, 24 * 60);
+    saved.save(ini)?;
+    *settings = saved;
+    Ok(())
+}
+
+/// 干净的输入框跟随新配置；尚未保存的用户输入不因定时刷新或设备动作丢失。
+fn adopt_saved_settings(
+    current: &mut Settings,
+    url: &mut String,
+    username: &mut String,
+    password: &mut String,
+    minutes: &mut u32,
+    saved: Settings,
+) {
+    if *url == current.webdav_url {
+        *url = saved.webdav_url.clone();
+    }
+    if *username == current.username {
+        *username = saved.username.clone();
+    }
+    if *password == current.password {
+        *password = saved.password.clone();
+    }
+    if *minutes == current.background_minutes {
+        *minutes = saved.background_minutes;
+    }
+    *current = saved;
 }
 
 /// `test_webdav` 之外的地方只需要一个只读的 WebDAV 探测入口，这里给出统一构造点。
@@ -2493,6 +2600,92 @@ fn build_webdav(settings: &Settings) -> Result<Option<webdav::WebDav>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_field_saves_preserve_imported_connection_and_external_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let ini = root.path().join("RimeUserDictSync.ini");
+        let mut cached = Settings {
+            webdav_url: "https://old.example/dav/".into(),
+            username: "account".into(),
+            ..Default::default()
+        };
+        let external = Settings {
+            webdav_url: "https://imported.example/dav/".into(),
+            background_enabled: false,
+            ..cached.clone()
+        };
+        external.save(&ini).unwrap();
+
+        save_background_minutes(&mut cached, &ini, 25).unwrap();
+        let saved = Settings::load(&ini).unwrap();
+        assert!(!saved.background_enabled, "保存间隔不能撤销 --quit-all");
+        assert_eq!(saved.webdav_url, external.webdav_url);
+        assert_eq!(saved.background_minutes, 25);
+
+        let external = Settings {
+            password: "new external password".into(),
+            ..saved
+        };
+        external.save(&ini).unwrap();
+        save_background_enabled(&mut cached, &ini, true).unwrap();
+        let saved = Settings::load(&ini).unwrap();
+        assert_eq!(saved.password, external.password);
+        assert_eq!(saved.webdav_url, external.webdav_url);
+        assert_eq!(saved.background_minutes, 25);
+        assert!(saved.background_enabled);
+    }
+
+    #[test]
+    fn imported_settings_refresh_clean_drafts_and_preserve_unsaved_edits() {
+        let mut current = Settings {
+            webdav_url: "https://old.example/dav/".into(),
+            username: "old account".into(),
+            password: "old password".into(),
+            ..Default::default()
+        };
+        let mut url = current.webdav_url.clone();
+        let mut username = "unsaved account".to_owned();
+        let mut password = current.password.clone();
+        let mut minutes = 30;
+        let imported = Settings {
+            webdav_url: "https://imported.example/dav/".into(),
+            username: "imported account".into(),
+            password: "imported password".into(),
+            background_minutes: 20,
+            background_enabled: false,
+            ..Default::default()
+        };
+        adopt_saved_settings(
+            &mut current,
+            &mut url,
+            &mut username,
+            &mut password,
+            &mut minutes,
+            imported.clone(),
+        );
+        assert_eq!(url, imported.webdav_url);
+        assert_eq!(password, imported.password);
+        assert_eq!(username, "unsaved account");
+        assert_eq!(minutes, 30);
+        assert!(!current.background_enabled);
+        assert_eq!(current.username, imported.username);
+
+        url = "https://unsaved.example/dav/".into();
+        let changed = Settings {
+            webdav_url: "https://external.example/dav/".into(),
+            ..imported
+        };
+        adopt_saved_settings(
+            &mut current,
+            &mut url,
+            &mut username,
+            &mut password,
+            &mut minutes,
+            changed,
+        );
+        assert_eq!(url, "https://unsaved.example/dav/");
+    }
 
     #[test]
     fn background_choice_is_only_changed_after_settings_can_be_saved() {

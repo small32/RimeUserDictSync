@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.3.0 (must match Cargo.toml)"
+        description: "Existing release tag, for example v0.5.3 (must match its Cargo.toml)"
         required: true
         type: string
 
@@ -30,32 +30,43 @@ jobs:
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       version: ${{ steps.check.outputs.version }}
+      commit: ${{ steps.check.outputs.commit }}
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Tag must match Cargo.toml version
         id: check
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSH_TAG: ${{ github.ref_name }}
+          PUSH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.ref_name }}"
+            TAG="$PUSH_TAG"
           fi
-          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [[ -z "$VERSION" ]]; then
-            echo "无法从 Cargo.toml 读到版本号" >&2
+          git check-ref-format "refs/tags/$TAG"
+          COMMIT="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          if [[ "$EVENT_NAME" == "push" && "$COMMIT" != "$(git rev-parse "$PUSH_SHA^{commit}")" ]]; then
+            echo "标签 $TAG 已移动，与触发此次构建的提交不同" >&2
             exit 1
           fi
+          VERSION="$(git show "$COMMIT:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')"
           if [[ "$TAG" != "v$VERSION" ]]; then
             echo "Release tag $TAG 与 Cargo.toml 的版本 $VERSION 不一致" >&2
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "标签 $TAG 与 Cargo.toml 版本 $VERSION 一致"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "标签 $TAG 对应提交 $COMMIT，Cargo.toml 版本 $VERSION"
 
   windows:
     name: Windows x64
@@ -64,6 +75,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Select Rust stable with fmt and clippy
         shell: pwsh
@@ -106,6 +119,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Select Rust stable and install targets
         run: |
@@ -144,6 +159,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Select Rust stable with fmt and clippy
         run: |
@@ -198,6 +215,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
@@ -216,29 +235,46 @@ jobs:
           cat SHA256SUMS.txt
 
       # RELEASE_NOTES.md 是累计式的（新版本段落加在最上面）。Release 正文只取
-      # 顶部这一段，否则页面上会连带列出 v0.5.1、v0.5.0 等所有历史版本。
-      # 写法约定（四毛定的）：顶部一句「建议所有用户更新」+ 重要修复 / 新增 /
-      # 升级注意三段；BUG 修复不逐条列，一笔「修复了一些BUG」带过。
+      # 顶部这一段，排除版本标题，避免带入其他版本的历史说明。
       - name: Keep only this version's notes
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          awk 'NR > 1 && /^# v/ { exit } { print }' RELEASE_NOTES.md > release-notes.md
-          test -s release-notes.md
-          grep -q '^# v' release-notes.md
-          echo "取到 $(wc -l < release-notes.md) 行：" && head -n 1 release-notes.md
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          lines = Path("RELEASE_NOTES.md").read_text(encoding="utf-8").splitlines()
+          if not lines or lines[0] != "# " + os.environ["RELEASE_TAG"]:
+              raise SystemExit("发布说明标题与标签不一致")
+          body = []
+          for line in lines[1:]:
+              if line.startswith("# v"):
+                  break
+              body.append(line)
+          notes = "\n".join(body).strip()
+          if not notes:
+              raise SystemExit("发布说明不能为空")
+          Path("release-notes.md").write_text(notes + "\n", encoding="utf-8")
+          print(notes)
+          PY
 
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$RELEASE_COMMIT"
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
+              --target "$RELEASE_COMMIT" \
               --title "RimeUserDictSync $RELEASE_TAG" \
               --notes-file release-notes.md
           fi

@@ -70,7 +70,7 @@ pub fn merge_text_for_path(
     }
 }
 
-/// `*.dict.yaml` 词条级并集：表头取本地（缺失则取远端），词条按 key 去重取大权重。
+/// `*.dict.yaml` 词条级并集：表头取本地（缺失则取远端），列定义保留两端字段，词条按 key 去重取大权重。
 pub fn dict_union(local: &str, remote: &str) -> String {
     let local_lines: Vec<&str> = local.lines().collect();
     let remote_lines: Vec<&str> = remote.lines().collect();
@@ -87,23 +87,33 @@ pub fn dict_union(local: &str, remote: &str) -> String {
     let local_body = &local_lines[local_header.unwrap_or(0)..];
     let remote_body = &remote_lines[remote_header.unwrap_or(0)..];
 
-    let mut out: Vec<String> = header.iter().map(|line| (*line).to_owned()).collect();
     let mut exact: HashSet<String> = HashSet::new();
     let mut weighted: HashMap<String, (Option<f64>, usize)> = HashMap::new();
     let local_columns = dict_columns(&local_lines[..local_header.unwrap_or(0)]);
     let remote_columns = dict_columns(&remote_lines[..remote_header.unwrap_or(0)]);
-    let output_columns = if local_header.is_none() && remote_header.is_some() {
+    let preferred_columns = if local_header.is_none() && remote_header.is_some() {
         &remote_columns
     } else {
         &local_columns
+    };
+    let mut output_columns = preferred_columns.clone();
+    for name in local_columns.iter().chain(&remote_columns) {
+        if !output_columns.contains(name) {
+            output_columns.push(name.clone());
+        }
+    }
+    let mut out = if output_columns == *preferred_columns {
+        header.iter().map(|line| (*line).to_owned()).collect()
+    } else {
+        header_with_columns(&header, &output_columns)
     };
     for (line, columns) in local_body
         .iter()
         .map(|line| (*line, &local_columns))
         .chain(remote_body.iter().map(|line| (*line, &remote_columns)))
     {
-        let line = align_dict_row(line, columns, output_columns);
-        if let Some((key, weight)) = parse_dict_row(&line, output_columns) {
+        let line = align_dict_row(line, columns, &output_columns);
+        if let Some((key, weight)) = parse_dict_row(&line, &output_columns) {
             match weighted.get(&key).copied() {
                 Some((old_weight, position)) if weight > old_weight => {
                     out[position] = line;
@@ -123,27 +133,56 @@ pub fn dict_union(local: &str, remote: &str) -> String {
     join_lines(out)
 }
 
-/// 两端声明相同字段但顺序不同，输出仍必须遵守所保留表头的列顺序。
+/// 扩展表头的列声明，保留本地其他设置与注释。
+fn header_with_columns(header: &[&str], columns: &[String]) -> Vec<String> {
+    let declaration = format!("columns: [{}]", columns.join(", "));
+    let mut out = Vec::new();
+    let mut replaced = false;
+    let mut skip_list = false;
+    for line in header {
+        let trimmed = line.trim_start();
+        if let Some(value) = trimmed.strip_prefix("columns:") {
+            let indentation = &line[..line.len() - trimmed.len()];
+            out.push(format!("{indentation}{declaration}"));
+            replaced = true;
+            skip_list = value.split('#').next().unwrap_or("").trim().is_empty();
+        } else if skip_list && trimmed.starts_with('-') {
+            continue;
+        } else {
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                skip_list = false;
+            }
+            if !replaced && trimmed.trim() == "..." {
+                out.push(declaration.clone());
+                replaced = true;
+            }
+            out.push((*line).to_owned());
+        }
+    }
+    out
+}
+
+/// 不同字段集合也按字段名映射；缺失的可选字段填空，不能把权重当成编码。
 fn align_dict_row(line: &str, source: &[String], target: &[String]) -> String {
-    if source == target
-        || line.trim_start().starts_with('#')
-        || !line.contains('\t')
-        || source.len() != target.len()
-        || !target.iter().all(|name| source.contains(name))
-    {
+    if source == target || line.trim_start().starts_with('#') {
         return line.to_owned();
     }
     let fields: Vec<_> = line.split('\t').collect();
-    if fields.len() > source.len() {
-        return line.to_owned();
-    }
     let mut reordered: Vec<_> = target
         .iter()
         .map(|name| {
-            let position = source.iter().position(|field| field == name).unwrap();
-            fields.get(position).copied().unwrap_or("")
+            source
+                .iter()
+                .position(|field| field == name)
+                .and_then(|position| fields.get(position))
+                .copied()
+                .unwrap_or("")
         })
         .collect();
+    // 声明之外的原始列也保留，避免重排时截掉内容。
+    if fields.len() > source.len() {
+        reordered.extend_from_slice(&fields[source.len()..]);
+    }
     while reordered.last() == Some(&"") {
         reordered.pop();
     }
@@ -279,13 +318,21 @@ fn dict_columns(header: &[&str]) -> Vec<String> {
         header[start + 1..]
             .iter()
             .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .take_while(|line| line.starts_with('-'))
             .map(|line| line[1..].trim())
             .collect()
     };
     names
         .into_iter()
-        .map(|name| name.trim().trim_matches(['\'', '"']).to_owned())
+        .map(|name| {
+            name.split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches(['\'', '"'])
+                .to_owned()
+        })
         .collect()
 }
 
@@ -536,5 +583,43 @@ mod tests {
         assert!(merged.starts_with("---\nname: words\ncolumns: [text, code, weight]\n...\n"));
         assert!(merged.ends_with("甲\tjia\t20\n"));
         assert_eq!(merged.matches("甲\t").count(), 1);
+    }
+
+    #[test]
+    fn dictionary_optional_code_and_weight_columns_keep_their_meaning() {
+        let coded = "---\nname: words\ncolumns: [text, code, weight]\n...\nA\ta\t10\n";
+        let weighted = "---\nname: words\ncolumns: [text, weight]\n...\nB\t50\n";
+        let merged = dict_union(coded, weighted);
+        assert!(merged.contains("B\t\t50\n"), "{merged}");
+        assert!(!merged.contains("B\t50\n"));
+        assert_eq!(dict_union(&merged, &merged), merged);
+
+        let merged = dict_union(weighted, coded);
+        assert!(
+            merged.contains("columns: [text, weight, code]\n"),
+            "{merged}"
+        );
+        assert!(merged.contains("A\t10\ta\n"));
+        assert!(merged.contains("B\t50\n"));
+        assert_eq!(dict_union(&merged, &merged), merged);
+    }
+
+    #[test]
+    fn dictionary_schema_expansion_keeps_stems_and_text_only_rows() {
+        let local = "---\nname: local\ncolumns:\n  # column comment\n  - text\n  - code\n  - weight\n...\nA\ta\t10\n";
+        let remote =
+            "---\nname: other\ncolumns: [text, code, weight, stem]\n...\nB\tb\t20\tstem-b\n";
+        let merged = dict_union(local, remote);
+        assert!(merged.starts_with("---\nname: local\n"));
+        assert!(merged.contains("columns: [text, code, weight, stem]\n"));
+        assert!(merged.contains("  # column comment\n"));
+        assert!(!merged.contains("  - text\n"));
+        assert!(merged.contains("B\tb\t20\tstem-b\n"));
+        assert_eq!(dict_union(&merged, &merged), merged);
+
+        let local = "---\nname: words\ncolumns: [code, text, weight]\n...\na\tA\t10\n";
+        let remote = "---\nname: words\ncolumns: [text]\n...\nB\n";
+        let merged = dict_union(local, remote);
+        assert!(merged.contains("\n\tB\n"), "{merged}");
     }
 }
